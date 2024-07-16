@@ -3,7 +3,7 @@ NEPTUNE_PROJECT_NAME = "YOUR-PROJECT-NAME"
 NEPTUNE_MODEL_NAME = "YOUR-MODEL-NAME"
 
 import matplotlib
-import pickle
+
 matplotlib.use('Agg')
 CUDA_VISIBLE_DEVICES = ""
 
@@ -25,11 +25,9 @@ from sklearn import metrics
 from tensorboardX import SummaryWriter
 from ax.service.managed_loop import optimize
 from sklearn.metrics import matthews_corrcoef as MCC
-from sklearn.metrics import precision_score as PPV
-from sklearn.metrics import recall_score
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 from torchvision.models import resnet18, ResNet18_Weights, vgg16, VGG16_Weights, resnet50, ResNet50_Weights
-from otitenet.dataset import get_images_loaders
+from otitenet.data_getters import GetData, get_distance_fct, get_images_loaders
 from otitenet.utils import get_optimizer, to_categorical, get_empty_dicts, get_empty_traces, \
     log_traces, get_best_values, add_to_logger, add_to_neptune, \
     add_to_mlflow
@@ -52,7 +50,6 @@ from torch.autograd import Variable
 
 from torch.autograd import Function
 # from sklearn.preprocessing import label_binarize, OneHotEncoder
-from sklearn.decomposition import PCA
 
 import torch.nn.functional as F
 # from otitenet.SVHModule import SpatialTransformer
@@ -62,35 +59,6 @@ warnings.filterwarnings("ignore")
 random.seed(1)
 torch.manual_seed(1)
 np.random.seed(1)
-
-def log_pca(lists, path, logger=None, mlops=True):
-    pca = PCA(n_components=2)
-    train_encs = np.concatenate(lists['train']['encoded_values'])
-    train_cats = np.concatenate(lists['train']['cats'])
-    valid_encs = np.concatenate(lists['valid']['encoded_values'])
-    valid_cats = np.concatenate(lists['valid']['cats'])
-    test_encs = np.concatenate(lists['test']['encoded_values'])
-    test_cats = np.concatenate(lists['test']['cats'])
-    train_encs_pca = pca.fit_transform(train_encs)
-    valid_encs_pca = pca.transform(valid_encs)
-    test_encs_pca = pca.transform(test_encs)
-    # plot the values and save img
-    fig = plt.figure(figsize=(10, 10))
-    plt.scatter(train_encs_pca[:, 0], train_encs_pca[:, 1], c=train_cats, marker='o')
-    plt.scatter(valid_encs_pca[:, 0], valid_encs_pca[:, 1], c=valid_cats, marker='x')
-    plt.scatter(test_encs_pca[:, 0], test_encs_pca[:, 1], c=test_cats, marker='^')
-    plt.colorbar()
-    plt.title('PCA of encoded values')
-    plt.savefig(f'pca.png')
-    if logger is not None:
-        if mlops == 'tensorboard':
-            logger.add_figure('pca', fig, 0)
-        if mlops == 'neptune':
-            logger[name].log(fig)
-    if mlops == 'mlflow':
-        plt.savefig(f'{path}/pca.png')
-        mlflow.log_figure(fig, f'{path}/pca.png')
-
 
 
 class ReverseLayerF(Function):
@@ -271,11 +239,11 @@ def save_roc_curve(y_pred_proba, y_test, unique_labels, name, binary, acc, mlops
 
         if logger is not None:
             if mlops == 'tensorboard':
-                logger.add_figure(name, fig, 0)
+                logger.add_figure(name, fig, epoch)
             if mlops == 'neptune':
-                logger['PCA'].log(fig)
+                logger[name].log(fig)
         if mlops == 'mlflow':
-            mlflow.log_figure(fig, f'{dirs}/ROC.png')
+            mlflow.log_figure(fig, name)
                 
         plt.close(fig)
 
@@ -507,7 +475,10 @@ class Dataset1(Dataset):
             not_label = None
             while not_label == label or not_label is None:
                 not_label = self.unique_labels[np.random.randint(0, len(self.unique_labels))].copy()
-            not_to_rec = self.samples[self.labels_inds[not_label][np.random.randint(0, self.n_labels[not_label])]].copy()
+            try:
+                not_to_rec = self.samples[self.labels_inds[not_label][np.random.randint(0, self.n_labels[not_label])]].copy()
+            except:
+                exit()
         else:
             to_rec = self.samples[idx].copy()
             not_to_rec = self.samples[idx].copy()
@@ -542,6 +513,107 @@ class Dataset1(Dataset):
                 x = x * (Variable(x.data.new(x.size()).normal_(0, 0.1)) > -.1).type_as(x)
         batch = np.argwhere(batch == self.unique_batches).flatten()
         return x, name, cat, label, old_label, batch, to_rec, not_to_rec, pos_batch_sample, neg_batch_sample
+
+
+class Dataset2(Dataset):
+    def __init__(self, data, unique_batches, unique_labels, names=None, labels=None, old_labels=None, batches=None, sets=None, transform=None, crop_size=-1,
+                 add_noise=False, random_recs=False, triplet_dloss=False, triplet_loss=True):
+        """
+
+        Args:
+            data: Contains a dict of data
+            meta: array of meta data
+            names: array or list of names
+            labels: array or list of labels
+            batches: array or list of batches
+            sets: array or list of sets
+            transform: transform to apply to the data
+            crop_size: crop size to apply to the data
+            add_noise: Whether to add noise to the data
+            random_recs: Whether to sample random reconstructions
+            triplet_dloss: Whether to use triplet loss of the domain
+        """
+        self.random_recs = random_recs
+        try:
+            self.samples = {'train': data['train'].to_numpy(), 'calibration': data['calibration'].to_numpy()}
+        except:
+            self.samples = data
+
+        self.add_noise = add_noise
+        self.names = names
+        self.sets = sets
+        self.transform = transform
+        self.crop_size = crop_size
+        self.labels = labels
+        self.cats = {g: np.array([np.argwhere(label==unique_labels).flatten()[0] for label in labels[g]]) for g in ['train', 'calibration']}
+        self.old_labels = old_labels
+        self.unique_labels = unique_labels
+        self.batches = batches
+        self.unique_batches = np.unique(batches['train'])
+        self.labels_inds = {g: {label: [i for i, x in enumerate(labels[g]) if x == label] for label in self.unique_labels} for g in ['train', 'calibration']}
+        self.batches_inds = {g: {batch: [i for i, x in enumerate(batches[g]) if x == batch] for batch in self.unique_batches} for g in ['train', 'calibration']}
+        # self.labels_data = {label: data[labels_inds[label]] for label in self.unique_labels}
+        # try:
+        #     self.batches_data = {batch: data[batches_inds[batch]] for batch in batches}
+        # except:
+        #     pass
+        self.n_labels = {g: {label: len(self.labels_inds[g][label]) for label in labels[g]} for g in ['train', 'calibration']}
+        self.n_batches = {g: {batch: len(self.batches_inds[g][batch]) for batch in batches[g]} for g in ['train', 'calibration']}
+        self.triplet_dloss = triplet_dloss
+        self.triplet_loss = triplet_loss
+
+    def __len__(self):
+        return len(self.samples['calibration'])
+
+    def __getitem__(self, idx):
+        meta_to_rec = None
+        if self.labels is not None:
+            cat = self.cats['calibration'][idx]
+            label = self.labels['calibration'][idx]
+            try:
+                old_label = self.old_labels['calibration'][idx]
+            except:
+                pass
+            batch = self.batches['calibration'][idx]
+            # set = self.sets[idx]
+            try:
+                name = self.names['calibration'][idx]
+            except:
+                name = str(self.names['calibration'].iloc[idx])
+
+        else:
+            label = None
+            cat = None
+            old_label = None
+            batch = None
+            name = None
+        if self.triplet_loss:
+            # to_rec = self.labels_data[label][np.random.randint(0, self.n_labels[label])].copy()
+            to_rec = self.samples[self.labels_inds['train'][label][np.random.randint(0, self.n_labels['train'][label])]].copy()
+            not_label = None
+            while not_label == label or not_label is None:
+                not_label = self.unique_labels[np.random.randint(0, len(self.unique_labels))].copy()
+            not_to_rec = self.samples['train'][self.labels_inds['train'][not_label][np.random.randint(0, self.n_labels['train'][not_label])]].copy()
+        else:
+            to_rec = self.samples['train'][idx].copy()
+            not_to_rec = self.samples['train'][idx].copy()
+        x = self.samples[idx]
+        if self.crop_size != -1:
+            max_start_crop = x.shape[1] - self.crop_size
+            ran = np.random.randint(0, max_start_crop)
+            x = torch.Tensor(x)[:, ran:ran + self.crop_size]  # .to(device)
+        if self.transform:
+            x = self.transform(x).squeeze()
+            to_rec = self.transform(to_rec).squeeze()
+            not_to_rec = self.transform(not_to_rec).squeeze()
+            pos_batch_sample = self.transform(pos_batch_sample).squeeze()
+            neg_batch_sample = self.transform(neg_batch_sample).squeeze()
+
+        if self.add_noise:
+            if np.random.random() > 0.5:
+                x = x * (Variable(x.data.new(x.size()).normal_(0, 0.1)) > -.1).type_as(x)
+        batch = np.argwhere(batch == self.unique_batches).flatten()
+        return x, name, cat, label, old_label, batch, to_rec, not_to_rec
 
 
 
@@ -699,21 +771,21 @@ def get_images_loaders(data, random_recs, weighted_sampler, is_transform, sample
                             sampler=WeightedRandomSampler(samples_weights['train'], len(samples_weights['train']),
                                                           replacement=True),
                             batch_size=bs,
-                            num_workers = 0,
-                            # prefetch_factor = 8,
+                            num_workers = 8,
+                            prefetch_factor = 8,
                             pin_memory=True,
                             drop_last=True,
-                            # persistent_workers=True
+                            persistent_workers=True
                             )
     else:
         train_loader = DataLoader(train_set,
                             shuffle=True,
                             batch_size=bs,
-                            num_workers = 0,
-                            # prefetch_factor = 8,
+                            num_workers = 8,
+                            prefetch_factor = 8,
                             pin_memory=True,
                             drop_last=True,
-                            # persistent_workers=True
+                            persistent_workers=True
                             )
     loaders = {
         'train': train_loader,
@@ -721,21 +793,21 @@ def get_images_loaders(data, random_recs, weighted_sampler, is_transform, sample
                            # sampler=WeightedRandomSampler(samples_weights['test'], sum(samples_weights['test']),
                            #                               replacement=False),
                            batch_size=bs,
-                            num_workers = 0,
-                            # prefetch_factor = 8,
+                            num_workers = 8,
+                            prefetch_factor = 8,
                            pin_memory=True,
                            drop_last=False,
-                           # persistent_workers=True
+                           persistent_workers=True
                            ),
         'valid': DataLoader(valid_set,
                             # sampler=WeightedRandomSampler(samples_weights['valid'], sum(samples_weights['valid']),
                             #                               replacement=False),
                             batch_size=bs,
-                            num_workers = 0,
-                            # prefetch_factor = 8,
+                            num_workers = 8,
+                            prefetch_factor = 8,
                             pin_memory=True,
                             drop_last=False,
-                            # persistent_workers=True
+                            persistent_workers=True
 
                             ),
     }
@@ -751,20 +823,40 @@ def get_images_loaders(data, random_recs, weighted_sampler, is_transform, sample
                        triplet_dloss=triplet_dloss
                        )
 
+    calibration_set = Dataset2({'train': data['inputs']['train'], 'calibration': data['inputs']['calibration']},
+                       unique_batches,
+                       unique_labels,
+                       {'train': data['names']['all'], 'calibration': data['names']['calibration']},
+                       {'train': data['labels']['all'], 'calibration': data['labels']['calibration']},
+                       {'train': data['old_labels']['all'], 'calibration': data['old_labels']['calibration']},
+                       {'train': data['batches']['all'], 'calibration': data['batches']['calibration']},
+                       sets=None,
+                       transform=transform_train, crop_size=-1, random_recs=False,
+                       triplet_dloss=triplet_dloss
+                       )
+
+    loaders['calibration'] = DataLoader(calibration_set,
+                                # num_workers=0,
+                                shuffle=True,
+                                batch_size=bs,
+                                num_workers = 8,
+                                prefetch_factor = 8,
+                                pin_memory=True,
+                                drop_last=True,
+                                persistent_workers=True
+                                )
     loaders['all'] = DataLoader(all_set,
                                 # num_workers=0,
                                 shuffle=True,
                                 batch_size=bs,
-                                num_workers = 0,
-                                # prefetch_factor = 8,
+                                num_workers = 8,
+                                prefetch_factor = 8,
                                 pin_memory=True,
                                 drop_last=True,
-                                # persistent_workers=True
+                                persistent_workers=True
                                 )
 
     return loaders
-
-
 
 
 class GetData:
@@ -851,8 +943,10 @@ class GetData:
 
     def split_deterministic(self):
         train_inds = np.argwhere(self.data['batches']['train'] == 'Banque_Comert_Turquie_2020_jpg').flatten()
+        train_inds2 = np.argwhere(self.data['batches']['train'] == 'Banque_Calaman_USA_2020_trie_CM').flatten()
+        train_inds = np.concatenate((train_inds, train_inds2))
         valid_inds = np.argwhere(self.data['batches']['train'] == 'Banque_Viscaino_Chili_2020').flatten()
-        test_inds = np.argwhere(self.data['batches']['train'] == 'Banque_Calaman_USA_2020_trie_CM').flatten()
+        test_inds = np.argwhere(self.data['batches']['train'] == 'GMFUNL_jan2023').flatten()
 
         self.data['inputs']['train'], self.data['inputs']['valid'], self.data['inputs']['test'] = self.data['inputs']['train'][train_inds], \
             self.data['inputs']['train'][valid_inds], self.data['inputs']['train'][test_inds]
@@ -926,7 +1020,6 @@ class TrainAE:
         self.unique_labels = None
         self.unique_batches = None
         self.triplet_loss = None
-        self.knn = None
 
     def make_samples_weights(self):
         self.n_batches = len(
@@ -980,15 +1073,12 @@ class TrainAE:
             # gamma = 0 will ensure DANN is not learned
             params['gamma'] = 0
         gamma = params['gamma']
-        knn_metric = params['knn_metric']
-        n_neighbors = params['n_neighbors']
         is_transform = params['is_transform']
-        dist_fct = params['dist_fct']
         # params['dropout'] = 0
         dropout = 0
 
         optimizer_type = 'adam'
-        dist_fct = get_distance_fct(dist_fct)
+        dist_fct = get_distance_fct(self.args.distance_fct)
         self.triplet_loss = nn.TripletMarginWithDistanceLoss(distance_function=dist_fct, margin=margin, swap=False)
         # self.triplet_loss = nn.TripletMarginLoss(margin=margin, swap=False)
         # self.log_path is where tensorboard logs are saved
@@ -1018,9 +1108,8 @@ class TrainAE:
             mlflow.log_param('task', self.args.task)
             mlflow.log_param('is_stn', self.args.is_stn)
             mlflow.log_param('n_calibration', self.args.n_calibration)
-            mlflow.log_param('distance_fct', params['dist_fct'])
-            mlflow.log_param('knn_metric', knn_metric)
-            mlflow.log_param('n_neighbors', n_neighbors)
+            mlflow.log_param('distance_fct', self.args.distance_fct)
+            mlflow.log_param('groupkfold', self.args.groupkfold)
 
         self.complete_log_path = f'logs/{self.args.task}/{self.foldername}'
         loggers = {'cm_logger': LogConfusionMatrix(self.complete_log_path)}
@@ -1078,6 +1167,8 @@ class TrainAE:
                 self.data, self.unique_labels, self.unique_batches = data_getter.get_variables()
             # self.unique_batches = np.unique(self.data['batches']['all'])
 
+            self.make_samples_weights()
+
             if self.args.n_calibration > 0:
                 # take a few samples from train to be used for calibration. The indices
                 for group in ['valid', 'test']:
@@ -1109,9 +1200,6 @@ class TrainAE:
             print("Train Batches:", np.unique(self.data['batches']['train']))
             print("Valid Batches:", np.unique(self.data['batches']['valid']))
             print("Test Batches:", np.unique(self.data['batches']['test']))
-
-            self.make_samples_weights()
-
             # event_acc is used to verify if the hparams have already been tested. If they were,
             # the best classification loss is retrieved and we go to the next trial
             # If thres > 0, features that are 0 for a proportion of samples smaller than thres are removed
@@ -1122,7 +1210,7 @@ class TrainAE:
             # data, self.scaler = scale_data(scale, data, self.args.device)
             loaders = get_images_loaders(data=self.data,
                                          random_recs=self.args.random_recs,
-                                            weighted_sampler=self.args.weighted_sampler,
+                                         weighted_sampler=self.args.weighted_sampler,
                                          is_transform=is_transform,
                                          samples_weights=self.samples_weights,
                                          unique_batches=self.unique_batches,
@@ -1151,7 +1239,7 @@ class TrainAE:
                 else:
                     train_groups = ['all', 'train']
                 for group in train_groups:
-                    _, _, _ = self.loop(group, optimizer_model, model,  gamma, n_neighbors, knn_metric, loaders[group], lists, traces)
+                    _, _, _ = self.loop(group, optimizer_model, model,  gamma, loaders[group], lists, traces)
 
                 model.eval()
                 for group in ["valid", "test"]:
@@ -1178,8 +1266,78 @@ class TrainAE:
                             f" test loss: {values['test']['closs'][-1]}, dloss: {values['all']['dloss'][-1]}")
                     self.best_mcc = values['valid']['mcc'][-1]
                     torch.save(model.state_dict(), f'{self.complete_log_path}/model.pth')
-                    filehandler = open(f'{self.complete_log_path}/knn.pickle',"wb")
-                    pickle.dump(self.knn, filehandler)
+                    best_values = get_best_values(values.copy())
+                    best_vals = values.copy()
+                    best_vals['rec_loss'] = self.best_loss
+                    # best_vals['dom_loss'] = self.best_dom_loss
+                    # best_vals['dom_acc'] = self.best_dom_acc
+                    early_stop_counter = 0
+                if self.best_mcc_mean < np.mean(values['valid']['mcc']):
+                    early_stop_counter = 0
+                    self.best_mcc_mean = np.mean(values['valid']['mcc'])
+                    print(self.best_mcc_mean, self.best_mcc)
+                else:
+                    m = np.mean(values['valid']['mcc'])
+                    print('missed', m, self.best_mcc_mean)
+
+                if values['valid']['acc'][-1] > self.best_acc:
+                    print(f"Best Classification Acc Epoch {epoch}, "
+                            f"Acc: {values['test']['acc'][-1]}"
+                            f"Mcc: {values['test']['mcc'][-1]}"
+                            f"Classification "
+                            f" valid loss: {values['valid']['closs'][-1]},"
+                            f" test loss: {values['test']['closs'][-1]}, dloss: {values['all']['dloss'][-1]}")
+
+                    self.best_acc = values['valid']['acc'][-1]
+                    early_stop_counter = 0
+
+                if values['valid']['closs'][-1] < self.best_closs:
+                    print(f"Best Classification Loss Epoch {epoch}, "
+                            f"Acc: {values['test']['acc'][-1]} "
+                            f"Mcc: {values['test']['mcc'][-1]} "
+                            f"Classification "
+                            f"valid loss: {values['valid']['closs'][-1]}, "
+                            f"test loss: {values['test']['closs'][-1]}, dloss: {values['all']['dloss'][-1]}")
+                    self.best_closs = values['valid']['closs'][-1]
+                    early_stop_counter = 0
+                else:
+                    # if epoch > self.warmup:
+                    early_stop_counter += 1
+
+            for epoch in range(0, self.args.n_epochs):
+                if early_stop_counter >= self.args.early_stop:
+                    if self.verbose > 0:
+                        print('EARLY STOPPING.', epoch)
+                    break
+                lists, traces = get_empty_traces()
+                model.train()
+                _, _, _ = self.loop_calibration("calibration", optimizer_model, model,  gamma, loaders["calibration"], lists, traces)
+
+                model.eval()
+                for group in ["valid", "test"]:
+                    _, _, _ = self.predict(group, model, loaders[group], lists, traces)
+
+                # traces = self.get_mccs(lists, traces)
+                # loggers['cm_logger'].add(lists)
+                values = log_traces(traces, values)
+                if self.log_tb:
+                    try:
+                        add_to_logger(values, loggers['logger'], epoch)
+                    except:
+                        print("Problem with add_to_logger!")
+                if self.log_neptune:
+                    add_to_neptune(values, run, epoch)
+                if self.log_mlflow:
+                    add_to_mlflow(values, epoch)
+                if values['valid']['mcc'][-1] > self.best_mcc:
+                    print(f"Best Classification Mcc Epoch {epoch}, "
+                            f"Acc: test: {values['test']['acc'][-1]}, valid: {values['valid']['acc'][-1]}"
+                            f"Mcc: test: {values['test']['mcc'][-1]}, valid: {values['valid']['mcc'][-1]}"
+                            f"Classification "
+                            f" valid loss: {values['valid']['closs'][-1]},"
+                            f" test loss: {values['test']['closs'][-1]}, dloss: {values['all']['dloss'][-1]}")
+                    self.best_mcc = values['valid']['mcc'][-1]
+                    torch.save(model.state_dict(), f'{self.complete_log_path}/model.pth')
                     best_values = get_best_values(values.copy())
                     best_vals = values.copy()
                     best_vals['rec_loss'] = self.best_loss
@@ -1229,17 +1387,13 @@ class TrainAE:
         model.eval()
         # shap_model.eval()
         with torch.no_grad():
-            _, _, _ = self.loop('train', optimizer_model, model,  gamma, n_neighbors, knn_metric, loaders[group], best_lists, traces)
-            self.knn = pickle.load(open(f'{self.complete_log_path}/knn.pickle','rb'))
+            _, _, _ = self.loop('train', optimizer_model, model,  gamma, loaders[group], best_lists, traces)
             for group in ["valid", "test"]:
                 closs, best_lists, traces = self.predict(group, model, loaders[group], best_lists, traces)
         if self.log_neptune:
             model["model"].upload(f'{self.complete_log_path}/model.pth')
             model["validation/closs"].log(self.best_closs)
-        if self.log_mlflow:
-            log_pca(lists, self.complete_log_path, logger=None, mlops='mlflow')        
-
-
+        
         # Create a dataframe of best_lists valid and test. Have preds, classes, names and gaps between pred and class
         for group in ['valid', 'test']:
             df = pd.DataFrame(np.concatenate((np.concatenate(best_lists[group]['preds']),
@@ -1343,33 +1497,10 @@ class TrainAE:
                 # TODO ADD OTHER FINAL METRICS HERE
                 mlflow.log_metric(f'{group}_acc',
                             metrics.accuracy_score(cats[group], scores[group].argmax(1)),
-                            step=step
-                )
+                            step=step)
                 mlflow.log_metric(f'{group}_mcc',
                             MCC(cats[group], scores[group].argmax(1)),
-                            step=step
-                )
-                mlflow.log_metric(f'{group}_ppv',
-                                  PPV(cats[group], scores[group].argmax(1)),
-                                      step=step
-                )
-                mlflow.log_metric(f'{group}_npv',
-                                  PPV(
-                                      np.logical_not(cats[group]), 
-                                      np.logical_not(scores[group].argmax(1))),
-                                      step=step
-                                      )
-                mlflow.log_metric(f'{group}_tpr',
-                    recall_score(cats[group], scores[group].argmax(1)),
-                    step=step
-                )
-                mlflow.log_metric(f'{group}_tnr',
-                    recall_score(
-                        np.logical_not(cats[group]), 
-                        np.logical_not(scores[group].argmax(1))),
-                        step=step
-                )
-
+                            step=step)
 
             save_roc_curve(
                 scores[group],
@@ -1383,7 +1514,7 @@ class TrainAE:
                 logger=None
             )
     
-    def loop(self, group, optimizer_model, model, gamma, n_neighbors, knn_metric, loader, lists, traces):
+    def loop(self, group, optimizer_model, model, gamma, loader, lists, traces):
         """
 
         Args:
@@ -1463,11 +1594,88 @@ class TrainAE:
                         dloss.backward()
                 optimizer_model.step()
             # pbar.update(1)
-        from sklearn.neighbors import KNeighborsClassifier as KNN
-        self.knn = KNN(n_neighbors=n_neighbors, metric=knn_metric)
-        train_encs = np.concatenate(lists['train']['encoded_values'])
-        train_cats = np.concatenate(lists['train']['cats'])
-        self.knn.fit(train_encs, train_cats)
+        return classif_loss, lists, traces
+
+    def loop_calibration(self, group, optimizer_model, model, gamma, loader, lists, traces):
+        """
+
+        Args:
+            group: Which set? Train, valid or test
+            optimizer_model: Object that contains the optimizer for the autoencoder
+            ae: AutoEncoder (pytorch model, inherits nn.Module)
+            sceloss: torch.nn.CrossEntropyLoss instance
+            triplet_loss: torch.nn.TripletMarginLoss instance
+            loader: torch.utils.data.DataLoader
+            lists: List keeping informations on the current run
+            traces: List keeping scores on the current run
+            nu: hyperparameter controlling the importance of the classification loss
+
+        Returns:
+
+        """
+        # If group is train and nu = 0, then it is not training. valid can also have sampling = True
+        # model, classifier, dann = models['model'], models['classifier'], models['dann']
+        # triplet_loss = nn.TripletMarginLoss(margin, p=2)
+        classif_loss = None
+        # with tqdm(total=len(loader), position=0, leave=True) as pbar:
+        for i, batch in enumerate(loader):
+            # if group in ['train']:
+            if model.training:
+                optimizer_model.zero_grad()
+            data, names, labels, _, old_labels, domain, to_rec, not_to_rec, pos_batch_sample, neg_batch_sample = batch
+            data = data.to(self.args.device).float()
+            to_rec = to_rec.to(self.args.device).float()
+            domains = to_categorical(domain.long(), self.n_batches).squeeze().float().to(self.args.device)
+            enc, dpreds = model(data)
+
+            if self.args.classif_loss == 'cosine':
+                classif_loss = 1 - torch.nn.functional.cosine_similarity(enc, model(to_rec)).mean()
+            elif self.args.classif_loss == 'triplet':
+                not_to_rec = not_to_rec.to(self.args.device).float()
+                pos_enc, _ = model(to_rec)
+                neg_enc, _ = model(not_to_rec)
+                classif_loss = self.triplet_loss(enc, model(to_rec)[0], model(not_to_rec)[0])
+
+            if self.args.dloss == 'DANN':
+                dloss = self.celoss(dpreds, domains)
+
+            elif self.args.dloss == 'inverseTriplet':
+                pos_batch_sample, neg_batch_sample = neg_batch_sample.to(
+                    self.args.device).float(), pos_batch_sample.to(self.args.device).float()
+                pos_enc, _, _ = model(pos_batch_sample)
+                neg_enc, _, _ = model(neg_batch_sample)
+                dloss = self.triplet_loss(enc, pos_enc, neg_enc)
+                # domain = domain.argmax(1)
+            else:
+                dloss = torch.Tensor([0]).to(self.args.device)[0]
+
+            lists[group]['domains'] += [np.array([self.unique_batches[np.argmax(d)] for d in domains.detach().cpu().numpy()])]
+            lists[group]['classes'] += [labels.detach().cpu().numpy()]
+            if group == 'train':
+                lists[group]['preds'] += [dpreds.detach().cpu().numpy()]
+            lists[group]['encoded_values'] += [enc.view(enc.shape[0], -1).detach().cpu().numpy()]
+            lists[group]['names'] += [names]
+            # lists[group]['inputs'] += [data.view(data.shape[0], -1).detach().cpu().numpy()]
+            lists[group]['labels'] += [np.array(
+                [self.unique_labels[x] for x in labels.detach().cpu().numpy()])]
+            lists[group]['old_labels'] += [np.array(old_labels)]
+            traces[group]['dom_acc'] += [np.mean([0 if pred != dom else 1 for pred, dom in
+                                                zip(dpreds.detach().cpu().numpy().argmax(1),
+                                                    domains.argmax(1).detach().cpu().numpy())])]
+            traces[group]['closs'] += [classif_loss.item()]
+            traces[group]['dloss'] += [dloss.item()]
+            lists[group]['cats'] += [labels.detach().cpu().numpy()]
+            if model.training:
+                if group in ['train']:
+                    # total_loss = classif_loss + gamma * dloss
+                    classif_loss.backward()
+                    # nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
+                elif group in ['all']:
+                    if gamma > 0:
+                        dloss = gamma * dloss
+                        dloss.backward()
+                optimizer_model.step()
+            # pbar.update(1)
         return classif_loss, lists, traces
 
     def predict(self, group, model, loader, lists, traces):
@@ -1490,7 +1698,12 @@ class TrainAE:
         # If group is train and nu = 0, then it is not training. valid can also have sampling = True
         # model, classifier, dann = models['model'], models['classifier'], models['dann']
         # import nearest_neighbors from sklearn
+        from sklearn.neighbors import KNeighborsClassifier as KNN
+        KNeighborsClassifier = KNN(n_neighbors=10, metric='minkowski')
         classif_loss = None
+        train_encs = np.concatenate(lists['train']['encoded_values'])
+        train_cats = np.concatenate(lists['train']['cats'])
+        KNeighborsClassifier.fit(train_encs, train_cats)
 
         # plot_decision_boundary(KNeighborsClassifier, train_encs, train_cats)
         # plt.savefig(f'{self.complete_log_path}/decision_boundary.png')
@@ -1502,8 +1715,8 @@ class TrainAE:
             to_rec = to_rec.to(self.args.device).float()
             domains = to_categorical(domain.long(), self.n_batches).squeeze().float().to(self.args.device)
             enc, dpreds = model(data)
-            preds = self.knn.predict(enc.view(enc.shape[0], -1).detach().cpu().numpy())
-            proba = self.knn.predict_proba(enc.view(enc.shape[0], -1).detach().cpu().numpy())
+            preds = KNeighborsClassifier.predict(enc.view(enc.shape[0], -1).detach().cpu().numpy())
+            proba = KNeighborsClassifier.predict_proba(enc.view(enc.shape[0], -1).detach().cpu().numpy())
             if self.args.dloss == 'DANN':
                 dloss = self.celoss(dpreds, domains)
 
@@ -1539,31 +1752,12 @@ class TrainAE:
         traces[group]['mcc'] += [np.round(
             MCC(np.concatenate(lists[group]['cats']), np.concatenate(lists[group]['preds']).argmax(1)), 3)
         ]
-        traces[group]['ppv'] += [np.round(
-            PPV(np.concatenate(lists[group]['cats']), np.concatenate(lists[group]['preds']).argmax(1)), 3)
-        ]
-        traces[group]['npv'] += [np.round(
-            PPV(
-                np.logical_not(np.concatenate(lists[group]['cats'])), 
-                np.logical_not(np.concatenate(lists[group]['preds']).argmax(1))
-                ), 3)
-        ]
-        traces[group]['tpr'] += [np.round(
-            recall_score(np.concatenate(lists[group]['cats']), np.concatenate(lists[group]['preds']).argmax(1)), 3)
-        ]
-        traces[group]['tnr'] += [
-            np.round(recall_score(
-                np.logical_not(np.concatenate(lists[group]['cats'])), 
-                np.logical_not(np.concatenate(lists[group]['preds']).argmax(1))
-                ), 3)
-        ]
             # pbar.update(1)
 
         if group == 'test':
             # plot the PCA of the encoded values
+            from sklearn.decomposition import PCA
             pca = PCA(n_components=2)
-            train_encs = np.concatenate(lists['train']['encoded_values'])
-            train_cats = np.concatenate(lists['train']['cats'])
             valid_encs = np.concatenate(lists['valid']['encoded_values'])
             valid_cats = np.concatenate(lists['valid']['cats'])
             test_encs = np.concatenate(lists['test']['encoded_values'])
@@ -1624,6 +1818,7 @@ if __name__ == "__main__":
     parser.add_argument('--bs', type=int, default=64, help='Batch size')
     parser.add_argument('--dloss', type=str, default="inverseTriplet", help='domain loss')
     parser.add_argument('--classif_loss', type=str, default='triplet', help='triplet or cosine')
+    parser.add_argument('--distance_fct', type=str, default='euclidean', help='[euclidean, cosine, manhattan, chebyshev, minkowski, SNR]')
     parser.add_argument('--task', type=str, default='notNormal', help='Binary classification?')
     parser.add_argument('--is_stn', type=int, default=1, help='Transform train data?')
     parser.add_argument('--weighted_sampler', type=int, default=1, help='Weighted sampler?')
@@ -1650,11 +1845,9 @@ if __name__ == "__main__":
         {"name": "lr", "type": "range", "bounds": [1e-5, 1e-2], "log_scale": True},
         {"name": "wd", "type": "range", "bounds": [1e-8, 1e-2], "log_scale": True},
         {"name": "smoothing", "type": "range", "bounds": [0., 0.2]},
-        {"name": "knn_metric", "type": "choice", "values": ['cosine', 'minkowski']},
         {"name": "dist_fct", "type": "choice", "values": ['cosine', 'euclidean']},
         {"name": "is_transform", "type": "choice", "values": [0, 1]},
         {"name": "margin", "type": "range", "bounds": [0., 10.]},
-        {"name": "n_neighbors", "type": "range", "bounds": [1, 20]},
     ]
     if args.dloss in ['revTriplet', 'revDANN', 'DANN', 'inverseTriplet', 'normae']:
         # gamma = 0 will ensure DANN is not learned

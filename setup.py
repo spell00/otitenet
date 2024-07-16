@@ -12,7 +12,7 @@ from setuptools import setup
 setup(
     name='otitenet',
     version='0.1',
-    packages=["otitenet"],
+    packages=["otitenet", 'RandConv', 'RandConv.lib', 'RandConv.lib.networks'],
     url='',
     license='',
     author='simon pelletier',

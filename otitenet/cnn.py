@@ -3,9 +3,7 @@ from torch import nn
 from torch.autograd import Variable
 import torch.nn.functional as F
 from torch.autograd import Function
-# from src.dl.models.pytorch.utils.stochastic import GaussianSample
-# from src.dl.models.pytorch.utils.distributions import log_normal_standard, log_normal_diag, log_gaussian
-# from src.dl.models.pytorch.utils.utils import to_categorical
+from torchvision.models import resnet18, ResNet18_Weights, vgg16, VGG16_Weights, resnet50, ResNet50_Weights
 import pandas as pd
 
 
@@ -624,7 +622,6 @@ class AutoEncoder(nn.Module):
 
         return kl
 
-
     """
     log likelihood (scalar) of a minibatch according to a zinb model.
     Notes:
@@ -648,3 +645,110 @@ class AutoEncoder(nn.Module):
     #res = torch.multiply(mask, case_zero) + torch.multiply(1 - mask, case_non_zero)
     #res = torch.nan_to_num(res, 0)
     #return torch.sum(res, axis=-1)
+
+class ReverseLayerF(Function):
+
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        output = grad_output.neg() * ctx.alpha
+
+        return output, None
+
+
+class Net(nn.Module):
+    def __init__(self, device, n_cats, n_batches, model_name='resnet18', is_stn=1):
+        super(Net, self).__init__()
+        if model_name == 'resnet18':
+            weights = ResNet18_Weights.DEFAULT
+            self.model = resnet18(weights=weights).to(device)
+            self.model = torch.nn.Sequential(*(list(self.model.children())[:-1]))
+            self.dann = nn.Linear(512, n_batches).to(device)
+        elif model_name == 'resnet50':
+            weights = ResNet50_Weights.DEFAULT
+            self.model = resnet50(weights=weights).to(device)
+            self.model = torch.nn.Sequential(*(list(self.model.children())[:-1]))
+            self.dann = nn.Linear(2048, n_batches).to(device)
+        elif model_name == 'vgg16':
+            weights = VGG16_Weights.DEFAULT
+            self.model = vgg16(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+        self.is_stn = is_stn
+        
+        self.classifier = nn.Linear(512, n_cats).to(device)
+
+        # Spatial transformer localization-network
+        self.localization = nn.Sequential(nn.Conv2d(3, 16, kernel_size=7),
+                                          nn.MaxPool2d(2, stride=2),
+                                          nn.ReLU(True),
+                                          nn.Conv2d(16, 32, kernel_size=5),
+                                          nn.MaxPool2d(2, stride=2),
+                                          nn.ReLU(True),
+                                          nn.Conv2d(32, 64, kernel_size=5),
+                                          nn.MaxPool2d(2, stride=2),
+                                          nn.ReLU(True),
+                                          nn.Conv2d(64, 128, kernel_size=5),
+                                          nn.MaxPool2d(2, stride=2),
+                                          nn.ReLU(True),
+                                          nn.Conv2d(128, 128, kernel_size=3),
+                                          nn.MaxPool2d(2, stride=2),
+                                          nn.ReLU(True)).to(device)
+
+        # Regressor for the 3 * 2 affine matrix
+        self.fc_loc = nn.Sequential(
+            nn.Linear(128 * 4 * 4, 32),
+            nn.ReLU(True),
+            nn.Linear(32, 3 * 2)
+        ).to(device)
+
+        # Initialize the weights/bias with identity transformation
+        self.fc_loc[2].weight.data.zero_()
+        self.fc_loc[2].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
+        # self.fc_loc[2].bias.data.copy_(
+        #     torch.tensor([0.2, 0, 0], dtype=torch.float)) #set scaling to start at 0.2 (~28/128)
+        # self.random_init()
+
+    # Spatial transformer network forward function
+    def stn(self, x):
+        xs = self.localization(x)
+        xs = xs.view(-1, 128 * 4 * 4)
+        theta = self.fc_loc(xs)
+        theta = theta.view(-1, 2, 3)
+
+        grid = F.affine_grid(theta, x.size())
+        x = F.grid_sample(x, grid)
+
+        return x
+
+    def forward(self, inp):
+        # transform the input
+        if self.is_stn:
+            inp = self.stn(inp)
+
+        # Perform the usual forward pass
+        enc = self.model(inp).squeeze()
+        reverse = ReverseLayerF.apply(enc, 1)
+        domout = self.dann(reverse)
+
+        return enc, domout
+
+    def random_init(self, init_func=nn.init.kaiming_uniform_):
+        for m in self.modules():
+            if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+                init_func(m.weight.data)
+                if m.bias is not None:
+                    m.bias.data.zero_()
+            # if isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
+            #     nn.init.constant_(m.weight, 0.975)
+            #     nn.init.constant_(m.bias, 0.125)
+
+    def predict(self, enc):
+        return self.classifier(enc).argmax(1).detach().cpu().numpy()
+
+    def predict_proba(self, enc):
+        return torch.softmax(self.classifier(enc), 1).detach().cpu().numpy()

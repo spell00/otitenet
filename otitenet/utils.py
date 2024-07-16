@@ -634,77 +634,6 @@ def plot_confusion_matrix(cm, class_names, acc):
     return figure
 
 
-class LogConfusionMatrix:
-    def __init__(self, complete_log_path):
-        self.complete_log_path = complete_log_path
-        self.preds = {'train': [], 'valid': [], 'test': []}
-        self.classes = {'train': [], 'valid': [], 'test': []}
-        self.cats = {'train': [], 'valid': [], 'test': []}
-        self.encs = {'train': [], 'valid': [], 'test': []}
-        self.recs = {'train': [], 'valid': [], 'test': []}
-        self.gender = {'train': [], 'valid': [], 'test': []}
-        self.age = {'train': [], 'valid': [], 'test': []}
-        self.batches = {'train': [], 'valid': [], 'test': []}
-
-    def add(self, lists):
-        # n_mini_batches = int(1000 / lists['train']['preds'][0].shape[0])
-        for group in list(self.preds.keys()):
-            # Calculate the confusion matrix.
-            if len(lists[group]['preds']) == 0:
-                continue
-            self.preds[group] += [np.concatenate(lists[group]['preds']).argmax(1)]
-            self.classes[group] += [np.concatenate(lists[group]['classes'])]
-            # self.encs[group] += [np.concatenate(lists[group]['encoded_values'])]
-            # try:
-            #     self.recs[group] += [np.concatenate(lists[group]['rec_values'])]
-            # except:
-            #     pass
-            self.cats[group] += [np.concatenate(lists[group]['cats'])]
-            self.batches[group] += [np.concatenate(lists[group]['domains'])]
-
-    def plot(self, logger, epoch, unique_labels, mlops):
-        for group in ['train', 'valid', 'test']:
-            preds = np.concatenate(self.preds[group])
-            classes = np.concatenate(self.classes[group])
-            cm = sklearn.metrics.confusion_matrix(classes, preds)
-
-            acc = np.mean([0 if pred != c else 1 for pred, c in zip(preds, classes)])
-
-            try:
-                figure = plot_confusion_matrix(cm, class_names=unique_labels[:len(np.unique(self.classes['train']))], acc=acc)
-            except:
-                figure = plot_confusion_matrix(cm, class_names=unique_labels, acc=acc)
-            if mlops == "tensorboard":
-                logger.add_figure(f"CM_{group}_all", figure, epoch)
-            elif mlops == "neptune":
-                logger[f"CM_{group}_all"].upload(figure)
-            elif mlops == "mlflow":
-                mlflow.log_figure(figure, f"CM_{group}_all.png")
-                # logger[f"CM_{group}_all"].log(figure)
-            plt.close(figure)
-        del cm, figure
-
-    def get_rf_results(self, run, args):
-        hparams_names = [x.name for x in rfc_space]
-        enc_data = {name: {x: None for x in ['train', 'valid', 'test']} for name in ['cats', 'inputs', 'batches']}
-        rec_data = {name: {x: None for x in ['train', 'valid', 'test']} for name in ['cats', 'inputs', 'batches']}
-        for group in list(self.preds.keys()):
-            enc_data['inputs'][group] = self.encs[group]
-            enc_data['cats'][group] = self.cats[group]
-            enc_data['batches'][group] = self.batches[group]
-            rec_data['inputs'][group] = self.encs[group]
-            rec_data['cats'][group] = self.cats[group]
-            rec_data['batches'][group] = self.batches[group]
-
-        train = Train("Reconstruction", RandomForestClassifier, rec_data, hparams_names,
-                      self.complete_log_path,
-                      args, run, ovr=0, binary=False, mlops='neptune')
-        _ = gp_minimize(train.train, rfc_space, n_calls=20, random_state=1)
-        train = Train("Encoded", RandomForestClassifier, enc_data, hparams_names, self.complete_log_path,
-                      args, run, ovr=0, binary=False, mlops='neptune')
-        _ = gp_minimize(train.train, rfc_space, n_calls=20, random_state=1)
-
-
 def log_confusion_matrix(logger, epoch, lists, unique_labels, traces, mlops):
     """
     Logs the confusion matrix with tensorboardX (tensorboard for pytorch)
@@ -1048,6 +977,10 @@ def get_empty_dicts():
             "dom_acc": [],
             "top3": [],
             "mcc": [],
+            "tpr": [],
+            "tnr": [],
+            "ppv": [],
+            "npv": [],
         }
         best_traces[g] = {
             'closs': [100],
@@ -1055,10 +988,14 @@ def get_empty_dicts():
             'dom_acc': [0],
             'acc': [0],
             'top3': [0],
-            'mcc': [0]
+            'mcc': [0],
+            "tpr": [],
+            "tnr": [],
+            "ppv": [],
+            "npv": [],
         }
 
-        for m in ['acc', 'top3', 'mcc', 'dom_acc']:
+        for m in ['acc', 'top3', 'mcc', 'dom_acc', 'tpr', 'tnr', 'ppv', 'npv']:
             best_values[f"{g}_{m}"] = 0
         best_values[f"{g}_loss"] = 100
         best_lists[g] = {
@@ -1123,6 +1060,10 @@ def get_empty_traces():
             'acc': [],
             'top3': [],
             'mcc': [],
+            'tpr': [],
+            'tnr': [],
+            'ppv': [],
+            'npv': []
         }
 
     return lists, traces
@@ -1145,6 +1086,10 @@ def log_traces(traces, values):
             values[g]['acc'] += [np.mean(traces[g]['acc'])]
             values[g]['top3'] += [np.mean(traces[g]['top3'])]
             values[g]['mcc'] += traces[g]['mcc']
+            values[g]['tpr'] += traces[g]['tpr']
+            values[g]['tnr'] += traces[g]['tnr']
+            values[g]['ppv'] += traces[g]['ppv']
+            values[g]['npv'] += traces[g]['npv']
 
     return values
 
@@ -1173,7 +1118,7 @@ def get_best_acc_from_tb(event_acc):
     return best_closs
 
 
-def get_best_values(values, ae_only, n_agg=10):
+def get_best_values(values, ae_only=False, n_agg=10):
     """
     As the name implies - this function gets the best values
     Args:
@@ -1191,7 +1136,7 @@ def get_best_values(values, ae_only, n_agg=10):
             'dom_acc': values['rec_loss'][-1],
         }
         for g in ['train', 'valid', 'test']:
-            for k in ['acc', 'mcc', 'top3']:
+            for k in ['acc', 'mcc', 'top3', 'tpr', 'tnr', 'ppv', 'npv']:
                 best_values[f'{g}_{k}'] = math.nan
                 best_values[f'{g}_loss'] = math.nan
 
@@ -1204,7 +1149,7 @@ def get_best_values(values, ae_only, n_agg=10):
         if len(values['rec_loss']) > 0:
             best_values['rec_loss'] = values['rec_loss'][-1]
         for g in ['train', 'valid', 'test']:
-            for k in ['acc', 'mcc', 'top3']:
+            for k in ['acc', 'mcc', 'top3', 'tpr', 'tnr', 'ppv', 'npv']:
                 if g == 'test':
                     best_values[f'{g}_{k}'] = values[g][k][-1]
                     best_values[f'{g}_loss'] = values[g]['closs'][-1]
@@ -1233,11 +1178,19 @@ def add_to_logger(values, logger, epoch):
             if not np.isnan(values[group]['closs'][-1]):
                 logger.add_scalar(f'/closs/{group}', values[group]['closs'][-1], epoch)
             if not np.isnan(values[group]['acc'][-1]):
-                logger.add_scalar(f'/acc/{group}/all_concentrations', values[group]['acc'][-1], epoch)
+                logger.add_scalar(f'/acc/{group}', values[group]['acc'][-1], epoch)
             if not np.isnan(values[group]['mcc'][-1]):
-                logger.add_scalar(f'/mcc/{group}/all_concentrations', values[group]['mcc'][-1], epoch)
+                logger.add_scalar(f'/mcc/{group}', values[group]['mcc'][-1], epoch)
+            if not np.isnan(values[group]['ppv'][-1]):
+                logger.add_scalar(f'/ppv/{group}', values[group]['ppv'][-1], epoch)
+            if not np.isnan(values[group]['npv'][-1]):
+                logger.add_scalar(f'/npv/{group}', values[group]['npv'][-1], epoch)
+            if not np.isnan(values[group]['tpr'][-1]):
+                logger.add_scalar(f'/tpr/{group}', values[group]['tpr'][-1], epoch)
+            if not np.isnan(values[group]['fpr'][-1]):
+                logger.add_scalar(f'/fpr/{group}', values[group]['fpr'][-1], epoch)
             if not np.isnan(values[group]['top3'][-1]):
-                logger.add_scalar(f'/top3/{group}/all_concentrations', values[group]['top3'][-1], epoch)
+                logger.add_scalar(f'/top3/{group}', values[group]['top3'][-1], epoch)
         except:
             pass
 
@@ -1260,11 +1213,19 @@ def add_to_neptune(values, run, epoch):
             if not np.isnan(values[group]['closs'][-1]):
                 run[f'/closs/{group}'].log(values[group]['closs'][-1])
             if not np.isnan(values[group]['acc'][-1]):
-                run[f'/acc/{group}/all_concentrations'].log(values[group]['acc'][-1])
+                run[f'/acc/{group}'].log(values[group]['acc'][-1])
             if not np.isnan(values[group]['mcc'][-1]):
-                run[f'/mcc/{group}/all_concentrations'].log(values[group]['mcc'][-1])
+                run[f'/mcc/{group}'].log(values[group]['mcc'][-1])
+            if not np.isnan(values[group]['tpr'][-1]):
+                run[f'/tpr/{group}'].log(values[group]['tpr'][-1])
+            if not np.isnan(values[group]['tnr'][-1]):
+                run[f'/tnr/{group}'].log(values[group]['tnr'][-1])
+            if not np.isnan(values[group]['ppv'][-1]):
+                run[f'/ppv/{group}'].log(values[group]['ppv'][-1])
+            if not np.isnan(values[group]['npv'][-1]):
+                run[f'/npv/{group}'].log(values[group]['npv'][-1])
             if not np.isnan(values[group]['top3'][-1]):
-                run[f'/top3/{group}/all_concentrations'].log(values[group]['top3'][-1])
+                run[f'/top3/{group}'].log(values[group]['top3'][-1])
         except:
             pass
 
@@ -1294,13 +1255,21 @@ def add_to_mlflow(values, epoch):
             if not np.isnan(values[group]['dloss'][-1]):
                 mlflow.log_metric(f'dloss/{group}', values[group]['dloss'][-1], epoch)
             if not np.isnan(values[group]['acc'][-1]):
-                mlflow.log_metric(f'acc/{group}/all_concentrations', values[group]['acc'][-1], epoch)
+                mlflow.log_metric(f'acc/{group}', values[group]['acc'][-1], epoch)
             if not np.isnan(values[group]['dom_acc'][-1]):
-                mlflow.log_metric(f'dom_acc/{group}/all_concentrations', values[group]['dom_acc'][-1], epoch)
+                mlflow.log_metric(f'dom_acc/{group}', values[group]['dom_acc'][-1], epoch)
             if not np.isnan(values[group]['mcc'][-1]):
-                mlflow.log_metric(f'mcc/{group}/all_concentrations', values[group]['mcc'][-1], epoch)
+                mlflow.log_metric(f'mcc/{group}', values[group]['mcc'][-1], epoch)
+            if not np.isnan(values[group]['tpr'][-1]):
+                mlflow.log_metric(f'tpr/{group}', values[group]['tpr'][-1], epoch)
+            if not np.isnan(values[group]['tnr'][-1]):
+                mlflow.log_metric(f'tnr/{group}', values[group]['tnr'][-1], epoch)
+            if not np.isnan(values[group]['ppv'][-1]):
+                mlflow.log_metric(f'ppv/{group}', values[group]['ppv'][-1], epoch)
+            if not np.isnan(values[group]['npv'][-1]):
+                mlflow.log_metric(f'npv/{group}', values[group]['npv'][-1], epoch)
             if not np.isnan(values[group]['top3'][-1]):
-                mlflow.log_metric(f'top3/{group}/all_concentrations', values[group]['top3'][-1], epoch)
+                mlflow.log_metric(f'top3/{group}', values[group]['top3'][-1], epoch)
         except:
             pass
 

@@ -18,7 +18,7 @@ def make_dataset_folder(path, size, new_path='data/otite_ds'):
     datasets = np.array([])
     # groups = np.array([])
 
-    for dataset in ['Banque_Calaman_USA_2020_trie_CM', 'Banque_Viscaino_Chili_2020', 'Banque_Comert_Turquie_2020_jpg']:
+    for dataset in ['Banque_Calaman_USA_2020_trie_CM', 'Banque_Viscaino_Chili_2020', 'Banque_Comert_Turquie_2020_jpg', 'GMFUNL_jan2023']:
         if dataset == 'Banque_Calaman_USA_2020_trie_CM':
             for label in os.listdir(f"{path}/{dataset}"):
                 if label == ".DS_Store" or '.xlsx' in label:
@@ -90,6 +90,32 @@ def make_dataset_folder(path, size, new_path='data/otite_ds'):
                         datasets = np.concatenate((datasets.reshape(1, -1), np.array([dataset]).reshape(1, -1)), 1)
                         groups = np.concatenate((groups.reshape(1, -1), np.array([group]).reshape(1, -1)), 1)
             # pngs[group] = np.stack(pngs[group])
+        if dataset == 'GMFUNL_jan2023':
+            new_labels = np.array([])
+            for label in os.listdir(f"{path}/{dataset}"):
+                if label == ".DS_Store":
+                    continue
+                for im in os.listdir(f"{path}/{dataset}/{label}"):
+                    if '.png' not in im or 'Off' in im or 'off' in im:
+                        continue
+                    png = Image.open(f"{path}/{dataset}/{label}/{im}")
+                    png = transforms.Resize((size, size))(png)
+                    png.save(f"{new_path}/{im}")
+
+                    new_labels = np.concatenate((new_labels.reshape(1, -1), np.array([label]).reshape(1, -1)), 1)
+                    names = np.concatenate((names.reshape(1, -1), np.array([im]).reshape(1, -1)), 1)
+                    datasets = np.concatenate((datasets.reshape(1, -1), np.array([dataset]).reshape(1, -1)), 1)
+            # pngs[group] = np.stack(pngs[group])
+
+            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            train_nums = np.arange(0, labels.shape[1])
+            splitter = skf.split(train_nums, labels.flatten())
+            train_inds, test_inds = splitter.__next__()
+
+            new_groups = np.array(['train' if x in train_inds else 'test' for x in np.arange(new_labels.shape[1])])
+            groups = np.concatenate((groups.reshape(1, -1), new_groups.reshape(1, -1)), 1)
+            labels = np.concatenate((labels.reshape(1, -1), new_labels.reshape(1, -1)), 1)
+
 
         if dataset == 'Banque_Comert_Turquie_2020_jpg':
             new_labels = np.array([])
@@ -129,4 +155,4 @@ def make_dataset_folder(path, size, new_path='data/otite_ds'):
     df.to_csv(f"{new_path}/infos.csv", index=False)
 
 if __name__ == '__main__':
-    make_dataset_folder(path='data/QC-CM', size=128, new_path='data/otite_ds')
+    make_dataset_folder(path='data/QC-CM', size=64, new_path='data/otite_ds')

@@ -5,12 +5,13 @@ import os
 from tensorboard.plugins.hparams import api as hp
 import tensorflow as tf
 from sklearn.metrics import silhouette_score, adjusted_rand_score, adjusted_mutual_info_score
-# from src.metrics import rKBET, rLISI
+from sklearn import metrics
 import numpy as np
 import mlflow
 import pandas as pd
 import matplotlib
 import shap
+import itertools
 
 from otitenet.utils import get_unique_labels
 
@@ -23,8 +24,7 @@ from otitenet.plotting import confidence_ellipse
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.neighbors import KNeighborsClassifier
 from otitenet.metrics import batch_f1_score
-from otitenet.utils import log_confusion_matrix, save_roc_curve, save_precision_recall_curve, \
-    LogConfusionMatrix
+from otitenet.utils import log_confusion_matrix, save_roc_curve, save_precision_recall_curve
 import seaborn as sns
 from sklearn.decomposition import PCA
 from sklearn.cross_decomposition import CCA
@@ -35,6 +35,122 @@ from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
 # It is useless to run tensorflow on GPU and it takes a lot of GPU RAM for nothing
 physical_devices = tf.config.list_physical_devices('CPU')
 tf.config.set_visible_devices(physical_devices)
+
+class LogConfusionMatrix:
+    def __init__(self, complete_log_path):
+        self.complete_log_path = complete_log_path
+        self.preds = {'train': [], 'valid': [], 'test': []}
+        self.classes = {'train': [], 'valid': [], 'test': []}
+        self.real_classes = {'train': [], 'valid': [], 'test': []}
+        self.cats = {'train': [], 'valid': [], 'test': []}
+        self.encs = {'train': [], 'valid': [], 'test': []}
+        self.recs = {'train': [], 'valid': [], 'test': []}
+        self.gender = {'train': [], 'valid': [], 'test': []}
+        self.age = {'train': [], 'valid': [], 'test': []}
+        self.batches = {'train': [], 'valid': [], 'test': []}
+
+    def add(self, lists):
+        # n_mini_batches = int(1000 / lists['train']['preds'][0].shape[0])
+        for group in list(self.preds.keys()):
+            # Calculate the confusion matrix.
+            if len(lists[group]['preds']) == 0:
+                continue
+            self.preds[group] += [np.concatenate(lists[group]['preds']).argmax(1)]
+            self.classes[group] += [np.concatenate(lists[group]['classes'])]
+            self.real_classes[group] += [np.concatenate(lists[group]['old_labels'])]
+            # self.encs[group] += [np.concatenate(lists[group]['encoded_values'])]
+            # try:
+            #     self.recs[group] += [np.concatenate(lists[group]['rec_values'])]
+            # except:
+            #     pass
+            self.cats[group] += [np.concatenate(lists[group]['cats'])]
+            self.batches[group] += [np.concatenate(lists[group]['domains'])]
+
+    def plot(self, logger, epoch, unique_labels, mlops):
+        for group in ['train', 'valid', 'test']:
+            preds = np.concatenate(self.preds[group])
+            classes = np.concatenate(self.classes[group])
+            real_classes = np.concatenate(self.real_classes[group])
+            unique_real_classes = np.unique(real_classes)
+
+            corrects = [1 if pred==label else 0 for pred, label in zip(preds, classes)]
+            real_cats = np.array([np.argwhere(x==unique_real_classes).flatten()[0] for x in real_classes])
+            real_preds = []
+            for i, pred in enumerate(preds):
+                if corrects[i] == 1:
+                    real_preds += [unique_real_classes[real_cats[i]]]
+                else:
+                    if pred == 1:
+                        real_preds += [unique_real_classes[0]]
+                    else:
+                        real_preds += ['Normal']
+            cm = metrics.confusion_matrix(real_classes, real_preds)
+
+            acc = np.mean([0 if pred != c else 1 for pred, c in zip(preds, classes)])
+
+            # try:
+            #     figure = plot_confusion_matrix(cm, class_names=unique_real_classes[:len(np.unique(self.classes['train']))], acc=acc)
+            # except:
+            figure = plot_confusion_matrix(cm, class_names=unique_real_classes, acc=acc)
+            if mlops == "tensorboard":
+                logger.add_figure(f"CM_{group}_all", figure, epoch)
+            elif mlops == "neptune":
+                logger[f"CM_{group}_all"].upload(figure)
+            elif mlops == "mlflow":
+                mlflow.log_figure(figure, f"CM_{group}_all.png")
+                # logger[f"CM_{group}_all"].log(figure)
+            plt.savefig(f"{self.complete_log_path}/cm/{group}_all.png") # , dpi=300)
+            plt.close()
+
+            cm = metrics.confusion_matrix(classes, preds)
+
+            acc = np.mean([0 if pred != c else 1 for pred, c in zip(preds, classes)])
+
+            # try:
+            #     figure = plot_confusion_matrix(cm, class_names=unique_real_classes[:len(np.unique(self.classes['train']))], acc=acc)
+            # except:
+            figure = plot_confusion_matrix(cm, class_names=unique_labels, acc=acc)
+            if mlops == "tensorboard":
+                logger.add_figure(f"CM_{group}", figure, epoch)
+            elif mlops == "neptune":
+                logger[f"CM_{group}"].upload(figure)
+            elif mlops == "mlflow":
+                mlflow.log_figure(figure, f"CM_{group}.png")
+                # logger[f"CM_{group}_all"].log(figure)
+            plt.savefig(f"{self.complete_log_path}/cm/{group}.png") # , dpi=300)
+            plt.close()
+        # del cm, figure
+
+    def get_rf_results(self, run, args):
+        hparams_names = [x.name for x in rfc_space]
+        enc_data = {name: {x: None for x in ['train', 'valid', 'test']} for name in ['cats', 'inputs', 'batches']}
+        rec_data = {name: {x: None for x in ['train', 'valid', 'test']} for name in ['cats', 'inputs', 'batches']}
+        for group in list(self.preds.keys()):
+            enc_data['inputs'][group] = self.encs[group]
+            enc_data['cats'][group] = self.cats[group]
+            enc_data['batches'][group] = self.batches[group]
+            rec_data['inputs'][group] = self.encs[group]
+            rec_data['cats'][group] = self.cats[group]
+            rec_data['batches'][group] = self.batches[group]
+
+        train = Train("Reconstruction", RandomForestClassifier, rec_data, hparams_names,
+                      self.complete_log_path,
+                      args, run, ovr=0, binary=False, mlops='neptune')
+        _ = gp_minimize(train.train, rfc_space, n_calls=20, random_state=1)
+        train = Train("Encoded", RandomForestClassifier, enc_data, hparams_names, self.complete_log_path,
+                      args, run, ovr=0, binary=False, mlops='neptune')
+        _ = gp_minimize(train.train, rfc_space, n_calls=20, random_state=1)
+
+    def reset(self):
+        self.preds = {'train': [], 'valid': [], 'test': []}
+        self.classes = {'train': [], 'valid': [], 'test': []}
+        self.real_classes = {'train': [], 'valid': [], 'test': []}
+        self.cats = {'train': [], 'valid': [], 'test': []}
+        self.encs = {'train': [], 'valid': [], 'test': []}
+        self.recs = {'train': [], 'valid': [], 'test': []}
+        self.gender = {'train': [], 'valid': [], 'test': []}
+        self.age = {'train': [], 'valid': [], 'test': []}
+        self.batches = {'train': [], 'valid': [], 'test': []}
 
 
 class TensorboardLoggingAE:
@@ -1532,3 +1648,161 @@ def log_input_ordination(logger, data, scaler, mlops, epoch=0):
 
     except:
         print("\n\n\nProblem with logging PCA, TSNE or UMAP\n\n\n")
+
+
+def save_roc_curve(y_pred_proba, y_test, unique_labels, name, binary, acc, mlops, epoch=None, logger=None):
+    """
+
+    Args:
+        model:
+        x_test:
+        y_test:
+        unique_labels:
+        name:
+        binary: Is it a binary classification?
+        acc:
+        epoch:
+        logger:
+
+    Returns:
+
+    """
+    dirs = '/'.join(name.split('/')[:-1])
+    name = name.split('/')[-1]
+    os.makedirs(f'{dirs}', exist_ok=True)
+    if binary:
+        # enc = model(x_test)
+        # y_pred_proba = model.classifier(enc)[::, 1]
+        # y_pred_proba = model(x_test)[::, 1]
+        fpr, tpr, _ = metrics.roc_curve(y_test, y_pred_proba)
+        roc_auc = metrics.auc(fpr, tpr)
+        roc_score = metrics.roc_auc_score(y_true=y_test, y_score=y_pred_proba)
+
+        # create ROC curve
+        plt.figure()
+        plt.plot(fpr, tpr, label='ROC curve (AUC = %0.2f)' % roc_auc)
+        plt.plot([0, 1], [0, 1], 'k--')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate (1 - Specificity)')
+        plt.ylabel('True Positive Rate (Sensitivity)')
+        plt.title(f'ROC curve (acc={np.round(acc, 3)})')
+        plt.legend(loc="lower right")
+        stuck = True
+        while stuck:
+            try:
+                plt.savefig(f'{dirs}/ROC.png')
+                stuck = False
+            except:
+                print('stuck...')
+        plt.close()
+    else:
+        # Compute ROC curve and ROC area for each class
+        from sklearn.preprocessing import label_binarize
+        # enc = model(x_test)
+        # y_pred_proba = model.classifier(enc)
+
+        # y_preds = model.predict_proba(x_test)
+        n_classes = len(unique_labels) - 1  # -1 to remove QC
+        fpr = dict()
+        tpr = dict()
+        roc_auc = dict()
+        classes = np.arange(len(unique_labels))
+
+        roc_score = metrics.roc_auc_score(y_true=y_test, y_score=y_pred_proba, multi_class='ovr')
+        for i in range(n_classes):
+            fpr[i], tpr[i], thresholds = metrics.roc_curve(label_binarize(y_test, classes=classes)[:, i], y_pred_proba[:, i])
+            roc_auc[i] = metrics.auc(fpr[i], tpr[i])
+        # roc for each class
+        fig, ax = plt.subplots()
+        ax.plot([0, 1], [0, 1], 'k--')
+        ax.set_xlim([0.0, 1.0])
+        ax.set_ylim([0.0, 1.05])
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        plt.title(f'ROC curve (AUC={np.round(roc_score, 3)}, acc={np.round(acc, 3)})')
+        # ax.plot(fpr[0], tpr[0], label=f'AUC = {np.round(roc_score, 3)} (All)', color='k')
+        for i in range(n_classes):
+            ax.plot(fpr[i], tpr[i], label=f'AUC = {np.round(roc_auc[i], 3)} ({unique_labels[i]})')
+        ax.legend(loc="best")
+        ax.grid(alpha=.4)
+        # sns.despine()
+        stuck = True
+        while stuck:
+            try:
+                plt.savefig(f'{dirs}/ROC.png')
+                stuck = False
+            except:
+                print('stuck...')
+
+        if logger is not None:
+            if mlops == 'tensorboard':
+                logger.add_figure('ROC', fig, 0)
+            if mlops == 'neptune':
+                logger['ROC'].log(fig)
+        if mlops == 'mlflow':
+            mlflow.log_figure(fig, name)
+                
+        plt.close(fig)
+
+    return roc_score
+
+def plot_confusion_matrix(cm, class_names, acc):
+    """
+  Returns a matplotlib figure containing the plotted confusion matrix.
+
+  Args:
+    cm (array, shape = [n, n]): a confusion matrix of integer classes
+    class_names (array, shape = [n]): String names of the integer classes
+  """
+    figure = plt.figure(figsize=(4, 4))
+    cm_normal = np.around(cm.astype('float') / cm.sum(axis=1)[:, np.newaxis], decimals=2)
+    cm_normal[np.isnan(cm_normal)] = 0
+    plt.imshow(cm_normal, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title(f"Confusion matrix (acc: {acc})")
+    plt.colorbar()
+    tick_marks = np.arange(len(class_names))
+    plt.xticks(tick_marks, class_names, rotation=45)
+    plt.yticks(tick_marks, class_names)
+
+    threshold = 0.5
+
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        color = "white" if cm_normal[i, j] > threshold else "black"
+        plt.text(j, i, cm[i, j], horizontalalignment="center", color=color)
+
+    plt.tight_layout()
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+
+    return figure
+
+def log_pca(lists, path, logger=None, mlops=True):
+    pca = PCA(n_components=2)
+    train_encs = np.concatenate(lists['train']['encoded_values'])
+    train_cats = np.concatenate(lists['train']['cats'])
+    valid_encs = np.concatenate(lists['valid']['encoded_values'])
+    valid_cats = np.concatenate(lists['valid']['cats'])
+    test_encs = np.concatenate(lists['test']['encoded_values'])
+    test_cats = np.concatenate(lists['test']['cats'])
+    train_encs_pca = pca.fit_transform(train_encs)
+    valid_encs_pca = pca.transform(valid_encs)
+    test_encs_pca = pca.transform(test_encs)
+    # plot the values and save img
+    fig = plt.figure(figsize=(10, 10))
+    plt.scatter(train_encs_pca[:, 0], train_encs_pca[:, 1], c=train_cats, marker='o')
+    plt.scatter(valid_encs_pca[:, 0], valid_encs_pca[:, 1], c=valid_cats, marker='x')
+    plt.scatter(test_encs_pca[:, 0], test_encs_pca[:, 1], c=test_cats, marker='^')
+    plt.colorbar()
+    plt.title('PCA of encoded values')
+    plt.savefig(f'pca.png')
+    if logger is not None:
+        if mlops == 'tensorboard':
+            logger.add_figure('pca', fig, 0)
+        if mlops == 'neptune':
+            logger['pca'].log(fig)
+    if mlops == 'mlflow':
+        plt.savefig(f'{path}/pca.png')
+        mlflow.log_figure(fig, f'{path}/pca.png')
+
+

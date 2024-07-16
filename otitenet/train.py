@@ -27,7 +27,7 @@ from ax.service.managed_loop import optimize
 from sklearn.metrics import matthews_corrcoef as MCC
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 from torchvision.models import resnet18, ResNet18_Weights
-from otitenet.dataset import get_images_loaders
+from otitenet.data_getters import GetData, get_distance_fct, get_images_loaders
 from otitenet.utils import get_optimizer, to_categorical, get_empty_dicts, get_empty_traces, \
     log_traces, get_best_values, add_to_logger, add_to_neptune, \
     add_to_mlflow
@@ -593,15 +593,15 @@ def get_images_loaders(data, random_recs, weighted_sampler, is_transform, sample
         # transforms.RandomApply(nn.ModuleList([transforms.RandomRotation(degrees=(180, 180))])),
         # transforms.RandomApply(nn.ModuleList([transforms.RandomRotation(degrees=(270, 270))])),
         # transforms.RandomErasing(p=0.5, scale=(0.02, 0.1), ratio=(0.3, 3.3)),
-        # transforms.RandomApply(nn.ModuleList([
-        #     transforms.RandomAffine(
-        #         degrees=10,
-        #         translate=(.1, .1),
-        #         # scale=(0.9, 1.1),
-        #         shear=(.01, .01),
-        #         interpolation=transforms.InterpolationMode.BILINEAR
-        #     )
-        # ]), p=0.5),
+        transforms.RandomApply(nn.ModuleList([
+            transforms.RandomAffine(
+                degrees=10,
+                translate=(.1, .1),
+                # scale=(0.9, 1.1),
+                shear=(.01, .01),
+                interpolation=transforms.InterpolationMode.BILINEAR
+            )
+        ]), p=0.5),
         # transforms.RandomApply(
         #     nn.ModuleList([
         #         transforms.GaussianBlur(kernel_size=3, sigma=(0.01, 0.03))
@@ -970,6 +970,7 @@ class TrainAE:
             mlflow.log_param('classif_loss', self.args.classif_loss)
             mlflow.log_param('task', self.args.task)
             mlflow.log_param('is_stn', self.args.is_stn)
+            mlflow.log_param('n_calibration', self.args.n_calibration)
 
         self.complete_log_path = f'logs/{self.args.task}/{self.foldername}'
         loggers = {'cm_logger': LogConfusionMatrix(self.complete_log_path)}
@@ -1027,9 +1028,6 @@ class TrainAE:
             else:
                 self.data, self.unique_labels, self.unique_batches = data_getter.get_variables()
             # self.unique_batches = np.unique(self.data['batches']['all'])
-            print("Train Batches:", np.unique(self.data['batches']['train']))
-            print("Valid Batches:", np.unique(self.data['batches']['valid']))
-            print("Test Batches:", np.unique(self.data['batches']['test']))
 
             self.make_samples_weights()
             # event_acc is used to verify if the hparams have already been tested. If they were,
@@ -1040,6 +1038,39 @@ class TrainAE:
             # Transform the data with the chosen scaler
             # data = copy.deepcopy(self.data)
             # data, self.scaler = scale_data(scale, data, self.args.device)
+
+            if self.args.n_calibration > 0:
+                # take a few samples from train to be used for calibration. The indices
+                for group in ['valid', 'test']:
+                    indices = {label: np.argwhere(self.data['labels'][group] == label).flatten() for label in self.unique_labels}
+                    calib_inds = np.concatenate([np.random.choice(indices[label], int(self.args.n_calibration/len(self.unique_labels)), replace=False) for label in self.unique_labels])
+
+                    self.data['inputs']['calibration'] = self.data['inputs'][group][calib_inds]
+                    self.data['labels']['calibration'] = self.data['labels'][group][calib_inds]
+                    self.data['old_labels']['calibration'] = self.data['old_labels'][group][calib_inds]
+                    self.data['names']['calibration'] = self.data['names'][group][calib_inds]
+                    self.data['cats']['calibration'] = self.data['cats'][group][calib_inds]
+                    self.data['batches']['calibration'] = self.data['batches'][group][calib_inds]
+
+                    # add them to train
+                    self.data['inputs']['train'] = np.concatenate((self.data['inputs']['train'], self.data['inputs'][group][calib_inds]))
+                    self.data['labels']['train'] = np.concatenate((self.data['labels']['train'], self.data['labels'][group][calib_inds]))
+                    self.data['old_labels']['train'] = np.concatenate((self.data['old_labels']['train'], self.data['old_labels'][group][calib_inds]))
+                    self.data['names']['train'] = np.concatenate((self.data['names']['train'], self.data['names'][group][calib_inds]))
+                    self.data['cats']['train'] = np.concatenate((self.data['cats']['train'], self.data['cats'][group][calib_inds]))
+                    self.data['batches']['train'] = np.concatenate((self.data['batches']['train'], self.data['batches'][group][calib_inds]))
+                    # remove them from test
+                    self.data['inputs'][group] = np.delete(self.data['inputs'][group], calib_inds, axis=0)
+                    self.data['labels'][group] = np.delete(self.data['labels'][group], calib_inds, axis=0)
+                    self.data['old_labels'][group] = np.delete(self.data['old_labels'][group], calib_inds, axis=0)
+                    self.data['names'][group] = np.delete(self.data['names'][group], calib_inds, axis=0)
+                    self.data['cats'][group] = np.delete(self.data['cats'][group], calib_inds, axis=0)
+                    self.data['batches'][group] = np.delete(self.data['batches'][group], calib_inds, axis=0)
+
+            print("Train Batches:", np.unique(self.data['batches']['train']))
+            print("Valid Batches:", np.unique(self.data['batches']['valid']))
+            print("Test Batches:", np.unique(self.data['batches']['test']))
+
             loaders = get_images_loaders(data=self.data,
                                          random_recs=self.args.random_recs,
                                             weighted_sampler=self.args.weighted_sampler,
@@ -1155,7 +1186,7 @@ class TrainAE:
                                                 ), 1))
             df.columns = [f'probs_{l}' for l in self.unique_labels] + ['labels', 'domains', 'names']
             preds = df.iloc[:, :2].values
-            preds = preds.astype(np.float).argmax(1).astype(np.int)
+            preds = preds.astype(np.float64).argmax(1).astype(np.int32)
             df['correct'] = [1 if label == df.columns[pred].split('_')[1] else 0 for label, pred in zip(df['labels'], preds)]
             df['gaps'] = [1 - float(df[f'probs_{l}'].iloc[i]) for i, l in enumerate(df['labels'])]
             # reorder dataframe with gaps column
@@ -1401,13 +1432,14 @@ if __name__ == "__main__":
     parser.add_argument('--exp_id', type=str, default='otite')
     parser.add_argument('--bs', type=int, default=64, help='Batch size')
     parser.add_argument('--n_layers', type=int, default=1, help='N layers for classifier')
-    parser.add_argument('--log1p', type=int, default=1, help='log1p the data? Should be 0 with zinb')
+    # parser.add_argument('--log1p', type=int, default=1, help='log1p the data? Should be 0 with zinb')
     parser.add_argument('--dloss', type=str, default="inverseTriplet", help='domain loss')
     parser.add_argument('--classif_loss', type=str, default='ce', help='ce or cosine')
     parser.add_argument('--task', type=str, default='notNormal', help='Binary classification?')
     parser.add_argument('--is_transform', type=int, default=0, help='Transform train data?')
     parser.add_argument('--is_stn', type=int, default=1, help='Transform train data?')
     parser.add_argument('--weighted_sampler', type=int, default=1, help='Weighted sampler?')
+    parser.add_argument('--n_calibration', type=int, default=0, help='n_calibration?')
 
     args = parser.parse_args()
     args.exp_id = f'{args.exp_id}_{args.task}'

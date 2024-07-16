@@ -78,3 +78,4 @@ def confidence_ellipse(x, y, ax, n_std=3.0, facecolor='none', train_set=True, **
 
 def rand_jitter(arr):
     return arr + np.random.randn(len(arr)) * 0.01
+
