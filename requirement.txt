@@ -27,3 +27,6 @@ neptune
 fastapi==0.89.1
 mlflow[extras]==2.2.1
 threadpoolctl==3.1.0
+transformers
+opencv-python
+mysql-connector-python

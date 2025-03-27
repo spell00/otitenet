@@ -3,8 +3,546 @@ from torch import nn
 from torch.autograd import Variable
 import torch.nn.functional as F
 from torch.autograd import Function
-from torchvision.models import resnet18, ResNet18_Weights, vgg16, VGG16_Weights, resnet50, ResNet50_Weights
 import pandas as pd
+from torchvision.models import resnet18, ResNet18_Weights, vgg16, VGG16_Weights, resnet50, ResNet50_Weights, \
+      efficientnet_b0, EfficientNet_B0_Weights, vit_b_16, ViT_B_16_Weights, efficientnet_b7, EfficientNet_B7_Weights, \
+        vgg11, VGG11_Weights, densenet121, DenseNet121_Weights
+
+
+
+def replace_bn_with_gn(module, num_groups=32):
+    """Recursively replace all BatchNorm2d layers with GroupNorm in a model."""
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            num_channels = child.num_features  # Get the number of channels
+            setattr(module, name, nn.GroupNorm(num_groups, num_channels))  # Replace with GroupNorm
+        else:
+            replace_bn_with_gn(child, num_groups)  # Recursively process submodules
+    return module
+
+class ReverseLayerF(Function):
+
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        output = grad_output.neg() * ctx.alpha
+
+        return output, None
+
+
+class Net(nn.Module):
+    def __init__(self, device, n_cats, n_batches, model_name='resnet18', is_stn=1, n_subcenters=3):
+        super(Net, self).__init__()
+        self.device = device
+        if model_name == 'resnet18':
+            weights = ResNet18_Weights.DEFAULT
+            self.model = resnet18(weights=weights).to(device)
+            self.model = torch.nn.Sequential(*(list(self.model.children())[:-1]))
+            self.dann = nn.Linear(512, n_batches).to(device)
+            self.linear = nn.Linear(512, n_cats).to(device)
+        if model_name == 'resnet18t':
+            weights = ResNet18_Weights.DEFAULT
+            self.model = resnet18(weights=weights).to(device)
+            self.model = torch.nn.Sequential(*(list(self.model.children())[:-4]) + [torch.nn.AdaptiveAvgPool2d((1, 1))])
+            self.dann = nn.Linear(128, n_batches).to(device)
+            self.linear = nn.Linear(128, n_cats).to(device)
+        elif model_name == 'resnet50':
+            weights = ResNet50_Weights.DEFAULT
+            self.model = resnet50(weights=weights).to(device)
+            self.model = torch.nn.Sequential(*(list(self.model.children())[:-1]))
+            self.dann = nn.Linear(2048, n_batches).to(device)
+            self.linear = nn.Linear(2048, n_cats).to(device)
+        elif model_name == 'vgg16':
+            weights = VGG16_Weights.DEFAULT
+            self.model = vgg16(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'densenet121':
+            weights = DenseNet121_Weights.DEFAULT
+            self.model = densenet121(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'vit':
+            weights = ViT_B_16_Weights.DEFAULT
+            self.model = vit_b_16(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'efficientnet_b0':
+            weights = EfficientNet_B0_Weights.DEFAULT
+            self.model = efficientnet_b0(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'efficientnet_b7':
+            weights = EfficientNet_B7_Weights.DEFAULT
+            self.model = efficientnet_b7(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        
+        self.is_stn = is_stn
+        self.n_cats = n_cats
+        self.n_subcenters = n_subcenters
+        
+        # Add sub-centers for each class
+        if model_name == 'resnet50':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 2048).to(device))
+        elif model_name == 'resnet18':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 512).to(device))
+        elif model_name == 'resnet18t':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 128).to(device))
+        elif model_name == 'vgg16':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+        elif model_name == 'vit':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+        elif model_name == 'efficientnet_b0':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+        elif model_name == 'efficientnet_b7':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+        elif model_name == 'densenet121':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+            
+        self.linear = nn.Linear(512, 2).to(device)
+
+        # Spatial transformer localization-network (unchanged)
+        self.localization = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=7),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            nn.Conv2d(16, 32, kernel_size=5),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            nn.Conv2d(32, 64, kernel_size=5),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            nn.Conv2d(64, 128, kernel_size=5),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            nn.Conv2d(128, 128, kernel_size=3),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True)
+        ).to(device)
+
+        # Regressor for the 3 * 2 affine matrix (unchanged)
+        self.fc_loc = nn.Sequential(
+            nn.Linear(128 * 4 * 4, 32),
+            nn.ReLU(True),
+            nn.Linear(32, 3 * 2)
+        ).to(device)
+
+        # Initialize the weights/bias with identity transformation (unchanged)
+        self.fc_loc[2].weight.data.zero_()
+        self.fc_loc[2].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
+
+    def stn(self, x):
+        # Spatial transformer network forward function (unchanged)
+        xs = self.localization(x)
+        xs = xs.view(-1, 128 * 4 * 4)
+        theta = self.fc_loc(xs)
+        theta = theta.view(-1, 2, 3)
+        grid = F.affine_grid(theta, x.size())
+        x = F.grid_sample(x, grid)
+        return x
+
+    def forward(self, inp):
+        # Transform the input
+        if self.is_stn:
+            inp = self.stn(inp)
+
+        # Perform the usual forward pass
+        enc = self.model(inp)
+        enc = enc.squeeze(-1).squeeze(-1)
+        reverse = ReverseLayerF.apply(enc, 1)
+        domout = self.dann(reverse)
+
+        try:
+            return enc, F.log_softmax(domout, dim=1)
+        except Exception as e:
+            print(f"An error occurred: {e}")    
+
+    def predict_proba(self, inp):
+        """
+        Returns the probability of each class for the given input.
+        """
+        proba = self.linear(torch.Tensor(inp).to(self.device)).softmax(dim=1)
+        return proba.detach().cpu().numpy()
+
+    def get_subcenters(self):
+        """
+        Returns the sub-centers for each class.
+        """
+        return self.subcenters
+
+
+class Net_shap(nn.Module):
+    def __init__(self, device, n_cats, n_batches, model_name='resnet18', is_stn=1, n_subcenters=3):
+        super(Net_shap, self).__init__()
+        if model_name == 'resnet18':
+            weights = ResNet18_Weights.DEFAULT
+            self.model = resnet18_no_inplace(weights=weights).to(device)
+            self.model = torch.nn.Sequential(*(list(self.model.children())[:-1]))
+            self.dann = nn.Linear(512, n_batches).to(device)
+            self.linear = nn.Linear(512, n_cats).to(device)
+        if model_name == 'resnet18t':
+            weights = ResNet18_Weights.DEFAULT
+            self.model = resnet18_no_inplace(weights=weights).to(device)
+            self.model = torch.nn.Sequential(*(list(self.model.children())[:-4]) + [torch.nn.AdaptiveAvgPool2d((1, 1))])
+            self.dann = nn.Linear(128, n_batches).to(device)
+            self.linear = nn.Linear(128, n_cats).to(device)
+        elif model_name == 'resnet50':
+            weights = ResNet50_Weights.DEFAULT
+            self.model = resnet50(weights=weights).to(device)
+            self.model = torch.nn.Sequential(*(list(self.model.children())[:-1]))
+            self.dann = nn.Linear(2048, n_batches).to(device)
+            self.linear = nn.Linear(2048, n_cats).to(device)
+        elif model_name == 'vgg16':
+            weights = VGG16_Weights.DEFAULT
+            self.model = vgg16(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'vit':
+            weights = ViT_B_16_Weights.DEFAULT
+            self.model = vit_b_16(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'efficientnet_b0':
+            weights = EfficientNet_B0_Weights.DEFAULT
+            self.model = efficientnet_b0(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'efficientnet_b7':
+            weights = EfficientNet_B7_Weights.DEFAULT
+            self.model = efficientnet_b7(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'densenet121':
+            weights = DenseNet121_Weights.DEFAULT
+            self.model = densenet121(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+
+        # Replace ReLU with non-in-place version
+        for module in self.model.modules():
+            if isinstance(module, nn.ReLU):
+                module.inplace = False
+        
+        self.is_stn = is_stn
+        self.n_cats = n_cats
+        self.n_subcenters = n_subcenters
+        
+        # Add sub-centers for each class
+        if model_name == 'resnet50':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 2048).to(device))
+        elif model_name == 'resnet18':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 512).to(device))
+        elif model_name == 'resnet18t':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 128).to(device))
+        elif model_name == 'vgg16':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+        elif model_name == 'vit':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+        elif model_name == 'efficientnet_b0':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+        elif model_name == 'efficientnet_b7':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+        elif model_name == 'densenet121':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+            
+        self.linear = nn.Linear(512, 2).to(device)
+
+        # Spatial transformer localization-network (unchanged)
+        self.localization = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=7),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            nn.Conv2d(16, 32, kernel_size=5),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            nn.Conv2d(32, 64, kernel_size=5),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            nn.Conv2d(64, 128, kernel_size=5),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            nn.Conv2d(128, 128, kernel_size=3),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True)
+        ).to(device)
+
+        # Regressor for the 3 * 2 affine matrix (unchanged)
+        self.fc_loc = nn.Sequential(
+            nn.Linear(128 * 4 * 4, 32),
+            nn.ReLU(True),
+            nn.Linear(32, 3 * 2)
+        ).to(device)
+
+        # Initialize the weights/bias with identity transformation (unchanged)
+        self.fc_loc[2].weight.data.zero_()
+        self.fc_loc[2].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
+
+    def stn(self, x):
+        # Spatial transformer network forward function (unchanged)
+        xs = self.localization(x)
+        xs = xs.view(-1, 128 * 4 * 4)
+        theta = self.fc_loc(xs)
+        theta = theta.view(-1, 2, 3)
+        grid = F.affine_grid(theta, x.size())
+        x = F.grid_sample(x, grid)
+        return x
+
+    def forward(self, inp):
+        # Transform the input
+        if self.is_stn:
+            inp = self.stn(inp)
+
+        # Perform the usual forward pass
+        enc = self.model(inp)
+        enc = enc.squeeze(-1).squeeze(-1)
+
+        return enc   
+
+    def get_subcenters(self):
+        """
+        Returns the sub-centers for each class.
+        """
+        return self.subcenters
+    
+    def predict_proba(self, inp):
+        """
+        Returns the probability of each class for the given input.
+        """
+        enc = self.model(torch.Tensor(inp).reshape(-1, self.shape[0], self.shape[1], self.shape[2]).to('cpu'))
+        enc = enc.squeeze(-1).squeeze(-1)
+        proba = self.linear(enc).softmax(dim=1)
+        return proba.detach().cpu().numpy()
+
+    def predict_emb_proba(self, inp):
+        """
+        Returns the probability of each class for the given input.
+        """
+        inp = torch.Tensor(inp).to('cpu')
+        enc = inp.squeeze(-1).squeeze(-1)
+        proba = self.linear.to('cpu')(enc).softmax(dim=1)
+        return proba.detach().cpu().numpy()
+
+
+class Net_deep_shap(nn.Module):
+    def __init__(self, device, n_cats, n_batches, model_name='resnet18', is_stn=1, n_subcenters=3, shape=(3, 224, 224)):
+        super(Net_deep_shap, self).__init__()
+        self.shape = shape
+        if model_name == 'resnet18':
+            weights = ResNet18_Weights.DEFAULT
+            self.model = resnet18_no_inplace(weights=weights).to(device)
+            self.model = torch.nn.Sequential(*(list(self.model.children())[:-1]))
+            self.dann = nn.Linear(512, n_batches).to(device)
+            self.linear = nn.Linear(512, n_cats).to(device)
+        if model_name == 'resnet18t':
+            weights = ResNet18_Weights.DEFAULT
+            self.model = resnet18_no_inplace(weights=weights).to(device)
+            self.model = torch.nn.Sequential(*(list(self.model.children())[:-4]) + [torch.nn.AdaptiveAvgPool2d((1, 1))])
+            self.dann = nn.Linear(128, n_batches).to(device)
+            self.linear = nn.Linear(128, n_cats).to(device)
+        elif model_name == 'resnet50':
+            weights = ResNet50_Weights.DEFAULT
+            self.model = resnet50(weights=weights).to(device)
+            self.model = torch.nn.Sequential(*(list(self.model.children())[:-1]))
+            self.dann = nn.Linear(2048, n_batches).to(device)
+            self.linear = nn.Linear(2048, n_cats).to(device)
+        elif model_name == 'vgg16':
+            weights = VGG16_Weights.DEFAULT
+            self.model = vgg16(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'vit':
+            weights = ViT_B_16_Weights.DEFAULT
+            self.model = vit_b_16(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'efficientnet_b0':
+            weights = EfficientNet_B0_Weights.DEFAULT
+            self.model = efficientnet_b0(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'efficientnet_b7':
+            weights = EfficientNet_B7_Weights.DEFAULT
+            self.model = efficientnet_b7(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'densenet121':
+            weights = DenseNet121_Weights.DEFAULT
+            self.model = densenet121(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+
+        # Replace ReLU with non-in-place version
+        for module in self.model.modules():
+            if isinstance(module, nn.ReLU):
+                module.inplace = False
+        
+        self.is_stn = is_stn
+        self.n_cats = n_cats
+        self.n_subcenters = n_subcenters
+        
+        # Add sub-centers for each class
+        if model_name == 'resnet50':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 2048).to(device))
+        elif model_name == 'resnet18':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 512).to(device))
+        elif model_name == 'resnet18t':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 128).to(device))
+        elif model_name == 'vgg16':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+        elif model_name == 'vit':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+        elif model_name == 'efficientnet_b0':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+        elif model_name == 'efficientnet_b7':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+        elif model_name == 'densenet121':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+            
+        self.linear = nn.Linear(512, 2).to(device)
+
+        # Spatial transformer localization-network (unchanged)
+        self.localization = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=7),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            nn.Conv2d(16, 32, kernel_size=5),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            nn.Conv2d(32, 64, kernel_size=5),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            nn.Conv2d(64, 128, kernel_size=5),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            nn.Conv2d(128, 128, kernel_size=3),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True)
+        ).to(device)
+
+        # Regressor for the 3 * 2 affine matrix (unchanged)
+        self.fc_loc = nn.Sequential(
+            nn.Linear(128 * 4 * 4, 32),
+            nn.ReLU(True),
+            nn.Linear(32, 3 * 2)
+        ).to(device)
+
+        # Initialize the weights/bias with identity transformation (unchanged)
+        self.fc_loc[2].weight.data.zero_()
+        self.fc_loc[2].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
+
+    def stn(self, x):
+        # Spatial transformer network forward function (unchanged)
+        xs = self.localization(x)
+        xs = xs.view(-1, 128 * 4 * 4)
+        theta = self.fc_loc(xs)
+        theta = theta.view(-1, 2, 3)
+        grid = F.affine_grid(theta, x.size())
+        x = F.grid_sample(x, grid)
+        return x
+
+    def forward(self, inp):
+        # Transform the input
+        if self.is_stn:
+            inp = self.stn(inp)
+
+        # Perform the usual forward pass
+        enc = self.model(inp)
+        enc = enc.squeeze(-1).squeeze(-1)
+
+        return self.linear(enc).softmax(dim=1)   
+
+    def get_subcenters(self):
+        """
+        Returns the sub-centers for each class.
+        """
+        return self.subcenters
+    
+    def predict_proba(self, inp):
+        """
+        Returns the probability of each class for the given input.
+        """
+        enc = self.model(torch.Tensor(inp).reshape(-1, self.shape[0], self.shape[1], self.shape[2]).to('cpu'))
+        enc = enc.squeeze(-1).squeeze(-1)
+        proba = self.linear(enc).softmax(dim=1)
+        return proba.detach().cpu().numpy()
+
+    def predict_emb_proba(self, inp):
+        """
+        Returns the probability of each class for the given input.
+        """
+        inp = torch.Tensor(inp).to('cpu')
+        enc = inp.squeeze(-1).squeeze(-1)
+        proba = self.linear.to('cpu')(enc).softmax(dim=1)
+        return proba.detach().cpu().numpy()
+
+
+# Define a modified BasicBlock without inplace addition
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=False)  # Non-inplace ReLU
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out = out + identity  # Non-inplace addition
+        out = self.relu(out)
+
+        return out
+
+# Replace the BasicBlock in ResNet18
+def resnet18_no_inplace(weights):
+    model = resnet18(weights)
+    model.layer1 = nn.Sequential(
+        BasicBlock(64, 64),
+        BasicBlock(64, 64)
+    )
+    model.layer2 = nn.Sequential(
+        BasicBlock(64, 128, stride=2, downsample=nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=1, stride=2, bias=False),
+            nn.BatchNorm2d(128)
+        )),
+        BasicBlock(128, 128)
+    )
+    model.layer3 = nn.Sequential(
+        BasicBlock(128, 256, stride=2, downsample=nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=1, stride=2, bias=False),
+            nn.BatchNorm2d(256)
+        )),
+        BasicBlock(256, 256)
+    )
+    model.layer4 = nn.Sequential(
+        BasicBlock(256, 512, stride=2, downsample=nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=1, stride=2, bias=False),
+            nn.BatchNorm2d(512)
+        )),
+        BasicBlock(512, 512)
+    )
+    return model
 
 
 # https://github.com/DHUDBlab/scDSC/blob/1247a63aac17bdfb9cd833e3dbe175c4c92c26be/layers.py#L43
@@ -24,20 +562,6 @@ class DispAct(nn.Module):
     def forward(self, x):
         return torch.clamp(F.softplus(x), min=1e-4, max=1e4)
 
-
-class ReverseLayerF(Function):
-
-    @staticmethod
-    def forward(ctx, x, alpha):
-        ctx.alpha = alpha
-
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        output = grad_output.neg() * ctx.alpha
-
-        return output, None
 
 
 def grad_reverse(x):
@@ -646,109 +1170,3 @@ class AutoEncoder(nn.Module):
     #res = torch.nan_to_num(res, 0)
     #return torch.sum(res, axis=-1)
 
-class ReverseLayerF(Function):
-
-    @staticmethod
-    def forward(ctx, x, alpha):
-        ctx.alpha = alpha
-
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        output = grad_output.neg() * ctx.alpha
-
-        return output, None
-
-
-class Net(nn.Module):
-    def __init__(self, device, n_cats, n_batches, model_name='resnet18', is_stn=1):
-        super(Net, self).__init__()
-        if model_name == 'resnet18':
-            weights = ResNet18_Weights.DEFAULT
-            self.model = resnet18(weights=weights).to(device)
-            self.model = torch.nn.Sequential(*(list(self.model.children())[:-1]))
-            self.dann = nn.Linear(512, n_batches).to(device)
-        elif model_name == 'resnet50':
-            weights = ResNet50_Weights.DEFAULT
-            self.model = resnet50(weights=weights).to(device)
-            self.model = torch.nn.Sequential(*(list(self.model.children())[:-1]))
-            self.dann = nn.Linear(2048, n_batches).to(device)
-        elif model_name == 'vgg16':
-            weights = VGG16_Weights.DEFAULT
-            self.model = vgg16(weights=weights).to(device)
-            self.dann = nn.Linear(1000, n_batches).to(device)
-        self.is_stn = is_stn
-        
-        self.classifier = nn.Linear(512, n_cats).to(device)
-
-        # Spatial transformer localization-network
-        self.localization = nn.Sequential(nn.Conv2d(3, 16, kernel_size=7),
-                                          nn.MaxPool2d(2, stride=2),
-                                          nn.ReLU(True),
-                                          nn.Conv2d(16, 32, kernel_size=5),
-                                          nn.MaxPool2d(2, stride=2),
-                                          nn.ReLU(True),
-                                          nn.Conv2d(32, 64, kernel_size=5),
-                                          nn.MaxPool2d(2, stride=2),
-                                          nn.ReLU(True),
-                                          nn.Conv2d(64, 128, kernel_size=5),
-                                          nn.MaxPool2d(2, stride=2),
-                                          nn.ReLU(True),
-                                          nn.Conv2d(128, 128, kernel_size=3),
-                                          nn.MaxPool2d(2, stride=2),
-                                          nn.ReLU(True)).to(device)
-
-        # Regressor for the 3 * 2 affine matrix
-        self.fc_loc = nn.Sequential(
-            nn.Linear(128 * 4 * 4, 32),
-            nn.ReLU(True),
-            nn.Linear(32, 3 * 2)
-        ).to(device)
-
-        # Initialize the weights/bias with identity transformation
-        self.fc_loc[2].weight.data.zero_()
-        self.fc_loc[2].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
-        # self.fc_loc[2].bias.data.copy_(
-        #     torch.tensor([0.2, 0, 0], dtype=torch.float)) #set scaling to start at 0.2 (~28/128)
-        # self.random_init()
-
-    # Spatial transformer network forward function
-    def stn(self, x):
-        xs = self.localization(x)
-        xs = xs.view(-1, 128 * 4 * 4)
-        theta = self.fc_loc(xs)
-        theta = theta.view(-1, 2, 3)
-
-        grid = F.affine_grid(theta, x.size())
-        x = F.grid_sample(x, grid)
-
-        return x
-
-    def forward(self, inp):
-        # transform the input
-        if self.is_stn:
-            inp = self.stn(inp)
-
-        # Perform the usual forward pass
-        enc = self.model(inp).squeeze()
-        reverse = ReverseLayerF.apply(enc, 1)
-        domout = self.dann(reverse)
-
-        return enc, domout
-
-    def random_init(self, init_func=nn.init.kaiming_uniform_):
-        for m in self.modules():
-            if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-                init_func(m.weight.data)
-                if m.bias is not None:
-                    m.bias.data.zero_()
-            # if isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
-            #     nn.init.constant_(m.weight, 0.975)
-            #     nn.init.constant_(m.bias, 0.125)
-
-    def predict(self, enc):
-        return self.classifier(enc).argmax(1).detach().cpu().numpy()
-
-    def predict_proba(self, enc):
-        return torch.softmax(self.classifier(enc), 1).detach().cpu().numpy()

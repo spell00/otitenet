@@ -18,7 +18,8 @@ def make_dataset_folder(path, size, new_path='data/otite_ds'):
     datasets = np.array([])
     # groups = np.array([])
 
-    for dataset in ['Banque_Calaman_USA_2020_trie_CM', 'Banque_Viscaino_Chili_2020', 'Banque_Comert_Turquie_2020_jpg', 'GMFUNL_jan2023']:
+    for dataset in ['Banque_Calaman_USA_2020_trie_CM', 'Banque_Viscaino_Chili_2020', 
+                    'Banque_Comert_Turquie_2020_jpg', 'GMFUNL_jan2023']:
         if dataset == 'Banque_Calaman_USA_2020_trie_CM':
             for label in os.listdir(f"{path}/{dataset}"):
                 if label == ".DS_Store" or '.xlsx' in label:
@@ -27,7 +28,8 @@ def make_dataset_folder(path, size, new_path='data/otite_ds'):
                     if '.jpg' not in im or 'Off' in im or 'off' in im:
                         continue
                     png = Image.open(f"{path}/{dataset}/{label}/{im}")
-                    png = transforms.Resize((size, size))(png)
+                    if size != -1:
+                        png = transforms.Resize((size, size))(png)
                     png.save(f"{new_path}/{im}")
 
                     # pngs[group].append(np.array(png))
@@ -51,7 +53,8 @@ def make_dataset_folder(path, size, new_path='data/otite_ds'):
                     if 'Off' in im or 'off' in im or '.png' not in im:
                         continue
                     png = Image.open(f"{path}/{dataset}/{label}/{im}")
-                    png = transforms.Resize((size, size))(png)
+                    if size != -1:
+                        png = transforms.Resize((size, size))(png)
                     png.save(f"{new_path}/{im}")
 
                     # pngs[group].append(np.array(png))
@@ -81,7 +84,8 @@ def make_dataset_folder(path, size, new_path='data/otite_ds'):
                         if '.jpg' not in im or 'Off' in im or 'off' in im:
                             continue
                         png = Image.open(f"{path}/{dataset}/{g}/{label}/{im}")
-                        png = transforms.Resize((size, size))(png)
+                        if size != -1:
+                            png = transforms.Resize((size, size))(png)
                         png.save(f"{new_path}/{im}")
 
                         # pngs[group].append(np.array(png))
@@ -99,7 +103,8 @@ def make_dataset_folder(path, size, new_path='data/otite_ds'):
                     if '.png' not in im or 'Off' in im or 'off' in im:
                         continue
                     png = Image.open(f"{path}/{dataset}/{label}/{im}")
-                    png = transforms.Resize((size, size))(png)
+                    if size != -1:
+                        png = transforms.Resize((size, size))(png)
                     png.save(f"{new_path}/{im}")
 
                     new_labels = np.concatenate((new_labels.reshape(1, -1), np.array([label]).reshape(1, -1)), 1)
@@ -126,7 +131,8 @@ def make_dataset_folder(path, size, new_path='data/otite_ds'):
                     if '.jpg' not in im or 'Off' in im or 'off' in im:
                         continue
                     png = Image.open(f"{path}/{dataset}/{label}/{im}")
-                    png = transforms.Resize((size, size))(png)
+                    if size != -1:
+                        png = transforms.Resize((size, size))(png)
                     png.save(f"{new_path}/{im}")
 
                     # pngs[group].append(np.array(png))
@@ -155,4 +161,4 @@ def make_dataset_folder(path, size, new_path='data/otite_ds'):
     df.to_csv(f"{new_path}/infos.csv", index=False)
 
 if __name__ == '__main__':
-    make_dataset_folder(path='data/QC-CM', size=64, new_path='data/otite_ds')
+    make_dataset_folder(path='data/QC-CM', size=224, new_path='data/otite_ds')

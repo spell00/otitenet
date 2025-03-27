@@ -21,6 +21,7 @@ from sklearn.metrics import roc_auc_score, PrecisionRecallDisplay
 # from src.ml.train.sklearn_train_nocv import Train
 from skopt import gp_minimize
 from sklearn.preprocessing import label_binarize, OneHotEncoder
+from PIL import Image
 
 
 def scale_data(scale, data, device='cpu'):
@@ -940,7 +941,7 @@ def get_empty_dicts():
         'dom_acc': [0],
     }
 
-    for g in ['all', 'train', 'valid', 'test', 'all_pool', 'train_pool', 'valid_pool', 'test_pool', 'all_pool']:
+    for g in ['all', 'train', 'valid', 'test', 'calibration']:
         values[g] = {
             "closs": [],
             "dloss": [],
@@ -1029,7 +1030,7 @@ def get_empty_traces():
         'dom_acc': [],
     }
     lists = {}
-    for g in ['all', 'train', 'valid', 'test', 'train_pool', 'valid_pool', 'test_pool', 'all_pool']:
+    for g in ['all', 'train', 'valid', 'test']:
         lists[g] = {
             'set': [],
             'preds': [],
@@ -1052,6 +1053,7 @@ def get_empty_traces():
             'names': [],
             'inputs': [],
             'rec_values': [],
+            'subcenters': [],
         }
         traces[g] = {
             'dloss': [],
@@ -1079,7 +1081,6 @@ def log_traces(traces, values):
 
     if len(traces['train']['closs']) > 0:
         for g in list(traces.keys())[3:]:
-            # if g not in ['all', 'all_pool']:
             values[g]['dloss'] += [np.mean(traces[g]['dloss'])]
             values[g]['closs'] += [np.mean(traces[g]['closs'])]
             values[g]['dom_acc'] += [np.mean(traces[g]['dom_acc'])]
@@ -1160,119 +1161,6 @@ def get_best_values(values, ae_only=False, n_agg=10):
     return best_values
 
 
-def add_to_logger(values, logger, epoch):
-    """
-    Add values to the tensorboarX logger
-    Args:
-        values: Dict of values to be logged
-        logger: Logger for the current experiment
-        epoch: Epoch of the values getting logged
-
-    """
-    if not np.isnan(values['rec_loss'][-1]):
-        logger.add_scalar(f'rec_loss', values['rec_loss'][-1], epoch)
-        logger.add_scalar(f'dom_loss', values['dom_loss'][-1], epoch)
-        logger.add_scalar(f'dom_acc', values['dom_acc'][-1], epoch)
-    for group in list(values.keys())[4:]:
-        try:
-            if not np.isnan(values[group]['closs'][-1]):
-                logger.add_scalar(f'/closs/{group}', values[group]['closs'][-1], epoch)
-            if not np.isnan(values[group]['acc'][-1]):
-                logger.add_scalar(f'/acc/{group}', values[group]['acc'][-1], epoch)
-            if not np.isnan(values[group]['mcc'][-1]):
-                logger.add_scalar(f'/mcc/{group}', values[group]['mcc'][-1], epoch)
-            if not np.isnan(values[group]['ppv'][-1]):
-                logger.add_scalar(f'/ppv/{group}', values[group]['ppv'][-1], epoch)
-            if not np.isnan(values[group]['npv'][-1]):
-                logger.add_scalar(f'/npv/{group}', values[group]['npv'][-1], epoch)
-            if not np.isnan(values[group]['tpr'][-1]):
-                logger.add_scalar(f'/tpr/{group}', values[group]['tpr'][-1], epoch)
-            if not np.isnan(values[group]['fpr'][-1]):
-                logger.add_scalar(f'/fpr/{group}', values[group]['fpr'][-1], epoch)
-            if not np.isnan(values[group]['top3'][-1]):
-                logger.add_scalar(f'/top3/{group}', values[group]['top3'][-1], epoch)
-        except:
-            pass
-
-
-def add_to_neptune(values, run, epoch):
-    """
-    Add values to the neptune run
-    Args:
-        values: Dict of values to be logged
-        run: Logger for the current experiment
-        epoch: Epoch of the values getting logged
-
-    """
-    if not np.isnan(values['rec_loss'][-1]):
-        run["rec_loss"].log(values['rec_loss'][-1])
-        run["dom_loss"].log(values['dom_loss'][-1])
-        run["dom_acc"].log(values['dom_acc'][-1])
-    for group in list(values.keys())[4:]:
-        try:
-            if not np.isnan(values[group]['closs'][-1]):
-                run[f'/closs/{group}'].log(values[group]['closs'][-1])
-            if not np.isnan(values[group]['acc'][-1]):
-                run[f'/acc/{group}'].log(values[group]['acc'][-1])
-            if not np.isnan(values[group]['mcc'][-1]):
-                run[f'/mcc/{group}'].log(values[group]['mcc'][-1])
-            if not np.isnan(values[group]['tpr'][-1]):
-                run[f'/tpr/{group}'].log(values[group]['tpr'][-1])
-            if not np.isnan(values[group]['tnr'][-1]):
-                run[f'/tnr/{group}'].log(values[group]['tnr'][-1])
-            if not np.isnan(values[group]['ppv'][-1]):
-                run[f'/ppv/{group}'].log(values[group]['ppv'][-1])
-            if not np.isnan(values[group]['npv'][-1]):
-                run[f'/npv/{group}'].log(values[group]['npv'][-1])
-            if not np.isnan(values[group]['top3'][-1]):
-                run[f'/top3/{group}'].log(values[group]['top3'][-1])
-        except:
-            pass
-
-
-def add_to_mlflow(values, epoch):
-    """
-    Add values to the mlflow logger
-    Args:
-        values: Dict of values to be logged
-        logger: Logger for the current experiment
-        epoch: Epoch of the values getting logged
-
-    """
-    if len(values['rec_loss']) > 0:
-        if not np.isnan(values['rec_loss'][-1]):
-            mlflow.log_metric("rec_loss", values['rec_loss'][-1], epoch)
-    if len(values['dom_loss']) > 0:
-        if not np.isnan(values['dom_loss'][-1]):
-            mlflow.log_metric("dom_loss", values['dom_loss'][-1], epoch)
-    if len(values['dom_acc']) > 0:
-        if not np.isnan(values['dom_acc'][-1]):
-            mlflow.log_metric("dom_acc", values['dom_acc'][-1], epoch)
-    for group in list(values.keys())[4:]:
-        try:
-            if not np.isnan(values[group]['closs'][-1]):
-                mlflow.log_metric(f'closs/{group}', values[group]['closs'][-1], epoch)
-            if not np.isnan(values[group]['dloss'][-1]):
-                mlflow.log_metric(f'dloss/{group}', values[group]['dloss'][-1], epoch)
-            if not np.isnan(values[group]['acc'][-1]):
-                mlflow.log_metric(f'acc/{group}', values[group]['acc'][-1], epoch)
-            if not np.isnan(values[group]['dom_acc'][-1]):
-                mlflow.log_metric(f'dom_acc/{group}', values[group]['dom_acc'][-1], epoch)
-            if not np.isnan(values[group]['mcc'][-1]):
-                mlflow.log_metric(f'mcc/{group}', values[group]['mcc'][-1], epoch)
-            if not np.isnan(values[group]['tpr'][-1]):
-                mlflow.log_metric(f'tpr/{group}', values[group]['tpr'][-1], epoch)
-            if not np.isnan(values[group]['tnr'][-1]):
-                mlflow.log_metric(f'tnr/{group}', values[group]['tnr'][-1], epoch)
-            if not np.isnan(values[group]['ppv'][-1]):
-                mlflow.log_metric(f'ppv/{group}', values[group]['ppv'][-1], epoch)
-            if not np.isnan(values[group]['npv'][-1]):
-                mlflow.log_metric(f'npv/{group}', values[group]['npv'][-1], epoch)
-            if not np.isnan(values[group]['top3'][-1]):
-                mlflow.log_metric(f'top3/{group}', values[group]['top3'][-1], epoch)
-        except:
-            pass
-
 
 def count_labels(arr):
     """
@@ -1294,3 +1182,75 @@ def count_labels(arr):
             to_remove += [key]
 
     return to_remove
+
+
+
+def save_tensor(tensor_image, name="saved_image.png"):
+    """
+    Save a tensor image to disk.
+    """
+    # Normalize to [0,1]
+    tensor_image = (tensor_image - tensor_image.min()) / (tensor_image.max() - tensor_image.min())
+
+    # Convert to [0,255] (uint8)
+    tensor_image = (tensor_image * 255).byte()
+
+    # Convert from (C, H, W) → (H, W, C) for saving
+    tensor_image = tensor_image.permute(1, 2, 0).cpu().numpy()
+
+    # Convert to PIL Image
+    image_pil = Image.fromarray(tensor_image)
+
+    # Save the image
+    image_pil.save(name) 
+
+def get_best_params(run, best_vals):
+    """
+    Placeholder function to get the best parameters.
+    Returns:
+        dict: Best parameters.
+    """
+    best_params = {}
+    best_params['params/lr'] = run['lr'].fetch()
+    best_params['params/wd'] = run['wd'].fetch()
+    best_params['params/margin'] = run['margin'].fetch()
+    best_params['params/dmargin'] = run['dmargin'].fetch()
+    best_params['params/smoothing'] = run['smooth'].fetch()
+    best_params['params/is_transform'] = run['is_transform'].fetch()
+    best_params['params/gamma'] = run['gamma'].fetch()
+    best_params['params/dropout'] = run['dropout'].fetch()
+    best_params['params/dist_fct'] = run['distance_fct'].fetch()
+    best_params['model_name'] = run['model_name'].fetch()
+    best_params['exp_id'] = run['exp_id'].fetch()
+    best_params['is_stn'] = run['is_stn'].fetch()
+    best_params['n_calibration'] = run['n_calibration'].fetch()
+    best_params['distance_fct'] = run['distance_fct'].fetch()
+    best_params['groupkfold'] = run['groupkfold'].fetch()
+    best_params['dloss'] = run['dloss'].fetch()
+    best_params['is_transform'] = run['is_transform'].fetch()
+    best_params['lr'] = run['lr'].fetch()
+    best_params['wd'] = run['wd'].fetch()
+    best_params['margin'] = run['margin'].fetch()
+    best_params['dmargin'] = run['dmargin'].fetch()
+    best_params['smooth'] = run['smooth'].fetch()
+    best_params['gamma'] = run['gamma'].fetch()
+    best_params['dropout'] = run['dropout'].fetch()
+    best_params['optimizer_type'] = run['optimizer_type'].fetch()
+    best_params['foldername'] = run['foldername'].fetch()
+    best_params['seed'] = run['seed'].fetch()
+    best_params['n_negatives'] = run['n_negatives'].fetch()
+    best_params['n_positives'] = run['n_positives'].fetch()
+    best_params['n_epochs'] = run['n_epochs'].fetch()
+    best_params['bs'] = run['bs'].fetch()
+    best_params['weighted_sampler'] = run['weighted_sampler'].fetch()
+    best_params['random_recs'] = run['random_recs'].fetch()
+    best_params['prototypes_to_use'] = run['prototypes_to_use'].fetch()
+    best_params['classif_loss'] = run['classif_loss'].fetch()
+    best_params['complete_log_path'] = run['complete_log_path'].fetch()
+
+    best_params['mcc/valid'] = best_vals['valid']['mcc'][-1]
+    best_params['acc/valid'] = best_vals['valid']['acc'][-1]
+    best_params['mcc/test'] = best_vals['test']['mcc'][-1]
+    best_params['acc/test'] = best_vals['test']['acc'][-1]
+
+    return best_params

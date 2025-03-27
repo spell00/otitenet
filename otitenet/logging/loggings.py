@@ -1,40 +1,246 @@
+import os
+NEPTUNE_API_TOKEN = os.getenv("NEPTUNE_API_TOKEN")
+NEPTUNE_PROJECT_NAME = "ADLab/otitenet"
+NEPTUNE_MODEL_NAME = "OT"
 # os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 # CUDA_VISIBLE_DEVICES = ""
-import os
-
-from tensorboard.plugins.hparams import api as hp
-import tensorflow as tf
-from sklearn.metrics import silhouette_score, adjusted_rand_score, adjusted_mutual_info_score
-from sklearn import metrics
-import numpy as np
+import shap
+import torch
 import mlflow
+import neptune
+
+import tensorflow as tf
+import numpy as np
 import pandas as pd
 import matplotlib
-import shap
 import itertools
-
-from otitenet.utils import get_unique_labels
-
-matplotlib.use('Agg')
-import torch
+import torchvision
+import seaborn as sns
 import matplotlib.pyplot as plt
+from sklearn import metrics
+from umap.umap_ import UMAP
 from matplotlib import rcParams, cycler
 from matplotlib.lines import Line2D
-from otitenet.plotting import confidence_ellipse
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.neighbors import KNeighborsClassifier
-from otitenet.metrics import batch_f1_score
-from otitenet.utils import log_confusion_matrix, save_roc_curve, save_precision_recall_curve
-import seaborn as sns
 from sklearn.decomposition import PCA
 from sklearn.cross_decomposition import CCA
-from umap.umap_ import UMAP
-from sklearn.manifold import TSNE
+from tensorboard.plugins.hparams import api as hp
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
+from sklearn.metrics import silhouette_score, adjusted_rand_score, adjusted_mutual_info_score
+
+matplotlib.use('Agg')
+from ..logging.plotting import confidence_ellipse
+from ..logging.metrics import batch_f1_score
+from ..utils.utils import get_unique_labels
 
 # It is useless to run tensorflow on GPU and it takes a lot of GPU RAM for nothing
 physical_devices = tf.config.list_physical_devices('CPU')
 tf.config.set_visible_devices(physical_devices)
+
+def log_mlflow(args, params, foldername):
+    """
+    Log the parameters to mlflow
+    Args:
+        args: Arguments passed to the script
+        params: Parameters to be logged
+        foldername: Name of the folder where the logs are stored
+
+    """
+    mlflow.set_experiment(
+        args.exp_id,
+    )
+    try:
+        mlflow.start_run()
+    except:
+        mlflow.end_run()
+        mlflow.start_run()
+
+    mlflow.log_param('margin', params['margin'])
+    mlflow.log_param('dmargin', params['dmargin'])
+    mlflow.log_param('smooth', params['smoothing'])
+    mlflow.log_param('wd', params['wd'])
+    mlflow.log_param('lr', params['lr'])
+    mlflow.log_param('gamma', params['gamma'])
+    mlflow.log_param('dropout', params['dropout'])
+    mlflow.log_param('optimizer_type', params['optimizer_type'])
+    mlflow.log_param('is_transform', params['is_transform'])
+    mlflow.log_param('distance_fct', params['dist_fct'])
+    mlflow.log_param('dloss', args.dloss)
+    mlflow.log_param('classif_loss', args.classif_loss)
+    mlflow.log_param('task', args.task)
+    mlflow.log_param('is_stn', args.is_stn)
+    mlflow.log_param('n_calibration', args.n_calibration)
+    mlflow.log_param('groupkfold', args.groupkfold)
+    mlflow.log_param('foldername', foldername)
+
+
+def create_neptune_run(args, params, complete_log_path, foldername):
+    # Create a Neptune run object
+    run = neptune.init_run(
+        project=NEPTUNE_PROJECT_NAME,
+        api_token=NEPTUNE_API_TOKEN,
+    )  # your credentials
+    # run["dataset"].track_files(f"{self.path}/{self.args.csv_file}")
+    # Track metadata and hyperparameters by assigning them to the run
+    run["params"] = params
+    run["n_neighbors"] = params['n_neighbors']
+    run["task"] = args.task
+    run["model_name"] = args.model_name
+    run["exp_id"] = args.exp_id
+    run["is_stn"] = args.is_stn
+    run["n_calibration"] = args.n_calibration
+    run["distance_fct"] = params['dist_fct']
+    run["groupkfold"] = args.groupkfold
+    run["dloss"] = args.dloss
+    run["is_transform"] = params['is_transform']
+    run["lr"] = params['lr']
+    run["wd"] = params['wd']
+    run["margin"] = params['margin']
+    run["dmargin"] = params['dmargin']
+    run["smooth"] = params['smoothing']
+    run["gamma"] = params['gamma']
+    run["dropout"] = params['dropout']
+    run["optimizer_type"] = params['optimizer_type']
+    run["seed"] = 42
+    run["n_negatives"] = args.n_negatives
+    run["n_positives"] = args.n_positives
+    run["n_epochs"] = args.n_epochs
+    run["bs"] = args.bs
+    run["weighted_sampler"] = args.weighted_sampler
+    run["random_recs"] = args.random_recs
+    run["prototypes_to_use"] = args.prototypes_to_use
+    run["classif_loss"] = args.classif_loss
+    run["epsilon"] = params['epsilon']
+    run["path"] = args.path
+    run["valid_dataset"] = args.valid_dataset
+    run["n_repeats"] = args.n_repeats
+    run['new_size'] = args.new_size
+    run["complete_log_path"] = complete_log_path
+    run["foldername"] = foldername
+
+    return run
+
+
+def add_to_neptune(values, run):
+    """
+    Add values to the neptune run
+    Args:
+        values: Dict of values to be logged
+        run: Logger for the current experiment
+        epoch: Epoch of the values getting logged
+
+    """
+    run['all/dloss'].log(values['all']['dloss'][-1])
+    for group in list(values.keys()):
+        try:
+            if not np.isnan(values[group]['closs'][-1]):
+                run[f'/closs/{group}'].log(values[group]['closs'][-1])
+            if not np.isnan(values[group]['acc'][-1]):
+                run[f'/acc/{group}'].log(values[group]['acc'][-1])
+            if not np.isnan(values[group]['mcc'][-1]):
+                run[f'/mcc/{group}'].log(values[group]['mcc'][-1])
+            if not np.isnan(values[group]['tpr'][-1]):
+                run[f'/tpr/{group}'].log(values[group]['tpr'][-1])
+            if not np.isnan(values[group]['tnr'][-1]):
+                run[f'/tnr/{group}'].log(values[group]['tnr'][-1])
+            if not np.isnan(values[group]['ppv'][-1]):
+                run[f'/ppv/{group}'].log(values[group]['ppv'][-1])
+            if not np.isnan(values[group]['npv'][-1]):
+                run[f'/npv/{group}'].log(values[group]['npv'][-1])
+            if not np.isnan(values[group]['top3'][-1]):
+                run[f'/top3/{group}'].log(values[group]['top3'][-1])
+        except:
+            pass
+
+
+def add_to_logger(values, logger, epoch):
+    """
+    Add values to the tensorboarX logger
+    Args:
+        values: Dict of values to be logged
+        logger: Logger for the current experiment
+        epoch: Epoch of the values getting logged
+
+    """
+    if not np.isnan(values['rec_loss'][-1]):
+        try:
+            logger.add_scalar(f'rec_loss', values['rec_loss'][-1], epoch)
+        except:
+            pass
+        try:
+            logger.add_scalar(f'dom_loss', values['dom_loss'][-1], epoch)
+        except:
+            pass
+        try:
+            logger.add_scalar(f'dom_acc', values['dom_acc'][-1], epoch)
+        except:
+            pass
+    for group in list(values.keys())[4:]:
+        try:
+            if not np.isnan(values[group]['closs'][-1]):
+                logger.add_scalar(f'/closs/{group}', values[group]['closs'][-1], epoch)
+            if not np.isnan(values[group]['acc'][-1]):
+                logger.add_scalar(f'/acc/{group}', values[group]['acc'][-1], epoch)
+            if not np.isnan(values[group]['mcc'][-1]):
+                logger.add_scalar(f'/mcc/{group}', values[group]['mcc'][-1], epoch)
+            if not np.isnan(values[group]['ppv'][-1]):
+                logger.add_scalar(f'/ppv/{group}', values[group]['ppv'][-1], epoch)
+            if not np.isnan(values[group]['npv'][-1]):
+                logger.add_scalar(f'/npv/{group}', values[group]['npv'][-1], epoch)
+            if not np.isnan(values[group]['tpr'][-1]):
+                logger.add_scalar(f'/tpr/{group}', values[group]['tpr'][-1], epoch)
+            if not np.isnan(values[group]['fpr'][-1]):
+                logger.add_scalar(f'/fpr/{group}', values[group]['fpr'][-1], epoch)
+            if not np.isnan(values[group]['top3'][-1]):
+                logger.add_scalar(f'/top3/{group}', values[group]['top3'][-1], epoch)
+        except:
+            pass
+
+
+def add_to_mlflow(values, epoch):
+    """
+    Add values to the mlflow logger
+    Args:
+        values: Dict of values to be logged
+        logger: Logger for the current experiment
+        epoch: Epoch of the values getting logged
+
+    """
+    if len(values['rec_loss']) > 0:
+        if not np.isnan(values['rec_loss'][-1]):
+            mlflow.log_metric("rec_loss", values['rec_loss'][-1], epoch)
+    if len(values['dom_loss']) > 0:
+        if not np.isnan(values['dom_loss'][-1]):
+            mlflow.log_metric("dom_loss", values['dom_loss'][-1], epoch)
+    if len(values['dom_acc']) > 0:
+        if not np.isnan(values['dom_acc'][-1]):
+            mlflow.log_metric("dom_acc", values['dom_acc'][-1], epoch)
+    for group in list(values.keys())[4:]:
+        try:
+            if not np.isnan(values[group]['closs'][-1]):
+                mlflow.log_metric(f'closs/{group}', values[group]['closs'][-1], epoch)
+            if not np.isnan(values[group]['dloss'][-1]):
+                mlflow.log_metric(f'dloss/{group}', values[group]['dloss'][-1], epoch)
+            if not np.isnan(values[group]['acc'][-1]):
+                mlflow.log_metric(f'acc/{group}', values[group]['acc'][-1], epoch)
+            if not np.isnan(values[group]['dom_acc'][-1]):
+                mlflow.log_metric(f'dom_acc/{group}', values[group]['dom_acc'][-1], epoch)
+            if not np.isnan(values[group]['mcc'][-1]):
+                mlflow.log_metric(f'mcc/{group}', values[group]['mcc'][-1], epoch)
+            if not np.isnan(values[group]['tpr'][-1]):
+                mlflow.log_metric(f'tpr/{group}', values[group]['tpr'][-1], epoch)
+            if not np.isnan(values[group]['tnr'][-1]):
+                mlflow.log_metric(f'tnr/{group}', values[group]['tnr'][-1], epoch)
+            if not np.isnan(values[group]['ppv'][-1]):
+                mlflow.log_metric(f'ppv/{group}', values[group]['ppv'][-1], epoch)
+            if not np.isnan(values[group]['npv'][-1]):
+                mlflow.log_metric(f'npv/{group}', values[group]['npv'][-1], epoch)
+            if not np.isnan(values[group]['top3'][-1]):
+                mlflow.log_metric(f'top3/{group}', values[group]['top3'][-1], epoch)
+        except:
+            pass
+
 
 class LogConfusionMatrix:
     def __init__(self, complete_log_path):
@@ -58,19 +264,14 @@ class LogConfusionMatrix:
             self.preds[group] += [np.concatenate(lists[group]['preds']).argmax(1)]
             self.classes[group] += [np.concatenate(lists[group]['classes'])]
             self.real_classes[group] += [np.concatenate(lists[group]['old_labels'])]
-            # self.encs[group] += [np.concatenate(lists[group]['encoded_values'])]
-            # try:
-            #     self.recs[group] += [np.concatenate(lists[group]['rec_values'])]
-            # except:
-            #     pass
             self.cats[group] += [np.concatenate(lists[group]['cats'])]
             self.batches[group] += [np.concatenate(lists[group]['domains'])]
 
     def plot(self, logger, epoch, unique_labels, mlops):
         for group in ['train', 'valid', 'test']:
-            preds = np.concatenate(self.preds[group])
-            classes = np.concatenate(self.classes[group])
-            real_classes = np.concatenate(self.real_classes[group])
+            preds = self.preds[group][-1]
+            classes = self.classes[group][-1]
+            real_classes = self.real_classes[group][-1]
             unique_real_classes = np.unique(real_classes)
 
             corrects = [1 if pred==label else 0 for pred, label in zip(preds, classes)]
@@ -488,6 +689,38 @@ def make_dependence_plot(df, values, var, group, run, log_path, category='explai
         plt.savefig(f'{log_path}/shap/dependence_{category}/{group}_values.png')
         mlflow.log_figure(f, f'{log_path}/shap/dependence_{category}/{group}_values.png')
     plt.close(f)
+
+
+def log_shap_images(run, model, inputs, class_names, group, log_path, mlops):
+    # python function to get model output; replace this function with your own model function.
+    transform = torchvision.transforms.Compose([
+        torchvision.transforms.ToTensor(),
+        # transforms.Grayscale(),
+        # transforms.Lambda(lambda x: x.broadcast_to(3, x.shape[1], x.shape[2]))
+        # transforms.Resize(224),
+        torchvision.transforms.Normalize(0.5, 0.5),
+    ])
+
+    inputs = torch.stack([transform(x) for x in inputs])
+
+    # define a masker that is used to mask out partitions of the input image.
+    masker_blur = shap.maskers.Image("blur(128,128)", inputs[0].shape)
+
+    # create an explainer with model and image masker
+    explainer_blur = shap.Explainer(model, masker_blur, output_names=class_names)
+
+    # here we explain two images using 500 evaluations of the underlying model to estimate the SHAP values
+    shap_values_fine = explainer_blur(inputs[1:3], max_evals=5000, batch_size=50, outputs=shap.Explanation.argsort.flip[:4])
+    shap.image_plot(shap_values_fine)
+    f = plt.gcf()
+    if mlops == 'neptune':
+        run[f'shap/images/{group}'].upload(f)
+    if mlops == 'mlflow':
+        os.makedirs(f'{log_path}/images/barold', exist_ok=True)
+        plt.savefig(f'{log_path}/images/barold/{group}_values.png')
+        mlflow.log_figure(f, f'{log_path}/images/barold/{group}_values.png')
+    plt.close(f)
+
 
 
 def log_explainer(model, x_df, labels, group, run, cats, log_path, device):
@@ -1464,43 +1697,6 @@ def log_metrics(logger, lists, values, model, unique_labels, unique_batches, epo
                               torch.Tensor(np.concatenate(lists['test']['age'])).view(-1, 1),
                               torch.Tensor(np.concatenate(lists['test']['gender'])).view(-1, 1),
                               ), 1)
-    try:
-        save_roc_curve(model,
-                       train_enc.to(device),
-                       np.concatenate(lists['train']['classes']),
-                       unique_labels, name='./roc_train', binary=bout, epoch=epoch,
-                       acc=values['train']['acc'][-1], logger=logger, mlops=mlops)
-        save_roc_curve(model,
-                       valid_enc.to(device),
-                       np.concatenate(lists['valid']['classes']),
-                       unique_labels, name='./roc_valid', binary=bout, epoch=epoch,
-                       acc=values['valid']['acc'][-1], logger=logger, mlops=mlops)
-        save_roc_curve(model,
-                       test_enc.to(device),
-                       np.concatenate(lists['test']['classes']),
-                       unique_labels, name='./roc_test', binary=bout, epoch=epoch,
-                       acc=values['test']['acc'][-1], logger=logger, mlops=mlops)
-    except:
-        print("\n\n\nProblem with ROC curves\n\n\n")
-
-    try:
-        save_precision_recall_curve(model,
-                                    train_enc.to(device),
-                                    np.concatenate(lists['train']['classes']),
-                                    unique_labels, name='./prc_train', binary=bout, epoch=epoch,
-                                    acc=values['train']['acc'][-1], logger=logger, mlops=mlops)
-        save_precision_recall_curve(model,
-                                    valid_enc.to(device),
-                                    np.concatenate(lists['valid']['classes']),
-                                    unique_labels, name='./prc_valid', binary=bout, epoch=epoch,
-                                    acc=values['valid']['acc'][-1], logger=logger, mlops=mlops)
-        save_precision_recall_curve(model,
-                                    test_enc.to(device),
-                                    np.concatenate(lists['test']['classes']),
-                                    unique_labels, name='./prc_test', binary=bout, epoch=epoch,
-                                    acc=values['test']['acc'][-1], logger=logger, mlops=mlops)
-    except:
-        print("\n\n\nProblem with precision/recall curves\n\n\n")
 
     return metrics
 
