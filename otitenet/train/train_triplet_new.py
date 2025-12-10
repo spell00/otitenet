@@ -36,6 +36,7 @@ from tensorboardX import SummaryWriter
 from ax.service.managed_loop import optimize
 from sklearn.metrics import matthews_corrcoef as MCC
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+import mysql.connector
 
 
 from ..logging.loggings import LogConfusionMatrix, add_to_neptune, add_to_mlflow, create_neptune_run, log_mlflow, \
@@ -56,8 +57,46 @@ torch.manual_seed(1)
 np.random.seed(1)
 
 from ..logging.shap import log_shap_images_gradients
+from ..logging.grad_cam import log_grad_cam_similarity
 from ..utils.prototypes import Prototypes
 
+def update_best_model_registry(params, accuracy, mcc, log_path):
+    try:
+        conn = mysql.connector.connect(
+            host="localhost",
+            user="y_user",
+            password="password",
+            database="results_db"
+        )
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT accuracy FROM best_models_registry
+            WHERE model_name=%s AND fgsm=%s AND prototypes=%s AND npos=%s AND nneg=%s AND dloss=%s AND n_calibration=%s AND normalize=%s
+        """, (params['model_name'], params['fgsm'], params['prototypes'], params['npos'], params['nneg'], params['dloss'], params['n_calibration'], params['normalize']))
+        row = cursor.fetchone()
+        if row is None or accuracy > row[0]:
+            cursor.execute("""
+                REPLACE INTO best_models_registry
+                (model_name, fgsm, prototypes, npos, nneg, dloss, n_calibration, accuracy, mcc, normalize, log_path)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                params['model_name'],
+                params['fgsm'],
+                params['prototypes'],
+                params['npos'],
+                params['nneg'],
+                params['dloss'],
+                params['n_calibration'],
+                float(accuracy),  # <-- cast to float
+                float(mcc),       # <-- cast to float
+                params['normalize'],
+                log_path
+            ))
+            conn.commit()
+        cursor.close()
+        conn.close()
+    except mysql.connector.Error as e:
+        print(f"❌ Registry DB error: {e}")
 
 class TrainAE:
     def __init__(self, args, path, load_tb=False, log_metrics=False, keep_models=True, log_inputs=True,
@@ -95,6 +134,7 @@ class TrainAE:
         self.unique_labels = None
         self.unique_batches = None
         self.triplet_loss = None
+        self.triplet_dloss = None
         
         self.arcloss = None
 
@@ -131,50 +171,88 @@ class TrainAE:
         self.best_params = {}
 
     def save_wrong_classif_imgs(self, run, models, lists, preds, names, group):
-        # Save images from valid and test that are wrongly classified
+        # Save Grad-CAM / SHAP artefacts for valid and test predictions
         for label in self.unique_labels:
-            os.makedirs(f'{self.complete_log_path}/wrong_classif/{label}/{group}/gradients_shap', exist_ok=True)
-            os.makedirs(f'{self.complete_log_path}/wrong_classif/{label}/{group}/imgs', exist_ok=True)
-            os.makedirs(f'{self.complete_log_path}/wrong_classif/{label}/{group}/knn_shap', exist_ok=True)
-            os.makedirs(f'{self.complete_log_path}/correct_classif/{label}/{group}/gradients_shap', exist_ok=True)
-            os.makedirs(f'{self.complete_log_path}/correct_classif/{label}/{group}/knn_shap', exist_ok=True)
+            base_wrong = f'{self.complete_log_path}/wrong_classif/{label}/{group}'
+            base_correct = f'{self.complete_log_path}/correct_classif/{label}/{group}'
+            os.makedirs(f'{base_wrong}/gradients_shap', exist_ok=True)
+            os.makedirs(f'{base_wrong}/imgs', exist_ok=True)
+            os.makedirs(f'{base_wrong}/knn_shap', exist_ok=True)
+            os.makedirs(f'{base_wrong}/grad_cam', exist_ok=True)
+            os.makedirs(f'{base_correct}/gradients_shap', exist_ok=True)
+            os.makedirs(f'{base_correct}/knn_shap', exist_ok=True)
+            os.makedirs(f'{base_correct}/grad_cam', exist_ok=True)
 
         cats = np.concatenate(lists[group]['cats'])
         preds = np.concatenate(lists[group]['preds'])
         names = np.concatenate(lists[group]['names'])
         wrong = 0
         correct = 0
-        for i, (cat, pred, name) in enumerate(zip(cats, np.argmax(preds, 1), names)):
-            if cat != pred:
+        prototype_store = self.class_prototypes.get('train', {})
+        if not isinstance(prototype_store, dict):
+            prototype_store = {}
+
+        for i, (cat, pred_idx, name) in enumerate(zip(cats, np.argmax(preds, 1), names)):
+            pred_label = self.unique_labels[pred_idx]
+            proto = prototype_store.get(pred_label)
+            if cat != pred_idx:
                 wrong += 1
                 try:
                     img = Image.open(f'{self.args.path_original}/{name}')
                     img.save(f'{self.complete_log_path}/wrong_classif/{self.unique_labels[cat]}/{group}/imgs/{wrong}_{name}.png')
                 except Exception as e:
                     print(f'Failed to save image {name}: {e}')
-                log_shap_images_gradients(models, i, lists, group, 
-                                               f'{self.complete_log_path}/wrong_classif/{self.unique_labels[cat]}/{group}/',
-                                               f'{wrong}_{name}')
+                log_shap_images_gradients(
+                    models,
+                    i,
+                    lists,
+                    group,
+                    f'{self.complete_log_path}/wrong_classif/{self.unique_labels[cat]}/{group}/',
+                    f'{wrong}_{name}',
+                )
+                if proto is not None:
+                    log_grad_cam_similarity(
+                        models['cnn'],
+                        i,
+                        lists,
+                        group,
+                        f'{self.complete_log_path}/wrong_classif/{self.unique_labels[cat]}/{group}/grad_cam',
+                        f'{wrong}_{name}',
+                        proto,
+                        device=self.args.device,
+                    )
             else:
-                log_shap_images_gradients(models, i, lists, group, 
-                                               f'{self.complete_log_path}/correct_classif/{self.unique_labels[cat]}/{group}/', 
-                                               f'{correct}_{name}')
+                log_shap_images_gradients(
+                    models,
+                    i,
+                    lists,
+                    group,
+                    f'{self.complete_log_path}/correct_classif/{self.unique_labels[cat]}/{group}/',
+                    f'{correct}_{name}',
+                )
+                if proto is not None:
+                    log_grad_cam_similarity(
+                        models['cnn'],
+                        i,
+                        lists,
+                        group,
+                        f'{self.complete_log_path}/correct_classif/{self.unique_labels[cat]}/{group}/grad_cam',
+                        f'{correct}_{name}',
+                        proto,
+                        device=self.args.device,
+                    )
+                correct += 1
+
         for label in self.unique_labels:
-            run[f'wrong_classif/{label}/{group}'].upload_files(
-                f'{self.complete_log_path}/wrong_classif/{label}/{group}/imgs'
-            )
-            run[f'wrong_classif/{label}/{group}'].upload_files(
-                f'{self.complete_log_path}/wrong_classif/{label}/{group}/gradients_shap'
-            )
-            run[f'wrong_classif/{label}/{group}'].upload_files(
-                f'{self.complete_log_path}/wrong_classif/{label}/{group}/knn_shap'
-            )
-            run[f'correct_classif/{label}/{group}'].upload_files(
-                f'{self.complete_log_path}/correct_classif/{label}/{group}/gradients_shap'
-            )
-            run[f'correct_classif/{label}/{group}'].upload_files(
-                f'{self.complete_log_path}/correct_classif/{label}/{group}/knn_shap'
-            )
+            base_wrong = f'{self.complete_log_path}/wrong_classif/{label}/{group}'
+            base_correct = f'{self.complete_log_path}/correct_classif/{label}/{group}'
+            run[f'wrong_classif/{label}/{group}'].upload_files(f'{base_wrong}/imgs')
+            run[f'wrong_classif/{label}/{group}'].upload_files(f'{base_wrong}/gradients_shap')
+            run[f'wrong_classif/{label}/{group}'].upload_files(f'{base_wrong}/knn_shap')
+            run[f'wrong_classif/{label}/{group}'].upload_files(f'{base_wrong}/grad_cam')
+            run[f'correct_classif/{label}/{group}'].upload_files(f'{base_correct}/gradients_shap')
+            run[f'correct_classif/{label}/{group}'].upload_files(f'{base_correct}/knn_shap')
+            run[f'correct_classif/{label}/{group}'].upload_files(f'{base_correct}/grad_cam')
 
     def set_prototypes(self, group, list1):
         self.prototypes.set_prototypes(group, list1)
@@ -268,6 +346,12 @@ class TrainAE:
             params['gamma'] = 0
         if 'n_neighbors' not in params:
             params['n_neighbors'] = 0
+        if 'is_transform' not in params:
+            params['is_transform'] = 1
+        if 'normalize' not in params:
+            params['normalize'] = 'no'
+        if not hasattr(self.args, 'normalize'):
+            self.args.normalize = params['normalize']
         params['dropout'] = 0
         params['optimizer_type'] = 'adam'
         dist_fct = get_distance_fct(params['dist_fct'])
@@ -401,7 +485,8 @@ class TrainAE:
                                          triplet_dloss=self.args.dloss, bs=self.args.bs,
                                          prototypes_to_use=self.args.prototypes_to_use,
                                          prototypes=prototypes,
-                                         size=self.args.new_size
+                                         size=self.args.new_size,
+                                         normalize=self.args.normalize
                                          )
             # Initialize model
             self.model = Net(self.args.device, self.n_cats, self.n_batches,
@@ -417,7 +502,7 @@ class TrainAE:
                                     n_subcenters=self.n_batches)
             loggers['logger_cm'] = SummaryWriter(f'{self.complete_log_path}/cm')
             loggers['logger'] = SummaryWriter(f'{self.complete_log_path}/traces')
-            sceloss = nn.CrossEntropyLoss(label_smoothing=params['smoothing'])
+            # sceloss = nn.CrossEntropyLoss(label_smoothing=params['smoothing'])
             optimizer_model = get_optimizer(self.model, params['lr'], params['wd'], params['optimizer_type'])
             self.scheduler = ReduceLROnPlateau(optimizer_model, mode='max', factor=0.1, patience=10)  # Reduce on plateau
 
@@ -479,7 +564,8 @@ class TrainAE:
                                             triplet_dloss=self.args.dloss, bs=self.args.bs,
                                             prototypes_to_use=self.args.prototypes_to_use,
                                             prototypes=prototypes,
-                                            size=self.args.new_size
+                                            size=self.args.new_size,
+                                            normalize=self.args.normalize
                                             )
                 values = log_traces(traces, values)
                 self.scheduler.step(values['valid']['mcc'][-1])
@@ -546,8 +632,6 @@ class TrainAE:
                             f"test loss: {values['test']['closs'][-1]}, dloss: {values['all']['dloss'][-1]}")
                     self.best_closs = values['train']['closs'][-1]
 
-
-
             early_stop_counter = 0
             if self.args.n_calibration > 0:
                 for epoch in range(0, self.args.n_epochs):
@@ -594,7 +678,8 @@ class TrainAE:
                                                 triplet_dloss=self.args.dloss, bs=self.args.bs,
                                                 prototypes_to_use=self.args.prototypes_to_use,
                                                 prototypes=prototypes,
-                                                size=self.args.new_size
+                                                size=self.args.new_size,
+                                                normalize=self.args.normalize
                                                 )
 
                     values = log_traces(traces, values)
@@ -660,9 +745,9 @@ class TrainAE:
         lists, traces = get_empty_traces()
         # values, _, _, _ = get_empty_dicts()  # Pas élégant
         # Loading best model that was saved during training
-        self.model.load_state_dict(torch.load(f'{self.complete_log_path}/model.pth'))
+        self.model.load_state_dict(torch.load(f'{self.complete_log_path}/model.pth', map_location=self.args.device))
         # Need another model because the other cant be use to get shap values
-        self.shap_model.load_state_dict(torch.load(f'{self.complete_log_path}/model.pth'))
+        self.shap_model.load_state_dict(torch.load(f'{self.complete_log_path}/model.pth', map_location=self.args.device))
         self.model.eval()
         self.shap_model.eval()
         with torch.no_grad():
@@ -674,14 +759,14 @@ class TrainAE:
         # Logging every model is taking too much resources and it makes it quite complicated to get information when
         # Too many runs have been made. This will make the notebook so much easier to work with
         if self.best_mcc > self.best_best_mcc:
-            self.save_best_run(run, best_vals)
+            self.save_best_run(run, params, best_vals)
             # Save best model parameters and hyperparamters into a csv, including task
 
         run.stop()
 
         return self.best_mcc
 
-    def save_best_run(self, run, best_vals):
+    def save_best_run(self, run, params, best_vals):
         # Create csv file if not exists
         models_csv_path = f'logs/best_models/{self.args.task}/models.csv'
         log_dir = f'logs/best_models/{self.args.task}'
@@ -689,10 +774,10 @@ class TrainAE:
         if not os.path.exists(models_csv_path):
             os.makedirs(log_dir, exist_ok=True)
             with open(models_csv_path, 'w') as f:
-                f.write('valid_mcc,model,path,nsize,fgsm,n_calibration,loss,dloss,prototype,n_positives,n_negatives,task,complete_log_path\n')
-                f.write(f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},{self.args.new_size},fsgm{self.args.fgsm},ncal{self.args.fgsm},' \
-                        f'{self.args.classif_loss}, {self.args.dloss},prototypes_{self.args.prototypes_to_use},' \
-                        f'{self.args.n_positives},{self.args.n_negatives},{self.args.task},{self.complete_log_path}\n')
+                f.write('valid_mcc,model,path,n_neighbors,nsize,fgsm,n_calibration,loss,dloss,prototype,n_positives,n_negatives,normalize,task,complete_log_path\n')
+                f.write(f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},nn{params["n_neighbors"]},nsize{self.args.new_size},fsgm{self.args.fgsm},ncal{self.args.fgsm},' \
+                        f'{self.args.classif_loss},{self.args.dloss},prototypes_{self.args.prototypes_to_use},' \
+                        f'npos{self.args.n_positives},nneg{self.args.n_negatives},{self.args.normalize},{self.args.task},{self.complete_log_path}\n')
         else:
             with open(models_csv_path, 'r') as f:
                 lines = f.readlines()
@@ -701,22 +786,23 @@ class TrainAE:
             for i, line in enumerate(lines[1:]):  # skip header
                 line_parts = line.strip().split(',')
                 line_mcc = float(line_parts[0])
-                if (line_parts[1:-1] == [self.args.model_name, f'{self.path.split("/")[-1]}', f'nsize{self.args.new_size}', f'fsgm{self.args.fgsm}', f'ncal{self.args.fgsm}', 
+                if (line_parts[1:-1] == [self.args.model_name, f'{self.path.split("/")[-1]}', f'nn{params["n_neighbors"]}', f'nsize{self.args.new_size}', f'fsgm{self.args.fgsm}', f'ncal{self.args.fgsm}', 
                                        str(self.args.classif_loss), str(self.args.dloss), 
                                        f'prototypes_{self.args.prototypes_to_use}',
                                        f'npos{self.args.n_positives}', f'nneg{self.args.n_negatives}',
-                                       self.args.task] and self.best_mcc >= line_mcc):
-                    lines[i + 1] = f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},nsize{self.args.new_size},fsgm{self.args.fgsm},' \
-                                   f'ncal{self.args.fgsm},{self.args.classif_loss},{self.args.dloss},' \
-                                   f'prototypes_{self.args.prototypes_to_use},npos{self.args.n_positives},' \
-                                   f'nneg{self.args.n_negatives},{self.args.task},{self.complete_log_path}\n'
-                else:
-                    lines[i + 1] = line
-                line_found = True
-                break
+                                       self.args.task]):
+                    if self.best_mcc >= line_mcc:
+                        lines[i + 1] = f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},nn{params["n_neighbors"]},nsize{self.args.new_size},fsgm{self.args.fgsm},' \
+                                    f'ncal{self.args.fgsm},{self.args.classif_loss},{self.args.dloss},' \
+                                    f'prototypes_{self.args.prototypes_to_use},npos{self.args.n_positives},' \
+                                    f'nneg{self.args.n_negatives},{self.args.task},{self.complete_log_path}\n'
+                    else:
+                        lines[i + 1] = line
+                    line_found = True
+                    break
 
             if not line_found:
-                lines.append(f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},'\
+                lines.append(f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},nn{params["n_neighbors"]}'\
                              f'nsize{self.args.new_size},fsgm{self.args.fgsm},'\
                              f'ncal{self.args.fgsm},{self.args.classif_loss},' \
                              f'{self.args.dloss},prototypes_{self.args.prototypes_to_use},' \
@@ -726,10 +812,10 @@ class TrainAE:
             with open(models_csv_path, 'w') as f:
                 f.writelines(lines)
 
-        params = f'{self.path.split("/")[-1]}/nsize{self.args.new_size}/fgsm{self.args.fgsm}/ncal{self.args.n_calibration}/{self.args.classif_loss}/' \
+        params_str = f'{self.path.split("/")[-1]}/nsize{self.args.new_size}/fgsm{self.args.fgsm}/ncal{self.args.n_calibration}/{self.args.classif_loss}/' \
                  f'{self.args.dloss}/prototypes_{self.args.prototypes_to_use}/' \
                  f'npos{self.args.n_positives}/nneg{self.args.n_negatives}'
-        model_dir = f'logs/best_models/{self.args.task}/{self.args.model_name}/{params}'
+        model_dir = f'logs/best_models/{self.args.task}/{self.args.model_name}/{params_str}'
 
         try:
             if os.path.exists(model_dir):
@@ -742,6 +828,24 @@ class TrainAE:
         self.keep_best_run(run, best_vals)
         self.save_prototypes(model_dir)
         self.save_samples_weights(model_dir)
+
+        # --- Update best model registry in MySQL ---
+        registry_params = {
+            'model_name': self.args.model_name,
+            'fgsm': self.args.fgsm,
+            'prototypes': self.args.prototypes_to_use,
+            'npos': self.args.n_positives,
+            'nneg': self.args.n_negatives,
+            'dloss': self.args.dloss,
+            'n_calibration': self.args.n_calibration,
+            'normalize': self.args.normalize
+        }
+        update_best_model_registry(
+            registry_params,
+            accuracy=best_vals.get('acc', self.best_mcc),
+            mcc=self.best_mcc,
+            log_path=model_dir
+        )
 
     # TODO Decide if valuable class method
     def save_prototypes(self, model_dir):
@@ -797,13 +901,16 @@ class TrainAE:
     def make_encoded_values(self, groups=['train', 'valid', 'test']):
         # Get transform function from transform['test']
         # TODO should not have to redefine it again
-        transform = torchvision.transforms.Compose([
-            torchvision.transforms.ToTensor(),
-            # transforms.Grayscale(),
-            # transforms.Lambda(lambda x: x.broadcast_to(3, x.shape[1], x.shape[2]))
-            # transforms.Resize(224),
-            torchvision.transforms.Normalize([0.13854676, 0.10721603, 0.09241733], [0.07892648, 0.07227526, 0.06690206]),
-        ])
+        # Apply normalization only when explicitly requested via args.normalize
+        transform_ops = [torchvision.transforms.ToTensor()]
+        if str(self.args.normalize).lower() in ['yes', 'true', '1']:
+            transform_ops.append(
+                torchvision.transforms.Normalize(
+                    [0.50818628, 0.40659687, 0.37182656],
+                    [0.27270308, 0.25273249, 0.24185425]
+                )
+            )
+        transform = torchvision.transforms.Compose(transform_ops)
 
 
         for group in groups:
@@ -841,13 +948,20 @@ class TrainAE:
         for group in ['valid', 'test']:
             cats[group] = np.concatenate(best_lists[group]['cats'])
             labels[group] = np.concatenate(best_lists[group]['labels'])
-            scores[group] = torch.softmax(torch.Tensor(np.concatenate(best_lists[group]['preds'])), 1)
+            # Use KNN outputs directly (assume best_lists[group]['preds'] contains KNN probabilities or one-hot)
+            scores[group] = np.concatenate(best_lists[group]['preds'])
             preds[group] = scores[group].argmax(1)
             names[group] = np.concatenate(best_lists[group]['names'])
-            pd.DataFrame(np.concatenate((labels[group].reshape(-1, 1), scores[group],
-                                         np.array([self.unique_labels[x] for x in preds[group]]).reshape(-1, 1),
-                                         names[group].reshape(-1, 1)), 1)).to_csv(
-                f'{self.complete_log_path}/{group}_predictions.csv')
+            score_colnames = [f'probs_{l}' for l in self.unique_labels]
+            colnames = ['label'] + score_colnames + ['pred', 'name']
+            df = pd.DataFrame(
+                np.concatenate((labels[group].reshape(-1, 1),
+                               scores[group],
+                               np.array([self.unique_labels[x] for x in preds[group]]).reshape(-1, 1),
+                               names[group].reshape(-1, 1)), 1),
+                columns=colnames
+            )
+            df.to_csv(f'{self.complete_log_path}/{group}_predictions.csv', index=False)
             if self.log_neptune:
                 run[f"{group}_predictions"].track_files(f'{self.complete_log_path}/{group}_predictions.csv')
                 run[f'{group}_AUC'] = metrics.roc_auc_score(y_true=to_categorical(cats[group], len(self.unique_labels)), y_score=scores[group], multi_class='ovr')
@@ -922,7 +1036,7 @@ class TrainAE:
         if self.args.dloss == 'DANN':
             dloss = self.dceloss(dpreds, domains)
 
-        elif self.args.dloss in ['inverseTriplet', 'inverse_softmax_contrastive']:
+        elif self.args.dloss in ['inverseTriplet', 'inverse_softmax_contrastive'] and self.triplet_dloss is not None:
             pos_batch_sample, neg_batch_sample = pos_batch_sample.to(
                 self.args.device).float(), neg_batch_sample.to(self.args.device).float()
             pos_batch_sample, neg_batch_sample = pos_batch_sample.requires_grad_(True), neg_batch_sample.requires_grad_(True)
@@ -1184,7 +1298,7 @@ class TrainAE:
             if self.args.dloss == 'DANN':
                 dloss = self.dceloss(dpreds, domains)
 
-            elif self.args.dloss in ['inverseTriplet', 'inverse_softmax_contrastive'] and self.args.prototypes_to_use not in ['both', 'batch']:
+            elif self.args.dloss in ['inverseTriplet', 'inverse_softmax_contrastive'] and self.args.prototypes_to_use not in ['both', 'batch'] and self.triplet_dloss is not None:
                 pos_batch_sample, neg_batch_sample = neg_batch_sample.to(
                     self.args.device).float(), pos_batch_sample.to(self.args.device).float()
                 pos_enc, _ = self.model(pos_batch_sample)
@@ -1311,7 +1425,7 @@ class TrainAE:
             if self.args.dloss == 'DANN':
                 dloss = self.dceloss(dpreds, domains)
 
-            elif self.args.dloss in ['inverseTriplet', 'inverse_softmax_contrastive'] and self.args.prototypes_to_use not in ['both', 'batch']:
+            elif self.args.dloss in ['inverseTriplet', 'inverse_softmax_contrastive'] and self.args.prototypes_to_use not in ['both', 'batch'] and self.triplet_dloss is not None:
                 pos_batch_sample, neg_batch_sample = neg_batch_sample.to(
                     self.args.device).float(), pos_batch_sample.to(self.args.device).float()
                 pos_enc, _ = self.model(pos_batch_sample)
@@ -1599,6 +1713,7 @@ if __name__ == "__main__":
     parser.add_argument('--fgsm', type=int, default=1, help='Use Fast Gradient Sign Method')
     parser.add_argument('--valid_dataset', type=str, default='Banque_Viscaino_Chili_2020', help='Validation dataset')
     parser.add_argument('--new_size', type=int, default=64, help='New size for images')
+    parser.add_argument('--normalize', type=str, default='no', help='Normalize images')
 
     args = parser.parse_args()
     args.exp_id = f'{args.exp_id}_{args.task}'
@@ -1621,7 +1736,7 @@ if __name__ == "__main__":
         {"name": "lr", "type": "range", "bounds": [1e-6, 1e-3], "log_scale": True},
         {"name": "wd", "type": "range", "bounds": [1e-8, 1e-2], "log_scale": True},
         {"name": "smoothing", "type": "range", "bounds": [0., 0.2]},
-        {"name": "is_transform", "type": "choice", "values": [0, 1]},
+        # {"name": "is_transform", "type": "choice", "values": [0, 1]},
     ]
     if args.classif_loss in ['triplet', 'softmax_contrastive'] or args.dloss in ['revTriplet', 'inverseTriplet', 'normae', 'inverse_softmax_contrastive']:
         parameters += [{"name": "dist_fct", "type": "choice", "values": ['cosine', 'euclidean']}]
@@ -1648,15 +1763,18 @@ if __name__ == "__main__":
     lists, traces = get_empty_traces()
     # values, _, _, _ = get_empty_dicts()  # Pas élégant
     # Loading best model that was saved during training
+    model_path = f'logs/best_models/notNormal/{train.args.model_name}/otite_ds_64/nsize{train.args.new_size}/fgsm{train.args.fgsm}/ncal{train.args.n_calibration}/{train.args.classif_loss}/{train.args.dloss}/prototypes_{train.args.prototypes_to_use}/npos{train.args.n_positives}/nneg{train.args.n_negatives}/model.pth'
     train.model.load_state_dict(
         torch.load(
-            f'logs/best_models/{train.args.model_name}/model.pth'
+            model_path,
+            map_location=train.args.device
         )
     )
     # Need another model because the other can't be used to get shap values
     train.shap_model.load_state_dict(
         torch.load(
-            f'logs/best_models/{train.args.model_name}/model.pth'  # Update path to match new model loading convention
+            model_path,  # Update path to match new model loading convention
+            map_location=train.args.device
         )
     )
     train.model.eval()
@@ -1669,7 +1787,7 @@ if __name__ == "__main__":
     loaders = get_images_loaders(data=train.data,
                                     random_recs=train.args.random_recs,
                                     weighted_sampler=train.args.weighted_sampler,
-                                    is_transform=0,
+                                    is_transform=1,
                                     samples_weights=train.samples_weights,
                                     epoch=1,
                                     unique_labels=train.unique_labels,
@@ -1677,6 +1795,7 @@ if __name__ == "__main__":
                                     prototypes_to_use=train.args.prototypes_to_use,
                                     prototypes=prototypes,
                                     size=train.args.new_size,
+                                    normalize=train.args.normalize,
                                     )
     with torch.no_grad():
         _, best_lists1, _ = train.loop('train', None, train.params['gamma'], loaders['train'], lists, traces)
@@ -1694,3 +1813,4 @@ if __name__ == "__main__":
                                     best_lists['test']['names'], 'test')
         
         run.stop()
+

@@ -25,7 +25,7 @@ run_experiment() {
 
     echo "Launching job: model=$model, fgsm=$fgsm, n_calibration=$n_calibration, loss=$loss, dloss=$dloss, prototype=$prototype, n_positives=$n_positives, n_negatives=$n_negatives"
 
-    PYTHONPATH="/home/simon/otitenet" /home/simon/otitenet/.venv/bin/python -m otitenet.train_triplet_new \
+    PYTHONPATH="/home/simon/otitenet" /home/simon/otitenet/.conda/bin/python -m otitenet.train.train_triplet_new \
         --n_calibration=$n_calibration --is_stn=0 --dloss=$dloss --device=cuda:0 \
         --classif_loss=$loss --n_epochs=$n_epochs --task=$task --weighted_sampler=0 \
         --groupkfold=1 --n_negatives=$n_negatives --n_positives=$n_positives --prototypes_to_use=$prototype --fgsm=$fgsm \

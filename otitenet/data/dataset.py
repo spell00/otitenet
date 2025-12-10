@@ -12,47 +12,12 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset
 import random
-import pandas as pd
 from torch.autograd import Variable
-from torchvision import transforms
 
 random.seed(42)
 torch.manual_seed(42)
 np.random.seed(42)
 
-# class Images:
-#     def __init__(self, path, binarize=False, resize=True, test=False):
-#         self.path = path
-#         self.binarize = binarize
-#         self.resize = resize
-#         if not test:
-#             self.fnames = os.listdir(path)
-#         else:
-#             tmp = os.listdir(path)
-#             np.random.shuffle(tmp)
-#             self.fnames = tmp[:57]
-# 
-#     def process(self, i):
-#         fname = self.fnames[i]
-#         print(f"Processing sample #{i}: {fname}")
-#         png = Image.open(f"{self.path}/{fname}")
-#         if self.resize:
-#             png = transforms.Resize((299, 299))(png)
-#         png.load()  # required for png.split()
-# 
-#         new_png = Image.new("RGB", png.size, (255, 255, 255))
-#         new_png.paste(png, mask=png.split()[3])  # 3 is the alpha channel
-#         label = fname.split('_')[0]
-#         mat_data = np.asarray(new_png)
-#         if self.binarize:
-#             mat_data[mat_data > 0] = 1
-# 
-#         return mat_data[:, :, 0], label, new_png
-# 
-#     def __len__(self):
-#         return len(self.fnames)
-# 
-# 
 
 class Dataset1(Dataset):
     def __init__(self, data, epoch, unique_labels, names=None,
@@ -206,12 +171,10 @@ class Dataset1(Dataset):
             x = torch.Tensor(x)[:, ran:ran + self.crop_size]  # .to(device)
         if self.transform:
             x = self.transform(x).squeeze()
-            if self.prototypes_to_use in ['no', 'batch'] or self.epoch == 0:
-                to_rec = self.transform(to_rec).squeeze()
-                not_to_rec = self.transform(not_to_rec).squeeze()
-            if self.prototypes_to_use in ['no', 'class', 'combined'] or self.epoch == 0:
-                pos_batch_sample = self.transform(pos_batch_sample).squeeze()
-                neg_batch_sample = self.transform(neg_batch_sample).squeeze()
+            to_rec = self.transform(to_rec).squeeze()
+            not_to_rec = self.transform(not_to_rec).squeeze()
+            pos_batch_sample = self.transform(pos_batch_sample).squeeze()
+            neg_batch_sample = self.transform(neg_batch_sample).squeeze()
 
         if self.add_noise:
             if np.random.random() > 0.5:

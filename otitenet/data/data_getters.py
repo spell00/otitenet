@@ -12,6 +12,12 @@ from torchvision.transforms import v2 as transforms
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 
+# Per-image normalization transform (expects CHW tensor)
+class PerImageNormalize:
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        mean = img.mean(dim=(1, 2), keepdim=True)
+        std = img.std(dim=(1, 2), keepdim=True) + 1e-6
+        return (img - mean) / std
 
 def get_data(path, args, seed=42):
     """
@@ -58,7 +64,7 @@ def get_data(path, args, seed=42):
                 valid_inds], data['cats']['train'][test_inds]
 
         else:
-            images = get_images(path)
+            images = get_images(path, normalize=args.normalize, size=args.new_size)
             # matrix = pd.read_csv(f"{path}/{args.csv_file}", sep=",")
             names = matrix.iloc[:, 0]
             labels = matrix.iloc[:, 1]
@@ -128,7 +134,7 @@ def get_best_values(values):
     return best_values
 
 
-def get_images(path, size=224):
+def get_images(path, normalize, size=224):
     pngs = []
     labels = []
     names = []
@@ -136,6 +142,9 @@ def get_images(path, size=224):
     groups = []
 
     infos = pd.read_csv(f"{path}/infos.csv")
+    per_image_normalize = PerImageNormalize()
+    normalize_flag = str(normalize).lower() in ['yes', 'true', '1']
+    
     for i, row in infos.iterrows():
         im = row['name']
         if im == ".DS_Store":
@@ -143,10 +152,22 @@ def get_images(path, size=224):
 
         png = Image.open(f"{path}/{im}").convert('RGB')
         if size != -1:
-            png = transforms.Resize((size, size))(png)
+            png = png.resize((size, size))
+        arr = np.array(png, dtype=np.float32) / 255.0  # Convert to [0,1] float
+        if arr.ndim == 2:  # grayscale fallback
+            arr = np.stack([arr] * 3, axis=-1)
+        
+        # Normalize per-image if requested
+        if normalize_flag:
+            # Convert HWC to CHW for normalization
+            arr_chw = torch.from_numpy(arr.transpose(2, 0, 1))
+            arr_chw = per_image_normalize(arr_chw)
+            # Convert back to HWC numpy
+            arr = arr_chw.permute(1, 2, 0).numpy()
+        
         try:
-            pngs += [np.array(png)]
-        except:
+            pngs += [arr]
+        except Exception:
             continue
         labels += [row['label']]
         names += [row['name']]
@@ -160,7 +181,7 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                        is_transform, samples_weights, epoch, 
                        unique_labels, triplet_dloss, prototypes_to_use,
                        n_positives=1, n_negatives=1,
-                       prototypes=None, bs=64, size=224):
+                       prototypes=None, bs=64, size=224, normalize='no'):
     """
 
     Args:
@@ -171,23 +192,12 @@ def get_images_loaders(data, random_recs, weighted_sampler,
     Returns:
 
     """
-    transform_train = transforms.Compose([
+    # Build transforms; only normalize when requested
+    train_ops = [
         transforms.ToTensor(),
-        # transforms.RandomApply(
-        #     nn.ModuleList([transforms.ColorJitter()])
-        # , p=0.5),
-        # transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
         transforms.RandomRotation(degrees=(-180, 180)),
-        # transforms.RandomApply(nn.ModuleList([transforms.RandomRotation(degrees=(180, 180))])),
-        # transforms.RandomApply(nn.ModuleList([transforms.RandomRotation(degrees=(270, 270))])),
-        # transforms.RandomErasing(p=0.5, scale=(0.02, 0.1), ratio=(0.3, 3.3)),
-        # transforms.AutoAugment(),
-        # transforms.RandomApply(
-        #     nn.ModuleList([
-        #         transforms.GaussianBlur(kernel_size=3, sigma=(0.01, 0.03))
-        #     ]), p=0.5),
         transforms.RandomApply(
             nn.ModuleList([
                 transforms.RandomResizedCrop(
@@ -196,19 +206,12 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                     ratio=(0.8, 1.2)
                 )
             ]), p=0.5),
-        torchvision.transforms.Normalize([0.13854676, 0.10721603, 0.09241733],
-                                         [0.07892648, 0.07227526, 0.06690206]),
-        # transforms.Lambda(lambda x: x.broadcast_to(3, x.shape[1], x.shape[2]))
-    ])
+    ]
+    eval_ops = [transforms.ToTensor()]
+    # Normalization is handled in get_images if requested
 
-    transform = torchvision.transforms.Compose([
-        torchvision.transforms.ToTensor(),
-        # transforms.Grayscale(),
-        # transforms.Lambda(lambda x: x.broadcast_to(3, x.shape[1], x.shape[2]))
-        # transforms.Resize(224),
-        torchvision.transforms.Normalize([0.13854676, 0.10721603, 0.09241733],
-                                         [0.07892648, 0.07227526, 0.06690206]),
-    ])
+    transform_train = transforms.Compose(train_ops)
+    transform = torchvision.transforms.Compose(eval_ops)
 
     if is_transform:
         transform_train = transform_train
@@ -389,7 +392,7 @@ class GetData:
             for group in ['all', 'train', 'test', 'valid', 'calibration']:
                 self.data[info][group] = np.array([])
         self.data['inputs']['all'], self.data['names']['all'], \
-            self.data['labels']['all'], self.data['batches']['all'] = get_images(path, args.new_size)
+            self.data['labels']['all'], self.data['batches']['all'] = get_images(path, args.normalize, args.new_size)
         self.data['old_labels']['all'] = self.data['labels']['all']
         new_labels = []
         for label in self.data['labels']['all']:

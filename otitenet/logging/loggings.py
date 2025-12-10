@@ -698,7 +698,8 @@ def log_shap_images(run, model, inputs, class_names, group, log_path, mlops):
         # transforms.Grayscale(),
         # transforms.Lambda(lambda x: x.broadcast_to(3, x.shape[1], x.shape[2]))
         # transforms.Resize(224),
-        torchvision.transforms.Normalize(0.5, 0.5),
+        # torchvision.transforms.Normalize(0.5, 0.5),
+        torchvision.transforms.Normalize([0.50818628, 0.40659687, 0.37182656], [0.27270308, 0.25273249, 0.24185425]),
     ])
 
     inputs = torch.stack([transform(x) for x in inputs])

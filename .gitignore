@@ -36,3 +36,5 @@ test_adv.png
 testemb.png
 testemb1.png
 your_file.jpeg
+otitenet/train/old/
+*__pycache__/*

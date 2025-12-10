@@ -3,7 +3,17 @@ import shap
 import numpy as np
 import matplotlib.pyplot as plt
 import torchvision
+import os
 import torch.nn as nn
+
+CHANNEL_MEAN = [0.13854676, 0.10721603, 0.09241733]
+CHANNEL_STD = [0.07892648, 0.07227526, 0.06690206]
+
+
+def denormalize_for_display(tensor: torch.Tensor) -> torch.Tensor:
+    mean = torch.tensor(CHANNEL_MEAN, dtype=tensor.dtype, device=tensor.device).view(1, -1, 1, 1)
+    std = torch.tensor(CHANNEL_STD, dtype=tensor.dtype, device=tensor.device).view(1, -1, 1, 1)
+    return torch.clamp(tensor * std + mean, 0.0, 1.0)
 
 def remove_batchnorm(module):
     if isinstance(module, nn.BatchNorm2d):
@@ -35,12 +45,26 @@ def get_gradient_explaination(i, nets, images, group, log_path, name, layer=5):
         log_path: path to save the images
         name: name of the image
     """
-    explainer = shap.GradientExplainer((nets['cnn'].model, nets['cnn'].model[layer]), images)
+    try:
+        explainer = shap.GradientExplainer(
+            (nets['cnn'].model, nets['cnn'].model[layer]),
+            images
+        )
+    except Exception as e:
+        explainer = shap.GradientExplainer(
+            (nets['cnn'].model, nets['cnn'].model.encoder.layers[layer]),
+            images
+        )
+    
 
     shap_values, indexes = explainer.shap_values(images[i:i+1], ranked_outputs=2, nsamples=200)
     # shap_values = explainer.shap_values(images[i:i+1], nsamples=200)
-    shap_values = [s.transpose(3, 1, 2, 0) for s in shap_values]
-    shap.image_plot(shap_values, images[i:i+1].cpu().detach().numpy().transpose(0, 2, 3, 1))
+    try:
+        shap_values = [s.transpose(3, 1, 2, 0) for s in shap_values]
+    except:
+        pass
+    # images_display = denormalize_for_display(images)
+    shap.image_plot(shap_values, images_display[i:i+1].cpu().detach().numpy().transpose(0, 2, 3, 1))
     # shap.image_plot(shap_values)
     f_emb = plt.gcf()
     plt.savefig(f'{log_path}/gradients_shap/{group}_{name}_layer{layer}.png')
@@ -61,6 +85,7 @@ def get_explanation_with_knn(i, nets, inputs, group, log_path, name, device='cud
     #     ((x - torch.min(x)) / (torch.max(x) - torch.min(x))) for x in inputs[group]['inputs']
     # ])
     images = torch.concatenate(inputs[group]['inputs'])
+    # images_display = denormalize_for_display(images)
     images = images.to(device)
     # images_train = torch.concatenate([
     #     ((x - torch.min(x)) / (torch.max(x) - torch.min(x))) for x in inputs['train']['inputs']
@@ -100,8 +125,8 @@ def get_explanation_with_knn(i, nets, inputs, group, log_path, name, device='cud
     ]  # (C, H, W)
     final_shap_values = [x.transpose(0, 2, 3, 1) for x in final_shap_values]
     shap.image_plot(
-        final_shap_values, 
-        images[i:i+1].cpu().detach().numpy().transpose(0, 2, 3, 1)
+        final_shap_values,
+        images_display[i:i+1].cpu().detach().numpy().transpose(0, 2, 3, 1)
     )
     # shap.image_plot(shap_values)
     f_emb2 = plt.gcf()
@@ -121,6 +146,7 @@ def get_explanation_layer_with_knn(i, nets, inputs, group, log_path, name, devic
     """
     # images = torch.concatenate([((x - torch.min(x)) / (torch.max(x) - torch.min(x))) for x in inputs[group]['inputs']])
     images = torch.concatenate(inputs[group]['inputs'])
+    # images_display = denormalize_for_display(images)
     images = images.to(device)
     # images_train = torch.concatenate([((x - torch.min(x)) / (torch.max(x) - torch.min(x))) for x in inputs['train']['inputs']])
     images_train = torch.concatenate(inputs['train']['inputs'])
@@ -162,10 +188,12 @@ def get_explanation_layer_with_knn(i, nets, inputs, group, log_path, name, devic
     final_shap_values = [x.transpose(0, 2, 3, 1) for x in final_shap_values]
     shap.image_plot(
         final_shap_values,
-        images[i:i+1].cpu().detach().numpy().transpose(0, 2, 3, 1)
+        images_display[i:i+1].cpu().detach().numpy().transpose(0, 2, 3, 1)
     )
     # shap.image_plot(shap_values)
     f_emb2 = plt.gcf()
+    # save_dir = os.path.dirname(f'{log_path}/knn_shap/{group}_{name}_layer{layer}.png')
+    # os.makedirs(save_dir, exist_ok=True)    
     plt.savefig(f'{log_path}/knn_shap/{group}_{name}_layer{layer}.png')
     plt.close(f_emb2)
 
@@ -181,9 +209,9 @@ def get_explanation_deep(i, nets, inputs, group, log_path, name, bs, device):
         name: name of the image
     """
     # images = torch.concatenate([((x - torch.min(x)) / (torch.max(x) - torch.min(x))) for x in inputs[group]['inputs']])
-    # transform = torchvision.transforms.Normalize([0.13854676, 0.10721603, 0.09241733], [0.07892648, 0.07227526, 0.06690206])
     images = torch.concatenate(inputs[group]['inputs'])
     # images = transform(images)
+    # images_display = denormalize_for_display(images)
     images = images.to(device)
     # images_train = torch.concatenate([((x - torch.min(x)) / (torch.max(x) - torch.min(x))) for x in inputs['train']['inputs']])
     images_train = torch.concatenate(inputs['train']['inputs'])
@@ -203,7 +231,7 @@ def get_explanation_deep(i, nets, inputs, group, log_path, name, bs, device):
     test_embedding = model(images[i:i+1]).reshape(1, -1)
     shap_values_knn = explainer_knn.shap_values(images[i:i+1])[0]  # Shape: (num_classes, 1, embedding_dim)
 
-    shap.image_plot(shap_values_knn, images[i:i+1].cpu().detach().numpy().transpose(0, 2, 3, 1))
+    shap.image_plot(shap_values_knn, images_display[i:i+1].cpu().detach().numpy().transpose(0, 2, 3, 1))
     # shap.image_plot(shap_values)
     f_emb2 = plt.gcf()
     plt.savefig(f'{log_path}/knn_shap/{group}_{name}_deepexplainer.png')
@@ -221,9 +249,9 @@ def get_explanation_deep_kernel(i, nets, inputs, group, log_path, name, device):
         name: name of the image
     """
     # images = torch.concatenate([((x - torch.min(x)) / (torch.max(x) - torch.min(x))) for x in inputs[group]['inputs']])
-    # transform = torchvision.transforms.Normalize([0.13854676, 0.10721603, 0.09241733], [0.07892648, 0.07227526, 0.06690206])
     images = torch.concatenate(inputs[group]['inputs'])
     # images = transform(images)
+    # images_display = denormalize_for_display(images)
     images = images.to(device)
     # images_train = torch.concatenate([((x - torch.min(x)) / (torch.max(x) - torch.min(x))) for x in inputs['train']['inputs']])
     images_train = torch.concatenate(inputs['train']['inputs'])
@@ -256,7 +284,7 @@ def get_explanation_deep_kernel(i, nets, inputs, group, log_path, name, device):
 
     shap.image_plot(
         shap_values_knn,
-        images[i:i+1].cpu().detach().numpy().transpose(0, 2, 3, 1)
+        images_display[i:i+1].cpu().detach().numpy().transpose(0, 2, 3, 1)
     )
     # shap.image_plot(shap_values)
     f_emb2 = plt.gcf()
@@ -276,6 +304,7 @@ def get_explanation_layer(i, nets, inputs, group, log_path, name, device, layer=
     """
     # images = torch.concatenate([((x - torch.min(x)) / (torch.max(x) - torch.min(x))) for x in inputs[group]['inputs']])
     images = torch.concatenate(inputs[group]['inputs'])
+    # images_display = denormalize_for_display(images)
     images = images.to(device)
     # images_train = torch.concatenate([((x - torch.min(x)) / (torch.max(x) - torch.min(x))) for x in inputs['train']['inputs']])
     images_train = torch.concatenate(inputs['train']['inputs'])
@@ -305,7 +334,7 @@ def get_explanation_layer(i, nets, inputs, group, log_path, name, device, layer=
     # Multiply signed SHAP values (retain positive and negative contributions)
     final_shap_values = [np.sum(shap_values_cnn * shap_values_knn[None, None, None, :, i], axis=-1) for i in range(shap_values_knn.shape[1])]  # (C, H, W)
     final_shap_values = [x.transpose(0, 2, 3, 1) for x in final_shap_values]
-    shap.image_plot(final_shap_values, images[i:i+1].cpu().detach().numpy().transpose(0, 2, 3, 1))
+    shap.image_plot(final_shap_values, images_display[i:i+1].cpu().detach().numpy().transpose(0, 2, 3, 1))
     # shap.image_plot(shap_values)
     f_emb2 = plt.gcf()
     plt.savefig(f'{log_path}/cnn_shap/{group}_{name}_layer{layer}.png')
@@ -330,7 +359,8 @@ def log_shap_images_gradients(nets, i, inputs, group, log_path, name, device='cu
     # images = torch.stack([((x - torch.min(x)) / (torch.max(x) - torch.min(x))) for x in images])
     # images = images.reshape(-1, 224, 224, 3)
     nets['cnn'].eval()
-
+    save_dir = os.path.dirname(f'{log_path}/knn_shap/{group}_{name}_layer{layer}.png')
+    os.makedirs(save_dir, exist_ok=True)
     get_gradient_explaination(i, nets, images, group, log_path, name)
     if not isinstance(nets['knn'], nn.Module):
         print('Using KNN model')

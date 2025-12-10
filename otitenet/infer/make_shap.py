@@ -15,6 +15,7 @@ if __name__ == '__main__':
     parser.add_argument('--fgsm', type=int, default=0)
     parser.add_argument('--n_calibration', type=int, default=0)
     parser.add_argument('--loss', type=str, default='triplet')
+    parser.add_argument('--normalize', type=str, default='no')
     parser.add_argument('--dloss', type=str, default='no')
     parser.add_argument('--prototypes_to_use', type=str, default='class')
     parser.add_argument('--n_positives', type=int, default=1)
@@ -61,7 +62,7 @@ if __name__ == '__main__':
 
     params = f'{args.path.split("/")[-1]}/nsize{args.new_size}/fgsm{args.fgsm}/ncal{args.n_calibration}/{args.classif_loss}/' \
                 f'{args.dloss}/prototypes_{args.prototypes_to_use}/' \
-                f'npos{args.n_positives}/nneg{args.n_negatives}'
+                f'npos{args.n_positives}/nneg{args.n_negatives}/normalize{args.normalize}'
     model_path = f'logs/best_models/{args.task}/{args.model_name}/{params}/model.pth'
     train.complete_log_path = f'logs/best_models/{args.task}/{args.model_name}/{params}'
 
@@ -69,13 +70,13 @@ if __name__ == '__main__':
                         model_name=args.model_name, is_stn=0,
                         n_subcenters=n_batches)
     train.model = model
-    model.load_state_dict(torch.load(model_path))
+    model.load_state_dict(torch.load(model_path, map_location=args.device))
     model.to(args.device)
     model.eval()
     shap_model = Net_shap(args.device, n_cats, n_batches,
                         model_name=args.model_name, is_stn=0,
                         n_subcenters=n_batches)
-    shap_model.load_state_dict(torch.load(model_path))
+    shap_model.load_state_dict(torch.load(model_path, map_location=args.device))
     shap_model.eval()
     prototypes = pickle.load(open(f'logs/best_models/{args.task}/{args.model_name}/{params}/prototypes.pkl', 'rb'))
 
@@ -96,6 +97,7 @@ if __name__ == '__main__':
                                     prototypes_to_use=args.prototypes_to_use,
                                     prototypes=prototypes,
                                     size=args.new_size,
+                                    normalize=args.normalize,
                                     )
     with torch.no_grad():
         _, best_lists1, _ = train.loop('train', None, 0, loaders['train'], lists, traces)
