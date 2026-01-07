@@ -51,9 +51,11 @@ try:
         confidence FLOAT,
         log_path VARCHAR(255),
         person_id INT,
+        model_id INT,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
         UNIQUE KEY unique_analysis (filename(100), model_name(50), nsize(20), fgsm(20), normalize(10), n_calibration(20), classif_loss(20), dloss(20)),
-        FOREIGN KEY(person_id) REFERENCES people(id)
+        FOREIGN KEY(person_id) REFERENCES people(id),
+        FOREIGN KEY(model_id) REFERENCES best_models_registry(id) ON DELETE SET NULL
     )
     ''')
 

@@ -118,20 +118,41 @@ class Dataset1(Dataset):
             name = None
         if self.triplet_loss:
             if self.prototypes_to_use == 'combined' and self.epoch > 0:
-                to_rec = self.prototypes[(label, 
-                                          list(self.n_batches.keys())[np.random.randint(len(self.n_batches))]
-                                          )].copy()
+                # Use combined (class+batch) prototypes when available; otherwise fallback to real samples
+                try:
+                    rand_batch = list(self.n_batches.keys())[np.random.randint(len(self.n_batches))]
+                    to_rec = self.prototypes[(label, rand_batch)].copy()
+                except Exception:
+                    to_rec = self.samples[self.labels_inds[label][np.random.randint(0, self.n_labels[label])]].copy()
+
                 not_label = None
                 while not_label == label or not_label is None:
                     not_label = self.unique_labels[np.random.randint(0, len(self.unique_labels))].copy()
-                not_to_rec = self.prototypes[(not_label, 
-                                              list(self.n_batches.keys())[np.random.randint(len(self.n_batches))])].copy()
+                try:
+                    rand_batch2 = list(self.n_batches.keys())[np.random.randint(len(self.n_batches))]
+                    not_to_rec = self.prototypes[(not_label, rand_batch2)].copy()
+                except Exception:
+                    try:
+                        not_to_rec = self.samples[self.labels_inds[not_label][np.random.randint(0, self.n_labels[not_label])]].copy()
+                    except Exception:
+                        not_to_rec = self.samples[idx].copy()
+
             elif (self.prototypes_to_use == 'class' or self.prototypes_to_use == 'both') and self.epoch > 0:
-                to_rec = self.class_prototypes[label].copy()
+                # Use class prototypes when available; otherwise fallback to real samples
+                try:
+                    to_rec = self.class_prototypes[label].copy()
+                except Exception:
+                    to_rec = self.samples[self.labels_inds[label][np.random.randint(0, self.n_labels[label])]].copy()
                 not_label = None
                 while not_label == label or not_label is None:
                     not_label = self.unique_labels[np.random.randint(0, len(self.unique_labels))].copy()
-                not_to_rec = self.class_prototypes[not_label].copy()
+                try:
+                    not_to_rec = self.class_prototypes[not_label].copy()
+                except Exception:
+                    try:
+                        not_to_rec = self.samples[self.labels_inds[not_label][np.random.randint(0, self.n_labels[not_label])]].copy()
+                    except Exception:
+                        not_to_rec = self.samples[idx].copy()
             else:
                 to_rec = self.samples[self.labels_inds[label][np.random.randint(0, self.n_labels[label])]].copy()
                 not_label = None
@@ -170,11 +191,24 @@ class Dataset1(Dataset):
             ran = np.random.randint(0, max_start_crop)
             x = torch.Tensor(x)[:, ran:ran + self.crop_size]  # .to(device)
         if self.transform:
+            # Always transform input image
             x = self.transform(x).squeeze()
-            to_rec = self.transform(to_rec).squeeze()
-            not_to_rec = self.transform(not_to_rec).squeeze()
-            pos_batch_sample = self.transform(pos_batch_sample).squeeze()
-            neg_batch_sample = self.transform(neg_batch_sample).squeeze()
+
+            # Only transform prototype/sample tensors that look like images (HWC/CHW); if encodings, convert to tensors directly
+            def _maybe_transform_or_tensor(arr):
+                try:
+                    ndim = arr.ndim
+                except Exception:
+                    ndim = len(arr.shape) if hasattr(arr, 'shape') else 0
+                if ndim >= 3:
+                    return self.transform(arr).squeeze()
+                else:
+                    return torch.as_tensor(arr).float()
+
+            to_rec = _maybe_transform_or_tensor(to_rec)
+            not_to_rec = _maybe_transform_or_tensor(not_to_rec)
+            pos_batch_sample = _maybe_transform_or_tensor(pos_batch_sample)
+            neg_batch_sample = _maybe_transform_or_tensor(neg_batch_sample)
 
         if self.add_noise:
             if np.random.random() > 0.5:

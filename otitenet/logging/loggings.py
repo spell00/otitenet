@@ -245,6 +245,7 @@ def add_to_mlflow(values, epoch):
 class LogConfusionMatrix:
     def __init__(self, complete_log_path):
         self.complete_log_path = complete_log_path
+        os.makedirs(os.path.join(self.complete_log_path, "cm"), exist_ok=True)
         self.preds = {'train': [], 'valid': [], 'test': []}
         self.classes = {'train': [], 'valid': [], 'test': []}
         self.real_classes = {'train': [], 'valid': [], 'test': []}
@@ -288,11 +289,12 @@ class LogConfusionMatrix:
             cm = metrics.confusion_matrix(real_classes, real_preds)
 
             acc = np.mean([0 if pred != c else 1 for pred, c in zip(preds, classes)])
+            mcc = metrics.matthews_corrcoef(classes, preds) if len(np.unique(classes)) > 1 else 0.0
 
             # try:
             #     figure = plot_confusion_matrix(cm, class_names=unique_real_classes[:len(np.unique(self.classes['train']))], acc=acc)
             # except:
-            figure = plot_confusion_matrix(cm, class_names=unique_real_classes, acc=acc)
+            figure = plot_confusion_matrix(cm, class_names=unique_real_classes, acc=acc, mcc=mcc)
             if mlops == "tensorboard":
                 logger.add_figure(f"CM_{group}_all", figure, epoch)
             elif mlops == "neptune":
@@ -306,11 +308,12 @@ class LogConfusionMatrix:
             cm = metrics.confusion_matrix(classes, preds)
 
             acc = np.mean([0 if pred != c else 1 for pred, c in zip(preds, classes)])
+            mcc = metrics.matthews_corrcoef(classes, preds) if len(np.unique(classes)) > 1 else 0.0
 
             # try:
             #     figure = plot_confusion_matrix(cm, class_names=unique_real_classes[:len(np.unique(self.classes['train']))], acc=acc)
             # except:
-            figure = plot_confusion_matrix(cm, class_names=unique_labels, acc=acc)
+            figure = plot_confusion_matrix(cm, class_names=unique_labels, acc=acc, mcc=mcc)
             if mlops == "tensorboard":
                 logger.add_figure(f"CM_{group}", figure, epoch)
             elif mlops == "neptune":

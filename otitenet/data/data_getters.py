@@ -151,6 +151,9 @@ def get_images(path, normalize, size=224):
             continue
 
         png = Image.open(f"{path}/{im}").convert('RGB')
+        # Always downsample first to a low-res anchor, then upscale to target size
+        downsample_size = 64
+        png = png.resize((downsample_size, downsample_size))
         if size != -1:
             png = png.resize((size, size))
         arr = np.array(png, dtype=np.float32) / 255.0  # Convert to [0,1] float
@@ -181,17 +184,30 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                        is_transform, samples_weights, epoch, 
                        unique_labels, triplet_dloss, prototypes_to_use,
                        n_positives=1, n_negatives=1,
-                       prototypes=None, bs=64, size=224, normalize='no'):
+                       prototypes=None, bs=64, size=224, normalize='no', n_aug=1):
     """
 
     Args:
         data:
         ae:
         classifier:
+        n_aug: Number of augmentations to apply per image (default=1). 
+               Always includes original image if n_aug > 0.
 
     Returns:
 
     """
+    # Worker initialization function for reproducible data loading
+    def worker_init_fn(worker_id):
+        # Each worker gets a unique but deterministic seed
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+        import random
+        random.seed(worker_seed)
+    
+    # Ensure n_aug is at least 1
+    n_aug = max(1, int(n_aug))
+    
     # Build transforms; only normalize when requested
     train_ops = [
         transforms.ToTensor(),
@@ -207,16 +223,12 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                 )
             ]), p=0.5),
     ]
+        
     eval_ops = [transforms.ToTensor()]
     # Normalization is handled in get_images if requested
 
     transform_train = transforms.Compose(train_ops)
-    transform = torchvision.transforms.Compose(eval_ops)
-
-    if is_transform:
-        transform_train = transform_train
-    else:
-        transform_train = transform
+    transform = transforms.Compose(eval_ops)
 
     train_set = Dataset1(data=data['inputs']['train'],
                          epoch=epoch,
@@ -262,38 +274,51 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                          prototypes_to_use=prototypes_to_use,
                         )
 
-    train_set.set_prototypes(prototypes['combined']['train'])
-    valid_set.set_prototypes(prototypes['combined']['valid'])
-    test_set.set_prototypes(prototypes['combined']['test'])
+    # Only keep prototypes for the train split; inference loaders operate without attached prototypes
+    def _train_proto(proto_dict):
+        try:
+            return proto_dict.get('train', {}) if isinstance(proto_dict, dict) else {}
+        except Exception:
+            return {}
 
-    train_set.set_class_prototypes(prototypes['class']['train'])
-    valid_set.set_class_prototypes(prototypes['class']['valid'])
-    test_set.set_class_prototypes(prototypes['class']['test'])
+    combined_train_proto = _train_proto(prototypes.get('combined', {}))
+    class_train_proto = _train_proto(prototypes.get('class', {}))
+    batch_train_proto = _train_proto(prototypes.get('batch', {}))
 
-    train_set.set_batch_prototypes(prototypes['batch']['train'])
-    valid_set.set_batch_prototypes(prototypes['batch']['valid'])
-    test_set.set_batch_prototypes(prototypes['batch']['test'])
+    train_set.set_prototypes(combined_train_proto)
+    valid_set.set_prototypes({})
+    test_set.set_prototypes({})
+
+    train_set.set_class_prototypes(class_train_proto)
+    valid_set.set_class_prototypes({})
+    test_set.set_class_prototypes({})
+
+    train_set.set_batch_prototypes(batch_train_proto)
+    valid_set.set_batch_prototypes({})
+    test_set.set_batch_prototypes({})
     
     if weighted_sampler:
         train_loader = DataLoader(train_set,
                             sampler=WeightedRandomSampler(samples_weights['train'], len(samples_weights['train']),
                                                           replacement=True),
                             batch_size=bs,
-                            num_workers = 8,
-                            prefetch_factor = 8,
+                            num_workers=0,
+                            # prefetch_factor=2,
                             pin_memory=True,
                             drop_last=True,
-                            persistent_workers=True
+                            # persistent_workers=True,
+                            worker_init_fn=worker_init_fn
                             )
     else:
         train_loader = DataLoader(train_set,
                             shuffle=True,
                             batch_size=bs,
-                            num_workers = 8,
-                            prefetch_factor = 8,
+                            num_workers=0,
+                            # prefetch_factor=2,
                             pin_memory=True,
                             drop_last=True,
-                            persistent_workers=True
+                            # persistent_workers=True,
+                            worker_init_fn=worker_init_fn
                             )
     loaders = {
         'train': train_loader,
@@ -301,21 +326,23 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                            # sampler=WeightedRandomSampler(samples_weights['test'], sum(samples_weights['test']),
                            #                               replacement=False),
                            batch_size=bs,
-                            num_workers = 8,
-                            prefetch_factor = 8,
+                            num_workers=0,
+                            # prefetch_factor=2,
                            pin_memory=True,
                            drop_last=False,
-                           persistent_workers=True
+                           # persistent_workers=True,
+                           worker_init_fn=worker_init_fn
                            ),
         'valid': DataLoader(valid_set,
                             # sampler=WeightedRandomSampler(samples_weights['valid'], sum(samples_weights['valid']),
                             #                               replacement=False),
                             batch_size=bs,
-                            num_workers = 8,
-                            prefetch_factor = 8,
+                            num_workers=0,
+                            # prefetch_factor=2,
                             pin_memory=True,
                             drop_last=False,
-                            persistent_workers=True
+                            # persistent_workers=True,
+                            worker_init_fn=worker_init_fn
 
                             ),
     }
@@ -349,42 +376,45 @@ def get_images_loaders(data, random_recs, weighted_sampler,
             triplet_dloss=triplet_dloss,
             prototypes_to_use=prototypes_to_use,
         )
-        calibration_set.set_prototypes(prototypes['combined']['calibration'])
-        calibration_set.set_class_prototypes(prototypes['class']['calibration'])
-        calibration_set.set_batch_prototypes(prototypes['batch']['calibration'])
+        calibration_set.set_prototypes({})
+        calibration_set.set_class_prototypes({})
+        calibration_set.set_batch_prototypes({})
         loaders['calibration'] = DataLoader(calibration_set,
                                     # num_workers=0,
                                     shuffle=True,
                                     batch_size=bs,
-                                    num_workers=8,
-                                    prefetch_factor=8,
+                                    num_workers=0,
+                                    # prefetch_factor=8,
                                     pin_memory=True,
                                     drop_last=True,
-                                    persistent_workers=True
+                                    # persistent_workers=True,
+                                    worker_init_fn=worker_init_fn
                                     )
 
-    if 'all' in prototypes['combined']:
-        all_set.set_prototypes(prototypes['combined']['all'])
-        all_set.set_class_prototypes(prototypes['class']['all'])
-        all_set.set_batch_prototypes(prototypes['batch']['all'])
+    # Build all-split loader without attaching prototypes
+    all_set.set_prototypes({})
+    all_set.set_class_prototypes({})
+    all_set.set_batch_prototypes({})
 
-        loaders['all'] = DataLoader(all_set,
-                                    # num_workers=0,
-                                    shuffle=True,
-                                    batch_size=bs,
-                                    num_workers = 8,
-                                    prefetch_factor = 8,
-                                    pin_memory=True,
-                                    drop_last=True,
-                                    persistent_workers=True
-                                    )
+    loaders['all'] = DataLoader(all_set,
+                                # num_workers=0,
+                                shuffle=True,
+                                batch_size=bs,
+                                num_workers = 0,
+                                # prefetch_factor = 8,
+                                pin_memory=True,
+                                drop_last=True,
+                                # persistent_workers=True,
+                                worker_init_fn=worker_init_fn
+                                )        
 
     return loaders
 
 
 class GetData:
-    def __init__(self, path, valid, args) -> None:
+    def __init__(self, path, valid, args, manifest_dir=None) -> None:
         self.args = args
+        self.manifest_dir = manifest_dir
         self.data = {}
         self.unique_labels = np.array([])
         for info in ['inputs', 'names', 'old_labels', 'labels', 'cats', 'batches']:
@@ -433,10 +463,19 @@ class GetData:
         self.data['labels']['train'], self.data['batches']['train'] =\
             self.data['labels']['all'].copy(), self.data['batches']['all'].copy()
         self.data['old_labels']['train'] = self.data['old_labels']['all'].copy()
-        if not args.groupkfold:
-            self.data, self.unique_labels, self.unique_batches = self.split('test', args.groupkfold, args.seed)
-        else:
-            self.split_deterministic(valid=valid)
+
+        # If a manifest of splits exists (saved during training), enforce it to keep exact same images.
+        manifest_applied = False
+        if manifest_dir is not None:
+            manifest_applied = self._apply_manifest_splits(manifest_dir)
+
+        if not manifest_applied:
+            if not args.groupkfold:
+                self.data, self.unique_labels, self.unique_batches = self.split('test', args.groupkfold, args.seed)
+            else:
+                self.split_deterministic(valid=valid)
+            if manifest_dir is not None:
+                self.save_split_manifests(manifest_dir)
         self.prototypes = {
             'combined': {'train': None, 'valid': None, 'test': None, 'calibration': None, 'all': None},
             'class': {'train': None, 'valid': None, 'test': None, 'calibration': None, 'all': None},
@@ -445,6 +484,59 @@ class GetData:
         self.n_prototypes = {}
 
         self.all_samples = self.data.copy()
+
+    def _manifest_paths(self, manifest_dir):
+        split_dir = os.path.join(manifest_dir, 'splits')
+        return {
+            'root': split_dir,
+            'train': os.path.join(split_dir, 'train.csv'),
+            'valid': os.path.join(split_dir, 'valid.csv'),
+            'test': os.path.join(split_dir, 'test.csv'),
+        }
+
+    def _apply_manifest_splits(self, manifest_dir):
+        paths = self._manifest_paths(manifest_dir)
+        if not all(os.path.exists(paths[k]) for k in ['train', 'valid', 'test']):
+            return False
+
+        try:
+            manifests = {k: pd.read_csv(paths[k]) for k in ['train', 'valid', 'test']}
+        except Exception:
+            return False
+
+        name_to_idx = {n: i for i, n in enumerate(self.data['names']['all'])}
+        def _select(group):
+            names = manifests[group]['name'].tolist()
+            idxs = [name_to_idx[n] for n in names if n in name_to_idx]
+            return idxs
+
+        idx_train = _select('train')
+        idx_valid = _select('valid')
+        idx_test = _select('test')
+
+        if not (idx_train and idx_valid and idx_test):
+            return False
+
+        for group, idxs in [('train', idx_train), ('valid', idx_valid), ('test', idx_test)]:
+            self.data['inputs'][group] = self.data['inputs']['all'][idxs]
+            self.data['labels'][group] = self.data['labels']['all'][idxs]
+            self.data['old_labels'][group] = self.data['old_labels']['all'][idxs]
+            self.data['names'][group] = self.data['names']['all'][idxs]
+            self.data['cats'][group] = self.data['cats']['all'][idxs]
+            self.data['batches'][group] = self.data['batches']['all'][idxs]
+
+        return True
+
+    def save_split_manifests(self, manifest_dir):
+        paths = self._manifest_paths(manifest_dir)
+        os.makedirs(paths['root'], exist_ok=True)
+        for group in ['train', 'valid', 'test']:
+            df = pd.DataFrame({
+                'name': self.data['names'][group],
+                'label': self.data['labels'][group],
+                'batch': self.data['batches'][group],
+            })
+            df.to_csv(paths[group], index=False)
     
     def remove_noisy_samples(self, complete_log_path):
         # Load noisy samples if the file exists

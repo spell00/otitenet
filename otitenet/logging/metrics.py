@@ -5,6 +5,7 @@ from sklearn.cluster import KMeans
 from scipy.stats import entropy
 from sklearn.metrics import confusion_matrix
 from sklearn.metrics import matthews_corrcoef as MCC
+from sklearn.metrics import brier_score_loss
 
 smooth = 1
 
@@ -182,4 +183,52 @@ def compute_batch_effect_metrics(embeddings, batch_labels, n_clusters=None):
         "ARI": ari,
         "Batch Entropy": batch_entropy
     }
+
+
+def expected_calibration_error(probs: np.ndarray, labels: np.ndarray, n_bins: int = 15) -> float:
+    """Compute Expected Calibration Error (ECE).
+
+    Args:
+        probs: predicted probabilities (N, C) or (N,) for binary.
+        labels: true labels (N,), integer class ids.
+        n_bins: number of equal-width bins over [0,1].
+    Returns:
+        Scalar ECE value in [0,1].
+    """
+    probs = np.asarray(probs)
+    labels = np.asarray(labels)
+    if probs.ndim == 1:
+        confs = probs
+        preds = (probs >= 0.5).astype(int)
+    else:
+        preds = np.argmax(probs, axis=1)
+        confs = probs[np.arange(len(probs)), preds]
+
+    ece = 0.0
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        mask = (confs > lo) & (confs <= hi) if i > 0 else (confs >= lo) & (confs <= hi)
+        if not np.any(mask):
+            continue
+        acc_bin = np.mean(preds[mask] == labels[mask])
+        conf_bin = np.mean(confs[mask])
+        ece += np.abs(acc_bin - conf_bin) * (np.sum(mask) / len(confs))
+    return float(ece)
+
+
+def brier_score(probs: np.ndarray, labels: np.ndarray) -> float:
+    """Compute Brier score (lower is better).
+
+    Supports binary or multiclass (one-vs-all average).
+    """
+    probs = np.asarray(probs)
+    labels = np.asarray(labels)
+    if probs.ndim == 1:
+        return float(brier_score_loss(labels, probs))
+    n_classes = probs.shape[1]
+    scores = []
+    for c in range(n_classes):
+        scores.append(brier_score_loss((labels == c).astype(int), probs[:, c]))
+    return float(np.mean(scores))
 

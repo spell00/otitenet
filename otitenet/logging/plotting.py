@@ -106,7 +106,7 @@ def save_roc_curve(y_pred_proba, y_test, unique_labels, name, binary, acc, mlops
     return roc_score
 
 
-def plot_confusion_matrix(cm, class_names, acc):
+def plot_confusion_matrix(cm, class_names, acc, mcc=None):
     """
     Returns a matplotlib figure containing the plotted confusion matrix.
 
@@ -118,7 +118,10 @@ def plot_confusion_matrix(cm, class_names, acc):
     cm_normal = np.around(cm.astype('float') / cm.sum(axis=1)[:, np.newaxis], decimals=2)
     cm_normal[np.isnan(cm_normal)] = 0
     plt.imshow(cm_normal, interpolation='nearest', cmap=plt.cm.Blues)
-    plt.title(f"Confusion matrix (acc: {acc})")
+    title_suffix = f"acc: {acc:.3f}"
+    if mcc is not None:
+        title_suffix += f" | mcc: {mcc:.3f}"
+    plt.title(f"Confusion matrix ({title_suffix})")
     plt.colorbar()
     tick_marks = np.arange(len(class_names))
     plt.xticks(tick_marks, class_names, rotation=45)
