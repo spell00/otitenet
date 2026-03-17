@@ -1,3 +1,5 @@
+import comet_ml
+from otitenet.logging.metrics import compute_batch_effect_metrics
 import os
 import traceback
 
@@ -6,7 +8,6 @@ import matplotlib
 matplotlib.use('Agg')
 CUDA_VISIBLE_DEVICES = ""
 
-import neptune
 import mlflow
 import warnings
 import torchvision
@@ -29,9 +30,15 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from umap.umap_ import UMAP
 from sklearn.manifold import Isomap
-from sklearn.cross_decomposition import CCA
 from sklearn.manifold import MDS
-from sklearn.neighbors import KNeighborsClassifier as KNN
+from otitenet.ml import (
+    find_best_classifier,
+    evaluate_knn_with_k_search,
+    fit_knn_classifier,
+    evaluate_all_classifiers,
+    fit_baseline_classifiers,
+    fit_kde_classifier,
+)
 from sklearn import metrics
 from tensorboardX import SummaryWriter
 from ax.service.managed_loop import optimize
@@ -40,46 +47,43 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 import mysql.connector
 
 
-from ..logging.loggings import LogConfusionMatrix, add_to_neptune, add_to_mlflow, create_neptune_run, log_mlflow, \
-    NEPTUNE_API_TOKEN, NEPTUNE_PROJECT_NAME, NEPTUNE_MODEL_NAME, add_to_logger
+from ..logging.loggings import LogConfusionMatrix, add_to_tracking, add_to_mlflow, create_tracking_run, log_mlflow, \
+    TRACKING_API_TOKEN, TRACKING_PROJECT_NAME, TRACKING_MODEL_NAME, add_to_logger, add_to_comet, make_comet_logger
 from ..data.data_getters import GetData, get_distance_fct, get_images_loaders, get_n_features
 from ..utils.utils import get_optimizer, to_categorical, get_empty_dicts, get_empty_traces, \
-    log_traces, save_tensor, get_best_params
-from ..models.cnn import Net, Net_deep_shap, Net_shap, replace_bn_with_gn
+    log_traces, save_tensor, get_best_params, get_best_params_comet
+from ..utils.encoding_utils import encode_split_with_augmentation, get_base_transform, get_knn_augmentation_transform
+from ..models.cnn import Net, Net_deep_shap, Net_shap
 from ..logging.losses import TupletLoss,ArcFaceLoss, ArcFaceLossWithHSM, \
         ArcFaceLossWithSubcenters, ArcFaceLossWithSubcentersHSM, SoftmaxContrastiveLoss
-from ..logging.metrics import compute_batch_effect_metrics
+from ..utils.kde import make_kde_classifier
 from ..logging.plotting import save_roc_curve, plot_pca
+from .batch_effects import get_batch_metrics
 
 warnings.filterwarnings("ignore")
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-
-
-def _set_global_seeds(seed: int = 1):
-    """Set all RNG seeds and deterministic flags for reproducibility."""
-    try:
-        seed_int = int(seed)
-    except Exception:
-        seed_int = 1
-    random.seed(seed_int)
-    np.random.seed(seed_int)
-    torch.manual_seed(seed_int)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed_int)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+from otitenet.utils.utils import set_random_seeds as _set_global_seeds  # Use shared seed function
 
 
 # Default seed before args are parsed; overridden later via args.seed
-_set_global_seeds(1)
+_set_global_seeds(1, deterministic=True)
 
 from ..logging.shap import log_shap_images_gradients
 from ..logging.grad_cam import log_grad_cam_similarity
 from ..utils.prototypes import Prototypes
 
-def update_best_model_registry(params, accuracy, mcc, log_path):
+def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=None):
+    """Update best_models_registry table with model performance metrics.
+    
+    Args:
+        params: Dict with model parameters
+        accuracy: Model accuracy
+        mcc: Matthews Correlation Coefficient
+        log_path: Path to model logs
+        batch_metrics: Optional dict with batch effect metrics (batch_entropy_norm, batch_nmi, batch_ari)
+    """
     try:
         conn = mysql.connector.connect(
             host="localhost",
@@ -108,10 +112,36 @@ def update_best_model_registry(params, accuracy, mcc, log_path):
         ))
         row = cursor.fetchone()
         if row is None or accuracy > row[0]:
+            # Extract batch metrics if provided
+            batch_entropy = None
+            batch_nmi = None
+            batch_ari = None
+            if batch_metrics:
+                batch_entropy = batch_metrics.get('batch_entropy_norm')
+                batch_nmi = batch_metrics.get('batch_nmi')
+                batch_ari = batch_metrics.get('batch_ari')
+                # Convert numpy types to Python floats if needed
+                if batch_entropy is not None:
+                    try:
+                        batch_entropy = float(batch_entropy) if not (isinstance(batch_entropy, float) and batch_entropy != batch_entropy) else None  # None if NaN
+                    except (TypeError, ValueError):
+                        batch_entropy = None
+                if batch_nmi is not None:
+                    try:
+                        batch_nmi = float(batch_nmi) if not (isinstance(batch_nmi, float) and batch_nmi != batch_nmi) else None
+                    except (TypeError, ValueError):
+                        batch_nmi = None
+                if batch_ari is not None:
+                    try:
+                        batch_ari = float(batch_ari) if not (isinstance(batch_ari, float) and batch_ari != batch_ari) else None
+                    except (TypeError, ValueError):
+                        batch_ari = None
+            
             cursor.execute("""
                 REPLACE INTO best_models_registry
-                (model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss, n_calibration, accuracy, mcc, normalize, n_neighbors, log_path)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss, n_calibration, 
+                 accuracy, mcc, batch_entropy_norm, batch_nmi, batch_ari, normalize, n_neighbors, log_path)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 params['model_name'],
                 str(params.get('nsize', 224)),
@@ -125,6 +155,9 @@ def update_best_model_registry(params, accuracy, mcc, log_path):
                 params['n_calibration'],
                 float(accuracy),  # <-- cast to float
                 float(mcc),       # <-- cast to float
+                batch_entropy,    # <-- batch effect metrics
+                batch_nmi,
+                batch_ari,
                 params['normalize'],
                 str(params.get('n_neighbors', 1)),
                 log_path
@@ -135,9 +168,81 @@ def update_best_model_registry(params, accuracy, mcc, log_path):
     except mysql.connector.Error as e:
         print(f"❌ Registry DB error: {e}")
 
+def register_all_params_to_tracking(run, args, params):
+    """Register all hyperparameters (both fixed and optimized) to Tracking.
+    
+    Args:
+        run: Tracking run object
+        args: Command line arguments (fixed parameters)
+        params: Optimized parameters dict
+    """
+    if run is None:
+        return
+    
+    # Register fixed arguments
+    run['args/model_name'] = args.model_name
+    run['args/task'] = args.task
+    run['args/device'] = args.device
+    run['args/new_size'] = args.new_size
+    run['args/n_epochs'] = args.n_epochs
+    run['args/n_trials'] = args.n_trials
+    run['args/early_stop'] = args.early_stop
+    run['args/groupkfold'] = args.groupkfold
+    run['args/is_stn'] = args.is_stn
+    run['args/weighted_sampler'] = args.weighted_sampler
+    run['args/bs'] = args.bs
+    run['args/seed'] = args.seed
+    
+    # Fixed hyperparameters
+    run['fixed/n_calibration'] = args.n_calibration
+    run['fixed/normalize'] = args.normalize
+    run['fixed/dloss'] = args.dloss
+    run['fixed/classif_loss'] = args.classif_loss
+    run['fixed/prototypes_to_use'] = args.prototypes_to_use
+    run['fixed/fgsm'] = args.fgsm
+    run['fixed/n_positives'] = args.n_positives
+    run['fixed/n_negatives'] = args.n_negatives
+    
+    # Prototype parameters
+    run['fixed/prototype_strategy'] = getattr(args, 'prototype_strategy', 'mean')
+    run['fixed/prototype_components'] = getattr(args, 'prototype_components', 1)
+    run['fixed/prototype_kind'] = getattr(args, 'prototype_kind', 'distance')
+    run['fixed/kde_kernel'] = getattr(args, 'kde_kernel', 'gaussian')
+    run['fixed/kde_bandwidth'] = getattr(args, 'kde_bandwidth', 'scott')
+    
+    # Register optimized parameters
+    for key, value in params.items():
+        run[f'optimized/{key}'] = value
+    
+    # Register augmentation parameter
+    run['fixed/n_aug'] = getattr(args, 'n_aug', 1)
+
+
+def register_all_params_to_comet(experiment, args, params):
+    """Register fixed and optimized parameters to Comet."""
+    if experiment is None:
+        return
+    experiment.log_parameter('model_name', args.model_name)
+    experiment.log_parameter('task', args.task)
+    experiment.log_parameter('device', args.device)
+    experiment.log_parameter('new_size', args.new_size)
+    experiment.log_parameter('n_epochs', args.n_epochs)
+    experiment.log_parameter('n_trials', args.n_trials)
+    experiment.log_parameter('early_stop', args.early_stop)
+    experiment.log_parameter('groupkfold', args.groupkfold)
+    experiment.log_parameter('is_stn', args.is_stn)
+    experiment.log_parameter('weighted_sampler', args.weighted_sampler)
+    experiment.log_parameter('bs', args.bs)
+    experiment.log_parameter('seed', args.seed)
+    run_tag = getattr(args, 'run_tag', 'prod')
+    experiment.log_parameter('run_tag', run_tag)
+    experiment.log_parameter('is_test', int('test' in str(run_tag).lower()))
+    for key, value in params.items():
+        experiment.log_parameter(f'optimized/{key}', value)
+
 class TrainAE:
     def __init__(self, args, path, load_tb=False, log_metrics=False, keep_models=True, log_inputs=True,
-                 log_plots=False, log_tb=False, log_neptune=False, log_mlflow=True, groupkfold=True):
+                 log_plots=False, log_tb=False, log_tracking=False, log_comet=True, log_mlflow=True, groupkfold=True):
         """
 
         Args:
@@ -152,7 +257,8 @@ class TrainAE:
         self.best_closs_final = np.inf
         self.logged_inputs = False
         self.log_tb = log_tb
-        self.log_neptune = log_neptune
+        self.log_tracking = log_tracking
+        self.log_comet = log_comet
         self.log_mlflow = log_mlflow
         self.args = args
         self.path = path
@@ -161,7 +267,7 @@ class TrainAE:
         self.save_repro_artifacts = bool(int(getattr(self.args, 'save_repro_artifacts', 1)))
 
         # Ensure reproducible data splits and training behavior
-        _set_global_seeds(getattr(self.args, 'seed', 1))
+        _set_global_seeds(getattr(self.args, 'seed', 1), deterministic=True)
         self.log_metrics = log_metrics
         self.log_plots = log_plots
         self.log_inputs = log_inputs
@@ -216,6 +322,7 @@ class TrainAE:
 
     def _save_raw_inputs_manifest(self, data_getter, path):
         """Persist raw input metadata (name, label, batch, full path) for all splits."""
+        train_exception = None
         try:
             os.makedirs(path, exist_ok=True)
             rows = []
@@ -474,6 +581,34 @@ class TrainAE:
         # Fixing the hyperparameters that are not optimized
 
         print(params)
+        
+        # Handle loop parameters from optimization
+        if 'dloss' in params:
+            self.args.dloss = params['dloss']
+        if 'classif_loss' in params:
+            self.args.classif_loss = params['classif_loss']
+        # Never allow n_calibration to be overridden - it stays at 0
+        if 'prototypes_to_use' in params:
+            self.args.prototypes_to_use = params['prototypes_to_use']
+        if 'n_positives' in params:
+            self.args.n_positives = int(params['n_positives'])
+        if 'n_negatives' in params:
+            self.args.n_negatives = int(params['n_negatives'])
+        if 'fgsm' in params:
+            self.args.fgsm = int(params['fgsm'])
+        if 'normalize' in params:
+            self.args.normalize = params['normalize']
+        # Handle prototype-specific parameters
+        if 'prototype_strategy' in params:
+            self.args.prototype_strategy = params['prototype_strategy']
+        if 'prototype_components' in params:
+            self.args.prototype_components = int(params['prototype_components'])
+        if 'prototype_kind' in params:
+            self.args.prototype_kind = params['prototype_kind']
+        if 'kde_kernel' in params:
+            self.args.kde_kernel = params['kde_kernel']
+        if 'kde_bandwidth' in params:
+            self.args.kde_bandwidth = params['kde_bandwidth']
 
         # Assigns the hyperparameters getting optimized
         self.params = params
@@ -522,7 +657,16 @@ class TrainAE:
         self._save_raw_inputs_manifest(data_getter, self.complete_log_path)
         self.unique_labels = data_getter.unique_labels
         self.unique_batches = data_getter.unique_batches
-        self.prototypes = Prototypes(self.unique_labels, self.unique_batches)
+        proto_strategy = getattr(self.args, 'prototype_strategy', 'mean')
+        proto_components = getattr(self.args, 'prototype_components', 1)
+        proto_seed = getattr(self.args, 'seed', 1)
+        self.prototypes = Prototypes(
+            self.unique_labels,
+            self.unique_batches,
+            strategy=proto_strategy,
+            components=proto_components,
+            random_state=proto_seed,
+        )
 
         # Store all samples before clustering
         for group in ['train', 'valid', 'test', 'calibration']:
@@ -540,11 +684,15 @@ class TrainAE:
         self.initial_nsamples = len(data_getter.data['labels']['all'])
         event_acc = EventAccumulator(hparams_filepath)
         event_acc.Reload()
-        NEPTUNE_MODEL_NAME = 'resnet50'
-        if self.log_neptune:
-            run = create_neptune_run(self.args, self.params, self.complete_log_path, self.foldername)
+        TRACKING_MODEL_NAME = 'resnet50'
+        if self.log_tracking:
+            run = create_tracking_run(self.args, self.params, self.complete_log_path, self.foldername)
         else:
             run = None
+        if self.log_comet:
+            comet_logger = make_comet_logger(self.args, self.params, self.complete_log_path, self.foldername)
+        else:
+            comet_logger = None
 
         try:
             for h in range(self.args.n_repeats):
@@ -678,13 +826,17 @@ class TrainAE:
                     _, best_lists1, _ = self.loop(group, optimizer_model, params['gamma'], loaders[group], lists, traces)
                 if epoch < warmup:
                     values['all']['dloss'] += [np.mean(traces['all']['dloss'])]
-                    add_to_neptune(values, run)
+                    add_to_tracking(values, run)
                     continue
                 # Save images in run
-                if self.log_neptune:
+                if self.log_tracking:
                     run['example_data'].upload(f'{self.complete_log_path}/{group}_data.png')
                     if self.args.fgsm:
                         run['example_adv_data'].upload(f'{self.complete_log_path}/{group}_adv_data.png')
+                if self.log_comet:
+                    comet_logger.log_image(f'{self.complete_log_path}/{group}_data.png', name=f'{group}_data_epoch_{epoch}')
+                    if self.args.fgsm:
+                        comet_logger.log_image(f'{self.complete_log_path}/{group}_adv_data.png', name=f'{group}_adv_data_epoch_{epoch}')
                 self.model.eval()
                 self.set_prototypes('train', best_lists1)
                 for group in ["valid", "test"]:
@@ -725,10 +877,12 @@ class TrainAE:
                         add_to_logger(values, loggers['logger'], epoch)
                     except:
                         print("Problem with add_to_logger!")
-                if self.log_neptune:
-                    add_to_neptune(values, run)
+                if self.log_tracking:
+                    add_to_tracking(values, run)
                 if self.log_mlflow:
                     add_to_mlflow(values, epoch)
+                if self.log_comet:
+                    add_to_comet(values, comet_logger, epoch)
                 if values['valid']['mcc'][-1] > self.best_mcc:
                     print(f"Best Classification Mcc Epoch {epoch}, "
                             f"Acc: test: {values['test']['acc'][-1]}, valid: {values['valid']['acc'][-1]}"
@@ -740,7 +894,7 @@ class TrainAE:
                     torch.save(self.model.state_dict(), f'{self.complete_log_path}/model.pth')
                     self.save_prototypes(self.complete_log_path)
                     self.save_samples_weights(self.complete_log_path)
-                    self.log_predictions(best_lists, run, 0)
+                    self.log_predictions(best_lists, run, comet_logger, 0)
 
                     loggers['cm_logger'].add(best_lists)
                     best_vals = values.copy()
@@ -849,10 +1003,12 @@ class TrainAE:
                             add_to_logger(values, loggers['logger'], epoch)
                         except:
                             print("Problem with add_to_logger!")
-                    if self.log_neptune:
-                        add_to_neptune(values, run)
+                    if self.log_tracking:
+                        add_to_tracking(values, run)
                     if self.log_mlflow:
                         add_to_mlflow(values, epoch)
+                    if self.log_comet:
+                        add_to_comet(values, comet_logger, epoch)
                     if values['valid_calibration']['mcc'][-1] > self.best_mcc:
                         print(f"Best Classification Mcc Epoch {epoch}, "
                                 f"Acc: test: {values['test_calibration']['acc'][-1]}, valid: {values['valid_calibration']['acc'][-1]}"
@@ -894,6 +1050,7 @@ class TrainAE:
                         self.best_closs = values['valid_calibration']['closs'][-1]
 
         except Exception as e:
+            train_exception = e
             print(f"Training failed: {e}")
             traceback.print_exc()
 
@@ -902,6 +1059,10 @@ class TrainAE:
         # Loading best model that was saved during training
         model_path = f'{self.complete_log_path}/model.pth'
         if not os.path.exists(model_path):
+            if train_exception is not None:
+                raise RuntimeError(
+                    f"Training aborted before checkpoint creation: {model_path}"
+                ) from train_exception
             raise FileNotFoundError(f"Checkpoint missing: {model_path}")
         self.model.load_state_dict(torch.load(model_path, map_location=self.args.device))
         # Need another model because the other cant be use to get shap values
@@ -912,23 +1073,36 @@ class TrainAE:
             _, best_lists1, _ = self.loop('train', optimizer_model, params['gamma'], loaders['train'], lists, traces)
             for group in ["train", "valid", "test"]:
                 _, best_lists2, traces, knn = self.predict(group, loaders[group], lists, traces)
+            batch_metrics = get_batch_metrics(lists)
+            for key, value in batch_metrics.items():
+                traces[key] = value
+            # Store batch metrics for database saving
+            self.batch_metrics = batch_metrics
+
         best_lists = {**best_lists1, **best_lists2}
 
         # Logging every model is taking too much resources and it makes it quite complicated to get information when
         # Too many runs have been made. This will make the notebook so much easier to work with
         if self.best_mcc > self.best_best_mcc:
-            self.save_best_run(run, params, best_vals, best_lists)
+            self.save_best_run(run, comet_logger, params, best_vals, best_lists)
             # Save best model parameters and hyperparamters into a csv, including task
 
-        if self.log_neptune and run is not None:
+        if self.log_tracking and run is not None:
             try:
                 run.stop()
             except Exception as e:
-                print(f"Warning: failed to stop Neptune run: {e}")
+                print(f"Warning: failed to stop Tracking run: {e}")
 
         return self.best_mcc
 
-    def save_best_run(self, run, params, best_vals, best_lists=None):
+    def save_best_run(self, run, comet_logger, params, best_vals, best_lists=None):
+        # Log the final K value used to Tracking if available
+        if self.log_tracking and run is not None:
+            final_k = params.get('n_neighbors', getattr(self.args, 'n_neighbors', 5))
+            run["final_n_neighbors"] = final_k
+        if self.log_comet and comet_logger is not None:
+            comet_logger.log_parameter("final_n_neighbors", params.get('n_neighbors', getattr(self.args, 'n_neighbors', 5)))
+        
         # Create csv file if not exists
         models_csv_path = f'logs/best_models/{self.args.task}/models.csv'
         log_dir = f'logs/best_models/{self.args.task}'
@@ -945,14 +1119,20 @@ class TrainAE:
         dist_fct_val = str(params.get("dist_fct", getattr(self.args, "dist_fct", "none")))
         self.args.dist_fct = dist_fct_val
         task_val = str(self.args.task) if getattr(self.args, "task", None) else "notNormal"
+        # Ensure prototypes_to_use doesn't have "prototypes_" prefix for consistent formatting
+        proto_val = str(self.args.prototypes_to_use)
+        if proto_val.startswith("prototypes_"):
+            proto_val = proto_val[len("prototypes_"):]
+
 
         if not os.path.exists(models_csv_path):
             os.makedirs(log_dir, exist_ok=True)
             with open(models_csv_path, 'w') as f:
                 f.write('valid_mcc,model,path,n_neighbors,nsize,fgsm,n_calibration,loss,dloss,dist_fct,prototype,n_positives,n_negatives,normalize,task,complete_log_path\n')
                 f.write(f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},{params["n_neighbors"]},nsize{self.args.new_size},fsgm{self.args.fgsm},ncal{self.args.n_calibration},' \
-                    f'{self.args.classif_loss},{self.args.dloss},{dist_fct_val},prototypes_{self.args.prototypes_to_use},' \
+                    f'{self.args.classif_loss},{self.args.dloss},{dist_fct_val},prototypes_{proto_val},' \
                     f'npos{self.args.n_positives},nneg{self.args.n_negatives},{self.args.normalize},{task_val},{self.complete_log_path}\n')
+
         else:
             with open(models_csv_path, 'r') as f:
                 lines = f.readlines()
@@ -963,14 +1143,14 @@ class TrainAE:
                 line_mcc = float(line_parts[0])
                 if (line_parts[1:-1] == [self.args.model_name, f'{self.path.split("/")[-1]}', str(params["n_neighbors"]), f'nsize{self.args.new_size}', f'fsgm{self.args.fgsm}', f'ncal{self.args.n_calibration}', 
                                        str(self.args.classif_loss), str(self.args.dloss), dist_fct_val,
-                                       f'prototypes_{self.args.prototypes_to_use}',
+                                       f'prototypes_{proto_val}',
                                        f'npos{self.args.n_positives}', f'nneg{self.args.n_negatives}',
                                        self.args.normalize,
                                        task_val]):
                     if self.best_mcc >= line_mcc:
-                        lines[i + 1] = f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},{params["n_neighbors"]},nsize{self.args.new_size},fsgm{self.args.fgsm},' \
+                        lines[i + 1] = f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},{params["n_neighbors"]},nsize{self.args.new_size},fgsm{self.args.fgsm},' \
                                         f'ncal{self.args.n_calibration},{self.args.classif_loss},{self.args.dloss},{dist_fct_val},' \
-                                        f'prototypes_{self.args.prototypes_to_use},npos{self.args.n_positives},' \
+                                        f'prototypes_{proto_val},npos{self.args.n_positives},' \
                                         f'nneg{self.args.n_negatives},{self.args.normalize},{task_val},{self.complete_log_path}\n'
                     else:
                         lines[i + 1] = line
@@ -979,27 +1159,53 @@ class TrainAE:
 
             if not line_found:
                 lines.append(f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},{params["n_neighbors"]},'\
-                             f'nsize{self.args.new_size},fsgm{self.args.fgsm},'\
+                             f'nsize{self.args.new_size},fgsm{self.args.fgsm},'\
                              f'ncal{self.args.n_calibration},{self.args.classif_loss},' \
-                             f'{self.args.dloss},{dist_fct_val},prototypes_{self.args.prototypes_to_use},' \
+                             f'{self.args.dloss},{dist_fct_val},prototypes_{proto_val},' \
                              f'npos{self.args.n_positives},nneg{self.args.n_negatives},' \
                              f'{self.args.normalize},{task_val},{self.complete_log_path}\n')
+
+            # Update CSV with consistent formatting
+            for i, line in enumerate(lines[1:], start=1):
+                line_parts = line.strip().split(',')
+                if len(line_parts) > 5:
+                    # Rebuild line with consistent prototypes naming
+                    if line_parts[10].startswith('prototypes_'):
+                        line_parts[10] = 'prototypes_' + line_parts[10][len('prototypes_'):]
+                    lines[i] = ','.join(line_parts) + '\n' if line_parts[-1] != '\n' else ','.join(line_parts)
 
             with open(models_csv_path, 'w') as f:
                 f.writelines(lines)
 
-        # Ensure prototypes_to_use doesn't have "prototypes_" prefix already
+        # Standardize parameter names for CSV and paths
         proto_val = str(self.args.prototypes_to_use)
         if proto_val.startswith("prototypes_"):
             proto_val = proto_val[len("prototypes_"):]
         
+        # Use consistent CSV formatting (same as path)
+        if not line_found:
+            lines[-1] = f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},{params["n_neighbors"]},'\
+                         f'nsize{self.args.new_size},fgsm{self.args.fgsm},'\
+                         f'ncal{self.args.n_calibration},{self.args.classif_loss},' \
+                         f'{self.args.dloss},{dist_fct_val},prototypes_{proto_val},' \
+                         f'npos{self.args.n_positives},nneg{self.args.n_negatives},' \
+                         f'{self.args.normalize},{task_val},{self.complete_log_path}\n'
+
+            with open(models_csv_path, 'w') as f:
+                f.writelines(lines)
+        # Ensure prototypes_to_use doesn't have "prototypes_" prefix already
+        proto_val = str(self.args.prototypes_to_use)
+        if proto_val.startswith("prototypes_"):
+            proto_val = proto_val[len("prototypes_"):]
+
         n_neighbors_val = params.get('n_neighbors', getattr(self.args, 'n_neighbors', 5))
         params_str = f'{self.path.split("/")[-1]}/nsize{self.args.new_size}/fgsm{self.args.fgsm}/ncal{self.args.n_calibration}/{self.args.classif_loss}/' \
-             f'{self.args.dloss}/prototypes_{proto_val}/' \
-             f'npos{self.args.n_positives}/nneg{self.args.n_negatives}/' \
-             f'norm{self.args.normalize}/' \
-             f'dist_{dist_fct_val}/' \
-             f'knn{n_neighbors_val}'
+            f'{self.args.dloss}/prototypes_{proto_val}/' \
+            f'npos{self.args.n_positives}/nneg{self.args.n_negatives}/' \
+            f'protoagg_{getattr(self.args, "prototype_strategy", "mean")}_{getattr(self.args, "prototype_components", 1)}/' \
+            f'norm{self.args.normalize}/' \
+            f'dist_{dist_fct_val}/' \
+            f'knn{n_neighbors_val}'
         model_dir = f'logs/best_models/{self.args.task}/{self.args.model_name}/{params_str}'
 
         try:
@@ -1013,7 +1219,7 @@ class TrainAE:
         self.save_encoded_vectors(model_dir, best_lists)
 
         self.best_best_mcc = self.best_mcc
-        self.keep_best_run(run, best_vals)
+        self.keep_best_run(run, comet_logger, best_vals)
         self.save_prototypes(model_dir)
         self.save_samples_weights(model_dir)
 
@@ -1032,11 +1238,23 @@ class TrainAE:
             'normalize': self.args.normalize,
             'n_neighbors': params.get('n_neighbors', getattr(self.args, 'n_neighbors', 5))
         }
+        
+        # Get batch metrics if available
+        batch_metrics_dict = None
+        if hasattr(self, 'batch_metrics') and self.batch_metrics:
+            # Extract validation batch metrics
+            batch_metrics_dict = {
+                'batch_entropy_norm': self.batch_metrics.get('valid_batch_entropy_norm'),
+                'batch_nmi': self.batch_metrics.get('valid_batch_nmi'),
+                'batch_ari': self.batch_metrics.get('valid_batch_ari'),
+            }
+        
         update_best_model_registry(
             registry_params,
             accuracy=best_vals.get('acc', self.best_mcc),
             mcc=self.best_mcc,
-            log_path=model_dir
+            log_path=model_dir,
+            batch_metrics=batch_metrics_dict
         )
 
     # TODO Decide if valuable class method
@@ -1088,8 +1306,9 @@ class TrainAE:
         except Exception as e:
             print(f"Error saving encoded vectors: {e}")
 
-    def keep_best_run(self, run, best_vals):
-        self.best_params = get_best_params(run, best_vals)
+    def keep_best_run(self, run, comet_logger, best_vals):
+        self.best_params_tracking = get_best_params(run, best_vals)
+        self.best_params = get_best_params_comet(comet_logger, best_vals)
 
     def set_arcloss(self):
         if self.args.classif_loss == 'arcface':
@@ -1130,26 +1349,18 @@ class TrainAE:
 
 
     def make_encoded_values(self, groups=['train', 'valid', 'test']):
-        # Base transform (no augmentation) used for inference and default KNN points
-        base_transform = torchvision.transforms.Compose([
-            torchvision.transforms.ToTensor()
-        ])
-
-        # Augmentations dedicated to KNN expansion (not used in CNN training loop)
-        knn_aug_transform = torchvision.transforms.Compose([
-            torchvision.transforms.ToTensor(),
-            torchvision.transforms.RandomHorizontalFlip(),
-            torchvision.transforms.RandomVerticalFlip(),
-            torchvision.transforms.RandomRotation(degrees=(-180, 180)),
-            torchvision.transforms.RandomApply(
-                [torchvision.transforms.RandomResizedCrop(
-                    size=self.args.new_size,
-                    scale=(0.8, 1.0),
-                    ratio=(0.8, 1.2)
-                )], p=0.5),
-        ])
-
-        n_aug = max(1, int(self.params.get('n_aug', 1))) if hasattr(self, 'params') else 1
+        """Encode all samples with optional augmentation for train set.
+        
+        Semantics:
+        - n_aug = 0: Only original images per sample
+        - n_aug >= 1: Original + n_aug augmented copies per image (train only)
+        - valid/test always use base transform without augmentation
+        """
+        # Get n_aug from params; defaults to 0 (originals only)
+        n_aug = max(0, int(self.params.get('n_aug', 0))) if hasattr(self, 'params') else 0
+        
+        base_transform = get_base_transform()
+        knn_aug_transform = get_knn_augmentation_transform(self.args.new_size)
 
         for group in groups:
             # Collect encoded samples and mirrored metadata (labels/names/etc.)
@@ -1157,8 +1368,6 @@ class TrainAE:
             all_subcenters = []
             group_labels, group_old_labels = [], []
             group_names, group_cats, group_batches = [], [], []
-
-            use_knn_aug = (group == 'train' and n_aug > 1)
 
             for i in range(0, len(self.all_samples['inputs'][group]), self.args.bs):
                 transformed_samples = []
@@ -1168,10 +1377,16 @@ class TrainAE:
                 batch = self.all_samples['inputs'][group][i:i + self.args.bs]
 
                 for j in range(len(batch)):
-                    repeats = n_aug if use_knn_aug else 1
-                    for _ in range(repeats):
-                        # Augment only for KNN enrichment; otherwise keep base transform
-                        sample = knn_aug_transform(batch[j]) if use_knn_aug else base_transform(batch[j])
+                    # Determine number of repeats: 1 original + n_aug extra for train; 1 for others
+                    repeats = 1 + max(0, n_aug) if group == 'train' else 1
+                    
+                    for r in range(repeats):
+                        # r == 0 -> original; r > 0 -> augmented (when n_aug > 0)
+                        if group == 'train' and r > 0:
+                            sample = knn_aug_transform(batch[j])
+                        else:
+                            sample = base_transform(batch[j])
+                        
                         transformed_samples.append(sample)
 
                         labels_batch.append(self.all_samples['labels'][group][i + j])
@@ -1221,7 +1436,7 @@ class TrainAE:
             if 'arcfacewithsubcenters' in self.args.classif_loss:
                 self.all_samples['subcenters'][group] = np.concatenate(all_subcenters) if all_subcenters else np.array([])
 
-    def log_predictions(self, best_lists, run, step):
+    def log_predictions(self, best_lists, run, comet_logger, step):
         cats, labels, preds, scores, names = [{'train': [], 'valid': [], 'test': []} for _ in range(5)]
         for group in ['valid', 'test']:
             cats[group] = np.concatenate(best_lists[group]['cats'])
@@ -1240,7 +1455,7 @@ class TrainAE:
                 columns=colnames
             )
             df.to_csv(f'{self.complete_log_path}/{group}_predictions.csv', index=False)
-            if self.log_neptune:
+            if self.log_tracking:
                 run[f"{group}_predictions"].track_files(f'{self.complete_log_path}/{group}_predictions.csv')
                 run[f'{group}_AUC'] = metrics.roc_auc_score(y_true=to_categorical(cats[group], len(self.unique_labels)), y_score=scores[group], multi_class='ovr')
                 save_roc_curve(
@@ -1250,11 +1465,35 @@ class TrainAE:
                     f'{self.complete_log_path}/{group}_roc_curve.png',
                     binary=False,
                     acc=metrics.accuracy_score(cats[group], np.array(scores[group].argmax(1))),
-                    mlops='neptune',
+                    mlops='mlflow',
                     epoch=step,
                     logger=None
                 )
                 run[f'{group}_ROC'].upload(f'{self.complete_log_path}/{group}_roc_curve.png')
+            if self.log_comet and comet_logger is not None:
+                comet_logger.log_metric(f'{group}_AUC',
+                            metrics.roc_auc_score(y_true=to_categorical(cats[group], len(self.unique_labels)), y_score=scores[group], multi_class='ovr'),
+                            step=step)
+
+                # TODO ADD OTHER FINAL METRICS HERE
+                comet_logger.log_metric(f'{group}_acc',
+                            metrics.accuracy_score(cats[group], scores[group].argmax(1)),
+                            step=step)
+                comet_logger.log_metric(f'{group}_mcc',
+                            MCC(cats[group], scores[group].argmax(1)),
+                            step=step)
+
+                save_roc_curve(
+                    scores[group],
+                    to_categorical(cats[group], len(self.unique_labels)),
+                    self.unique_labels,
+                    f'{self.complete_log_path}/{group}_roc_curve.png',
+                    binary=False,
+                    acc=metrics.accuracy_score(cats[group], np.array(scores[group].argmax(1))),
+                    mlops='comet',
+                    epoch=step,
+                    logger=comet_logger
+                )
             if self.log_mlflow:
                 mlflow.log_metric(f'{group}_AUC',
                             metrics.roc_auc_score(y_true=to_categorical(cats[group], len(self.unique_labels)), y_score=scores[group], multi_class='ovr'),
@@ -1540,7 +1779,227 @@ class TrainAE:
             # pbar.update(1)
         return classif_loss, lists, traces
 
+
+    def _classify_with_prototypes(self, embeddings: np.ndarray, dist_fct: str = 'euclidean'):
+        """
+        Classify using prototype distance with optional weighting by class size.
+        
+        Args:
+            embeddings: (n_samples, n_features)
+            dist_fct: 'euclidean' or 'cosine'
+            
+        Returns:
+            predictions: (n_samples,)
+            probas: (n_samples, n_classes)
+        """
+        if not self.class_prototypes.get('train'):
+            return None, None
+        
+        from scipy.spatial.distance import cdist
+        
+        predictions = []
+        probas_list = []
+        
+        for emb in embeddings:
+            emb = emb.reshape(1, -1)
+            distances = {}
+            
+            # Compute distance to each class prototype
+            for label, proto in self.class_prototypes['train'].items():
+                if proto is None or not isinstance(proto, np.ndarray) or proto.size == 0:
+                    distances[label] = np.inf
+                    continue
+                
+                proto = proto.reshape(1, -1)
+                
+                if dist_fct.lower() == 'cosine':
+                    # Cosine distance
+                    from sklearn.metrics.pairwise import cosine_distances
+                    dist = cosine_distances(emb, proto)[0, 0]
+                else:
+                    # Euclidean distance
+                    dist = cdist(emb, proto, metric='euclidean')[0, 0]
+                
+                distances[label] = dist
+            
+            # Apply distance-based classification
+            prototype_kind = getattr(self.args, 'prototype_kind', 'distance').lower()
+            
+            if prototype_kind == 'distance_weighted':
+                # Weight by number of prototypes per class (classes with more prototypes have more votes)
+                class_counts = {}
+                for clas in self.unique_labels:
+                    # Count number of training samples per class
+                    mask = np.concatenate(self.all_samples['cats']['train']) == clas
+                    class_counts[clas] = np.sum(mask)
+                
+                # Inverse distance weighted by class count
+                inv_distances = {}
+                for label, dist in distances.items():
+                    weight = class_counts.get(label, 1)
+                    inv_distances[label] = (weight / (dist + 1e-8)) if dist != np.inf else 0.0
+                
+                total_inv = sum(inv_distances.values())
+                probas = {label: inv_dist / (total_inv + 1e-8) for label, inv_dist in inv_distances.items()}
+            else:
+                # Simple distance-based (inverse distance ratio)
+                inv_distances = {label: 1.0 / (dist + 1e-8) if dist != np.inf else 0.0 
+                                for label, dist in distances.items()}
+                total_inv = sum(inv_distances.values())
+                probas = {label: inv_dist / (total_inv + 1e-8) for label, inv_dist in inv_distances.items()}
+            
+            best_label = max(probas, key=probas.get)
+            predictions.append(best_label)
+            probas_list.append(probas)
+        
+        # Convert to class indices and probability matrix
+        preds = np.array([np.argwhere(p == self.unique_labels).flatten()[0] if p in self.unique_labels else 0 
+                         for p in predictions])
+        proba_matrix = np.array([[probas_list[i].get(label, 0.0) for label in self.unique_labels] 
+                                 for i in range(len(predictions))])
+        
+        return preds, proba_matrix
+    
+    def _fit_kde_classifier(self, encs: np.ndarray, cats: np.ndarray):
+        """
+        Fit a KDE classifier on training encodings.
+        
+        Args:
+            encs: Training encodings (n_samples, n_features)
+            cats: Training labels (n_samples,)
+            
+        Returns:
+            KDE classifier instance
+        """
+        kde = make_kde_classifier(
+            kernel=getattr(self.args, 'kde_kernel', 'gaussian'),
+            bandwidth=getattr(self.args, 'kde_bandwidth', 'scott'),
+            learnable=False,
+            soft=True
+        )
+        kde.fit(encs, cats)
+        return kde
+
+    def evaluate_multi_classifiers(self, train_encs, train_cats, valid_encs, valid_cats):
+        """
+        Evaluate multiple classification strategies in parallel and select the best one.
+        This is much faster than sequential Ax optimization and works well for classifier selection.
+        
+        Args:
+            train_encs: Training encodings (n_samples, n_features)
+            train_cats: Training labels (n_samples,)
+            valid_encs: Validation encodings (n_samples, n_features)
+            valid_cats: Validation labels (n_samples,)
+            
+        Returns:
+            best_classifier_info: dict with keys:
+                - 'method': str name of best method
+                - 'classifier': fitted classifier instance (if applicable)
+                - 'mcc': float MCC score
+                - 'time': float execution time in seconds
+                - 'params': dict of parameters used
+        """
+        import time
+        
+        # Use ML module for comprehensive evaluation
+        start_time = time.time()
+        
+        all_results = evaluate_all_classifiers(
+            train_encs, train_cats,
+            valid_encs, valid_cats,
+            min_k=1,
+            max_k=min(10, train_encs.shape[0]),
+            include_kde=(self.args.prototypes_to_use != 'no'),
+            include_baselines=True
+        )
+        
+        total_time = time.time() - start_time
+        
+        # Find best method
+        best_method = 'knn'
+        best_mcc = all_results.get('knn', {}).get('best_mcc', -1)
+        best_params = {'k': all_results.get('knn', {}).get('best_k', 1)}
+        
+        # Check baselines
+        for name, data in all_results.get('baselines', {}).items():
+            if data.get('mcc', -1) > best_mcc:
+                best_method = name
+                best_mcc = data['mcc']
+                best_params = {'method': name}
+        
+        # Check KDE
+        kde_data = all_results.get('kde', {})
+        if kde_data.get('mcc', -1) > best_mcc:
+            best_method = 'kde'
+            best_mcc = kde_data['mcc']
+            best_params = {
+                'kernel': kde_data.get('kernel'),
+                'bandwidth': kde_data.get('bandwidth')
+            }
+        
+        # Add prototype-based classification if enabled
+        if self.args.prototypes_to_use != 'no' and self.class_prototypes.get('train'):
+            try:
+                preds, _ = self._classify_with_prototypes(
+                    valid_encs,
+                    dist_fct=self.params.get('dist_fct', 'euclidean')
+                )
+                if preds is not None:
+                    proto_mcc = MCC(valid_cats, preds)
+                    if proto_mcc > best_mcc:
+                        best_method = 'prototypes'
+                        best_mcc = proto_mcc
+                        best_params = {'method': 'prototypes'}
+            except Exception as e:
+                print(f"Prototype evaluation failed: {e}")
+        
+        print(f"\n{'='*60}")
+        print(f"Multi-Classifier Validation Results:")
+        print(f"  KNN:        MCC={all_results.get('knn', {}).get('best_mcc', 'N/A'):.4f} (k={all_results.get('knn', {}).get('best_k', 'N/A')})")
+        
+        for name, data in all_results.get('baselines', {}).items():
+            print(f"  {name.upper():11} MCC={data.get('mcc', -1):.4f}")
+        
+        kde_data = all_results.get('kde', {})
+        if kde_data:
+            print(f"  KDE:        MCC={kde_data.get('mcc', -1):.4f} (kernel={kde_data.get('kernel', 'N/A')}, bw={kde_data.get('bandwidth', 'N/A')})")
+        
+        print(f"  Prototypes: MCC={best_mcc if best_method == 'prototypes' else 'N/A'}")
+        print(f"  Best method: {best_method.upper()} (MCC={best_mcc:.4f})")
+        print(f"  Total time: {total_time:.2f}s")
+        print(f"{'='*60}\n")
+        
+        # Fit and return the best classifier
+        best_classifier = None
+        if best_method == 'knn':
+            best_classifier = fit_knn_classifier(
+                train_encs, train_cats,
+                n_neighbors=best_params['k'],
+                metric='minkowski'
+            )
+        elif best_method in ['logistic_regression', 'naive_bayes', 'linear_svc']:
+            from otitenet.ml import fit_baseline_classifiers
+            classifiers = fit_baseline_classifiers(train_encs, train_cats)
+            best_classifier = classifiers.get(best_method)
+        elif best_method == 'kde':
+            from otitenet.ml import fit_kde_classifier
+            best_classifier = fit_kde_classifier(
+                train_encs, train_cats,
+                kernel=best_params.get('kernel', 'gaussian'),
+                bandwidth=best_params.get('bandwidth', 'scott')
+            )
+        # Note: prototypes don't need a sklearn-style classifier
+        
+        return {
+            'method': best_method,
+            'classifier': best_classifier,
+            'mcc': best_mcc,
+            'time': total_time,
+            'params': best_params
+        }
+
     def predict(self, group, loader, lists, traces):
+
         """
 
         Args:
@@ -1569,41 +2028,42 @@ class TrainAE:
         train_encs = _safe_concat(lists['train']['encoded_values'])
         train_cats = _safe_concat(lists['train']['cats'])
                 
-        if self.args.classif_loss not in ['ce', 'hinge']:
-            # Build KNN with class prototypes if available
-            use_prototypes = self.args.prototypes_to_use in ['combined', 'class'] and self.class_prototypes.get('train')
-            
-            if use_prototypes:
-                proto_encs = []
-                proto_cats = []
-                for clas, proto in self.class_prototypes['train'].items():
-                    if isinstance(proto, np.ndarray) and proto.size > 0:
-                        proto_encs.append(proto.reshape(1, -1) if proto.ndim == 1 else proto)
-                        proto_cats.append(np.array([np.argwhere(clas == self.unique_labels).flatten()[0]]))
-                
-                if proto_encs:
-                    proto_encs = np.concatenate(proto_encs)
-                    proto_cats = np.concatenate(proto_cats)
-                    train_encs_aug = np.concatenate([train_encs, proto_encs])
-                    train_cats_aug = np.concatenate([train_cats, proto_cats])
-                    print(f"KNN with prototypes: {len(train_cats)} train samples + {len(proto_cats)} prototypes")
-                else:
-                    train_encs_aug, train_cats_aug = train_encs, train_cats
-            else:
-                train_encs_aug, train_cats_aug = train_encs, train_cats
-            
+        # Decide which classifier to use
+        use_prototypes = (self.args.prototypes_to_use in ['combined', 'class'] and 
+                         self.class_prototypes.get('train') and 
+                         self.args.classif_loss not in ['ce', 'hinge'])
+        use_kde = (use_prototypes and 
+                  getattr(self.args, 'prototype_kind', 'distance').lower() == 'kde')
+        use_knn = (self.args.classif_loss not in ['ce', 'hinge'] and not use_prototypes and not use_kde)
+        
+        # Initialize classifiers
+        KNeighborsClassifier = None
+        kde_classifier = None
+        
+        if use_kde and train_encs is not None and train_cats is not None:
+            kde_classifier = self._fit_kde_classifier(train_encs, train_cats)
+            print(f"Using KDE classifier with {len(train_encs)} training samples")
+        
+        elif use_prototypes and train_encs is not None and train_cats is not None:
+            print(f"Using prototype-based classification ({getattr(self.args, 'prototype_kind', 'distance')})") 
+        
+        elif use_knn:
             if train_encs is None or train_cats is None or train_encs.size == 0 or train_cats.size == 0:
                 KNeighborsClassifier = None
             else:
-                # If user left n_neighbors at 0, fallback to a safe range (<=25, <=train size)
                 requested_k = self.params.get('n_neighbors', 0)
                 if requested_k is None or requested_k <= 0:
-                    requested_k = min(25, max(1, train_encs_aug.shape[0]))
+                    requested_k = min(25, max(1, train_encs.shape[0]))
                     self.params['n_neighbors'] = requested_k
-
-                k_val = min(requested_k, max(1, train_encs_aug.shape[0]))
-                KNeighborsClassifier = KNN(n_neighbors=k_val, metric='minkowski')
-                KNeighborsClassifier.fit(train_encs_aug, train_cats_aug)
+                k_val = min(requested_k, max(1, train_encs.shape[0]))
+                
+                # Use ML module for KNN fitting
+                KNeighborsClassifier = fit_knn_classifier(
+                    train_encs, train_cats,
+                    n_neighbors=k_val,
+                    metric='minkowski'
+                )
+                print(f"Using KNN classifier with k={k_val}")
         else:
             KNeighborsClassifier = self.model
         # plot_decision_boundary(KNeighborsClassifier, train_encs, train_cats)
@@ -1616,14 +2076,24 @@ class TrainAE:
             to_rec = to_rec.to(self.args.device).float()
             domains = to_categorical(domain.long(), self.n_batches).squeeze().float().to(self.args.device)
             enc, dpreds = self.model(data)
-            if self.args.classif_loss not in ['ce', 'hinge']:
+            enc_np = enc.view(enc.shape[0], -1).detach().cpu().numpy()
+            
+            # Predict based on chosen method
+            if use_kde and kde_classifier is not None:
+                preds = kde_classifier.predict(enc_np)
+                proba = kde_classifier.predict_proba(enc_np)
+            elif use_prototypes and self.class_prototypes.get('train'):
+                preds, proba = self._classify_with_prototypes(enc_np, dist_fct=self.args.dist_fct)
+                if preds is None:
+                    preds = np.zeros(enc_np.shape[0], dtype=int)
+                    proba = np.full((enc_np.shape[0], len(self.unique_labels)), 1.0 / max(len(self.unique_labels), 1))
+            elif self.args.classif_loss not in ['ce', 'hinge']:
                 if KNeighborsClassifier is not None:
-                    preds = KNeighborsClassifier.predict(enc.view(enc.shape[0], -1).detach().cpu().numpy())
-                    proba = KNeighborsClassifier.predict_proba(enc.view(enc.shape[0], -1).detach().cpu().numpy())
+                    preds = KNeighborsClassifier.predict(enc_np)
+                    proba = KNeighborsClassifier.predict_proba(enc_np)
                 else:
-                    # Fallback: uniform probabilities, zero preds when no train encodings available
-                    preds = np.zeros(enc.shape[0], dtype=int)
-                    proba = np.full((enc.shape[0], len(self.unique_labels)), 1.0 / max(len(self.unique_labels), 1))
+                    preds = np.zeros(enc_np.shape[0], dtype=int)
+                    proba = np.full((enc_np.shape[0], len(self.unique_labels)), 1.0 / max(len(self.unique_labels), 1))
             else:
                 out = self.model.linear(enc)
                 preds = out.argmax(1).detach().cpu().numpy()
@@ -1702,6 +2172,8 @@ class TrainAE:
             except:
                 pass
             test_cats = np.concatenate(lists['test']['cats'])
+            train_encs = np.concatenate(lists['train']['encoded_values'])
+            train_cats = np.concatenate(lists['train']['cats'])
             train_encs_pca = pca.fit_transform(train_encs)
             valid_encs_pca = pca.transform(valid_encs)
             test_encs_pca = pca.transform(test_encs)
@@ -1746,14 +2218,15 @@ class TrainAE:
                 train_encs_aug, train_cats_aug = train_encs, train_cats
             
             if valid_encs is not None and valid_encs.size > 0 and train_encs is not None:
-                for k in range(1, max_k):
-                    knn_temp = KNN(n_neighbors=k, metric='minkowski')
-                    knn_temp.fit(train_encs_aug, train_cats_aug)
-                    valid_preds = knn_temp.predict(valid_encs)
-                    mcc_val = MCC(valid_cats, valid_preds)
-                    
-                    if mcc_val > best_mcc:
-                        best_k, best_mcc = k, mcc_val
+                # Use ML module for k optimization
+                best_k, best_mcc, mcc_per_k = evaluate_knn_with_k_search(
+                    train_encs_aug, train_cats_aug,
+                    valid_encs, valid_cats,
+                    min_k=1,
+                    max_k=max_k
+                )
+                #best_k = best_k_result['best_k']
+                #best_mcc = best_k_result['best_mcc']
                 
                 self.params['n_neighbors'] = best_k
                 print(f"Auto-selected k={best_k} with validation MCC={best_mcc:.4f}")
@@ -1783,8 +2256,13 @@ class TrainAE:
         train_prototypes = np.stack([self.class_prototypes['train'][x] for x in self.class_prototypes['train']])
         train_labels = list(self.class_prototypes['train'].keys())
         train_cats = [np.argwhere(x == self.unique_labels).flatten() for x in train_labels]
-        KNeighborsClassifier = KNN(n_neighbors=1, metric='minkowski')
-        KNeighborsClassifier.fit(train_prototypes, train_cats)
+        
+        # Use ML module for KNN fitting
+        KNeighborsClassifier = fit_knn_classifier(
+            train_prototypes, train_cats,
+            n_neighbors=1,
+            metric='minkowski'
+        )
         # plot_decision_boundary(KNeighborsClassifier, train_encs, train_cats)
         # plt.savefig(f'{self.complete_log_path}/decision_boundary.png')
         # with tqdm(total=len(loader), position=0, leave=True) as pbar:
@@ -2046,7 +2524,7 @@ class TrainAE:
                 'batches',
                 ordin,
             )
-            if self.log_neptune:
+            if self.log_tracking:
                 run[f"clusters_{ordin}"].upload(f'{self.complete_log_path}/clusters_{ordin}.png')
                 run[f"batches_{ordin}"].upload(f'{self.complete_log_path}/batches_{ordin}.png')  # TODO make the batches pca in this function
                 run[f"labels_{ordin}"].upload(f'{self.complete_log_path}/labels_{ordin}.png')
@@ -2082,7 +2560,7 @@ class TrainAE:
         })
         noisy_df.to_csv(f'{self.complete_log_path}/noisy_samples.csv', index=False)
         
-        if self.log_neptune:
+        if self.log_tracking:
             run["noisy_samples"].track_files(f'{self.complete_log_path}/noisy_samples.csv')
         
         if self.log_mlflow:
@@ -2151,28 +2629,84 @@ if __name__ == "__main__":
     parser.add_argument('--path_original', type=str, default='./data/otite_ds_-1')
     parser.add_argument('--exp_id', type=str, default='otite')
     parser.add_argument('--bs', type=int, default=32, help='Batch size')
-    parser.add_argument('--dloss', type=str, default="inverseTriplet", help='domain loss')
-    parser.add_argument('--classif_loss', type=str, default='softmax_contrastive', help='triplet or cosine')
+    parser.add_argument('--dloss', type=str, default=None, help='domain loss - if None, will optimize')
+    parser.add_argument('--classif_loss', type=str, default=None, help='triplet or cosine - if None, will optimize')
     parser.add_argument('--task', type=str, default='notNormal', help='Binary classification?')
     parser.add_argument('--is_stn', type=int, default=1, help='Transform train data?')
     parser.add_argument('--weighted_sampler', type=int, default=1, help='Weighted sampler?')
-    parser.add_argument('--n_calibration', type=int, default=0, help='n_calibration?')
+    parser.add_argument('--n_calibration', type=int, default=0, help='n_calibration - NOT optimized, fixed at 0')
     parser.add_argument('--remove_noisy_samples', type=int, default=0, help='Remove noisy samples?')
     parser.add_argument('--noisy_cluster_limit', type=int, default=10, help='Noisy cluster limit?')
-    parser.add_argument('--prototypes_to_use', type=str, default='no', help='Which prototypes?')
-    parser.add_argument('--n_positives', type=int, default=1, help='Number of positive samples per anchor for Tuplet Loss')
-    parser.add_argument('--n_negatives', type=int, default=1, help='Number of negative samples per anchor for Tuplet Loss')
-    parser.add_argument('--fgsm', type=int, default=1, help='Use Fast Gradient Sign Method')
+    parser.add_argument('--prototypes_to_use', type=str, default=None, help='Which prototypes - if None, will optimize')
+    parser.add_argument('--prototype_strategy', type=str, default='mean', choices=['mean', 'kmeans', 'gmm'], help='TRAINING: How to aggregate/learn prototypes during training (mean/kmeans/gmm). Determines shape of prototype set.')
+    parser.add_argument('--prototype_components', type=int, default=1, help='Components/centroids per class for prototype aggregation (used with kmeans/gmm during training)')
+    parser.add_argument('--prototype_kind', type=str, default='distance', choices=['distance', 'kde', 'distance_weighted'], help='VALIDATION: How to classify using learned prototypes at test time (distance/kde/distance_weighted)')
+    parser.add_argument('--kde_kernel', type=str, default='gaussian', choices=['gaussian', 'exponential', 'linear', 'tophat'], help='KDE kernel type')
+    parser.add_argument('--kde_bandwidth', type=str, default='scott', help='KDE bandwidth: scott, silverman, or float value')
+    parser.add_argument('--n_positives', type=int, default=None, help='Number of positive samples per anchor - if None, will optimize (only for triplet-based losses)')
+    parser.add_argument('--n_negatives', type=int, default=None, help='Number of negative samples per anchor - if None, will optimize (only for triplet-based losses)')
+    parser.add_argument('--fgsm', type=int, default=None, help='Use Fast Gradient Sign Method - if None, will optimize')
     parser.add_argument('--valid_dataset', type=str, default='Banque_Viscaino_Chili_2020', help='Validation dataset')
     parser.add_argument('--new_size', type=int, default=64, help='New size for images')
-    parser.add_argument('--normalize', type=str, default='no', help='Normalize images')
+    parser.add_argument('--normalize', type=str, default=None, help='Normalize images - if None, will optimize')
     parser.add_argument('--n_aug', type=int, default=1, help='Number of augmentations per image (1=original only)')
     parser.add_argument('--auto_select_k', type=int, default=1, help='Automatically select best k (1-10) each epoch based on validation MCC')
     parser.add_argument('--save_repro_artifacts', type=int, default=1, help='Save manifests + sanity samples for reproducibility')
+    parser.add_argument('--run_tag', type=str, default='prod', help='Tag to identify run type in logs/MLOps (e.g., TEST_SMOKE)')
+    parser.add_argument('--log_tracking', type=int, default=0, help='Enable Tracking logging (0/1)')
+    parser.add_argument('--log_comet', type=int, default=1, help='Enable Comet logging (0/1)')
+    parser.add_argument('--log_mlflow', type=int, default=0, help='Enable MLflow logging (0/1)')
+    parser.add_argument('--verbose', type=int, default=1, help='Verbosity level')
 
     args = parser.parse_args()
-    _set_global_seeds(getattr(args, 'seed', 1))
-    args.exp_id = f'{args.exp_id}_{args.task}'
+    _set_global_seeds(getattr(args, 'seed', 1), deterministic=True)
+    args.exp_id = f'{args.exp_id}_{args.task}_{args.run_tag}'
+    
+    # Track which parameters were originally None (to optimize them)
+    optimize_params = {}
+    
+    # Convert string "None" to actual None for optional parameters
+    if args.dloss == "None":
+        args.dloss = None
+    if args.classif_loss == "None":
+        args.classif_loss = None
+    if args.prototypes_to_use == "None":
+        args.prototypes_to_use = None
+    if args.n_positives == "None":
+        args.n_positives = None
+    if args.n_negatives == "None":
+        args.n_negatives = None
+    if args.fgsm == "None":
+        args.fgsm = None
+    if args.normalize == "None":
+        args.normalize = None
+    
+    # Mark which ones are None before applying defaults
+    # NOTE: n_calibration is NEVER optimized - it stays at 0
+    if args.dloss is None:
+        optimize_params['dloss'] = True
+        args.dloss = "inverseTriplet"
+    if args.classif_loss is None:
+        optimize_params['classif_loss'] = True
+        args.classif_loss = "softmax_contrastive"
+    # Always keep n_calibration at 0 - never optimize it
+    args.n_calibration = 0
+    if args.prototypes_to_use is None:
+        optimize_params['prototypes_to_use'] = True
+        args.prototypes_to_use = "no"
+    if args.n_positives is None:
+        optimize_params['n_positives'] = True
+        args.n_positives = 1
+    if args.n_negatives is None:
+        optimize_params['n_negatives'] = True
+        args.n_negatives = 1
+    if args.fgsm is None:
+        optimize_params['fgsm'] = True
+        args.fgsm = 1
+    if args.normalize is None:
+        optimize_params['normalize'] = True
+        args.normalize = "no"
+    
     try:
         mlflow.create_experiment(
             args.dloss,
@@ -2183,8 +2717,12 @@ if __name__ == "__main__":
         print(f"\n\nExperiment {args.exp_id} already exists: {e}\n\n")
 
     train = TrainAE(args, args.path, load_tb=False, log_metrics=True, keep_models=True,
-                    log_inputs=False, log_plots=True, log_tb=False, log_neptune=True,
-                    log_mlflow=False, groupkfold=args.groupkfold)
+                    log_inputs=False, log_plots=True, log_tb=False,
+                    log_tracking=bool(int(args.log_tracking)),
+                    log_comet=bool(int(args.log_comet)),
+                    log_mlflow=bool(int(args.log_mlflow)),
+                    groupkfold=args.groupkfold)
+    train.verbose = int(getattr(args, 'verbose', 1))
 
     def safe_eval(params):
         try:
@@ -2203,21 +2741,68 @@ if __name__ == "__main__":
         {"name": "smoothing", "type": "range", "bounds": [0., 0.2]},
         # {"name": "is_transform", "type": "choice", "values": [0, 1]},
     ]
+    
+    # Add loop parameters to optimization if they were originally None
+    if optimize_params.get('dloss'):
+        parameters += [{"name": "dloss", "type": "choice", "values": ['no', 'inverseTriplet']}]
+    if optimize_params.get('classif_loss'):
+        parameters += [{"name": "classif_loss", "type": "choice", "values": ['arcface', 'triplet', 'softmax_contrastive', 'ce', 'hinge']}]
+    # NEVER optimize n_calibration - it's always 0
+    if optimize_params.get('prototypes_to_use'):
+        parameters += [{"name": "prototypes_to_use", "type": "choice", "values": ['batch', 'no', 'class']}]
+    
+    # Only optimize n_positives and n_negatives if classif_loss is triplet-based
+    # These are only relevant for triplet and softmax_contrastive losses
+    triplet_losses = ['triplet', 'softmax_contrastive']
+    if optimize_params.get('n_positives') and args.classif_loss in triplet_losses:
+        parameters += [{"name": "n_positives", "type": "choice", "values": [1]}]
+    if optimize_params.get('n_negatives') and args.classif_loss in triplet_losses:
+        parameters += [{"name": "n_negatives", "type": "choice", "values": [1, 5]}]
+    
+    if optimize_params.get('fgsm'):
+        parameters += [{"name": "fgsm", "type": "choice", "values": [0, 1]}]
+    if optimize_params.get('normalize'):
+        parameters += [{"name": "normalize", "type": "choice", "values": ['yes', 'no']}]
+    
+    # Add prototype parameters only if prototypes are being used
+    if args.prototypes_to_use != 'no':
+        # prototype_strategy: only relevant when using prototypes
+        parameters += [{"name": "prototype_strategy", "type": "choice", "values": ['mean', 'kmeans']}]
+        # prototype_components: only relevant when using kmeans or gmm
+        parameters += [{"name": "prototype_components", "type": "range", "bounds": [1, 5]}]
+        # prototype_kind: how to classify using prototypes
+        parameters += [{"name": "prototype_kind", "type": "choice", "values": ['distance', 'kde', 'distance_weighted']}]
+        # KDE-specific parameters: only if prototype_kind will be kde (or might be)
+        # Since we're optimizing prototype_kind, we include these to allow kde exploration
+        parameters += [{"name": "kde_kernel", "type": "choice", "values": ['gaussian', 'exponential']}]
+        parameters += [{"name": "kde_bandwidth", "type": "choice", "values": ['scott', 'silverman']}]
+    
+    # Distance metrics: only relevant for triplet-based and distance-based classification
     if args.classif_loss in ['triplet', 'softmax_contrastive'] or args.dloss in ['revTriplet', 'inverseTriplet', 'normae', 'inverse_softmax_contrastive']:
         parameters += [{"name": "dist_fct", "type": "choice", "values": ['cosine', 'euclidean']}]
         parameters += [{"name": "dmargin", "type": "range", "bounds": [0., 1.]}]
+    
+    # Domain loss specific parameters
     if args.dloss in ['revTriplet', 'revDANN', 'DANN', 'inverseTriplet', 'normae', 'inverse_softmax_contrastive']:
         # gamma = 0 will ensure DANN is not learned
         parameters += [{"name": "gamma", "type": "range", "bounds": [1e-2, 1e2], "log_scale": True}]
+    
+    # Margin: only relevant for triplet-based losses
     if args.classif_loss in ['triplet', 'softmax_contrastive']:
         parameters += [{"name": "margin", "type": "range", "bounds": [0., 10.]}]
+    
+    # Epsilon for FGSM: only if FGSM is enabled
     if args.fgsm:
         parameters += [{"name": "epsilon", "type": "range", "bounds": [1e-4, 5e-1], "log_scale": True}]
+    
     # Only optimize n_neighbors if not using auto k selection
+    # Only relevant for non-linear classifiers (not 'ce' or 'hinge')
     if not args.auto_select_k and (args.classif_loss not in ['ce', 'hinge'] or args.dloss in ['inverse_softmax_contrastive', 'inverseTriplet']):
         parameters += [{"name": "n_neighbors", "type": "range", "bounds": [1, 10], "log_scale": True}]
-    # Add n_aug as hyperparameter (1=no augmentation, higher=more augmented copies)
+    
+    # Data augmentation: always useful
     parameters += [{"name": "n_aug", "type": "range", "bounds": [1, 5]}]
+    
     # Some hyperparameters are not always required. They are set to a default value in Train.train()
 
     best_parameters, values, experiment, model = optimize(
@@ -2269,6 +2854,18 @@ if __name__ == "__main__":
         # last resort: use current training run's complete path
         found_model_path = f"{train.complete_log_path}/model.pth"
 
+    if found_model_path is None or not os.path.exists(found_model_path):
+        raise RuntimeError(
+            "No trained checkpoint found after optimization; all trials may have failed. "
+            f"Last checked path: {found_model_path}"
+        )
+
+    if not hasattr(train, "model") or not hasattr(train, "shap_model"):
+        raise RuntimeError(
+            "Training object is missing model attributes after optimization; "
+            "a trial likely failed before model initialization."
+        )
+
     train.model.load_state_dict(
         torch.load(
             found_model_path,
@@ -2308,15 +2905,18 @@ if __name__ == "__main__":
         for group in ["train", "valid", "test"]:
             _, best_lists2, traces, knn = train.predict(group, loaders[group], lists, traces)
     best_lists = {**best_lists1, **best_lists2}
-    if train.log_neptune:
-        run = neptune.init_run(
-            project=NEPTUNE_PROJECT_NAME,
-            api_token=NEPTUNE_API_TOKEN,
-        )  # your credentials
-        run = set_run(run, train.best_params)
-        train.log_predictions(best_lists, run, 0)
-        train.save_wrong_classif_imgs(run, {'cnn': train.shap_model, 'knn': knn}, best_lists, best_lists['test']['preds'], 
+    if train.log_comet:
+        COMET_API_KEY = os.environ.get("COMET_API_KEY", "")
+        COMET_PROJECT_NAME = os.environ.get("COMET_PROJECT_NAME", "otitenet")
+        experiment = comet_ml.Experiment(
+            api_key=COMET_API_KEY,
+            project_name=COMET_PROJECT_NAME,
+        )
+        experiment = set_run(experiment, train.best_params)
+        # Register all parameters (fixed and optimized) to Comet
+        register_all_params_to_comet(experiment, train.args, train.best_params)
+        train.log_predictions(best_lists, experiment, 0)
+        train.save_wrong_classif_imgs(experiment, {'cnn': train.shap_model, 'knn': knn}, best_lists, best_lists['test']['preds'], 
                                     best_lists['test']['names'], 'test')
         
-        run.stop()
-
+        experiment.end()

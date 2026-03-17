@@ -3,12 +3,17 @@ import json
 import tempfile
 import glob
 import time
+import gc
+import traceback
+from tqdm import tqdm
+from otitenet.app.ui_helpers import plot_knn_mcc_curves, plot_prototype_mcc_curves
 
 # Disable Streamlit file watcher early to avoid importing/inspecting heavy packages
 # (prevents Streamlit from touching packages like torch._classes which can raise)
 os.environ.setdefault("STREAMLIT_FILE_WATCHER_TYPE", "none")
 
 import streamlit as st
+st.set_page_config(layout="wide")
 import debugpy
 if 'debugger_attached' not in st.session_state:
     try:
@@ -32,6 +37,11 @@ from otitenet.train.train_triplet_new import TrainAE  # If needed for params
 from otitenet.data.data_getters import GetData, get_images_loaders, get_images, PerImageNormalize  # Update import path
 from otitenet.models.cnn import Net, Net_shap  # Update path if needed
 from otitenet.utils.utils import get_empty_traces
+from otitenet.utils.prototypes import Prototypes
+from otitenet.utils.encoding_utils import (
+    get_base_transform, get_knn_augmentation_transform,
+    encode_split_with_augmentation, compute_prototypes_by_strategy, flatten_prototype_dict
+)
 from otitenet.logging.shap import log_shap_gradients_only, log_shap_knn_or_deep
 from otitenet.logging.grad_cam import (
     log_grad_cam_similarity,
@@ -42,1807 +52,183 @@ from otitenet.logging.metrics import MCC, expected_calibration_error, brier_scor
 from torchvision import transforms
 from matplotlib import pyplot as plt
 from sklearn.calibration import calibration_curve
-from sklearn.neighbors import KNeighborsClassifier as KNN
 from sklearn.decomposition import PCA
+from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
+from otitenet.ml import (
+    find_best_classifier,
+    fit_knn_classifier,
+    evaluate_knn_with_k_search,
+    fit_baseline_classifiers,
+    optimize_prototype_components,
+)
+from otitenet.ml.evaluation import evaluate_baseline_classifiers
 from sklearn.manifold import TSNE
+from datetime import datetime
 try:
     from umap import UMAP
 except ImportError:
     UMAP = None
 import seaborn as sns
+import joblib
 from otitenet.utils.update_model_ranks import update_model_ranks
-from otitenet.utils.update_model_ranks import update_model_ranks
-
-def strip_extension(filename):
-    """Remove common image extensions from filename."""
-    for ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.JPG', '.PNG', '.JPEG']:
-        if filename.endswith(ext):
-            return filename[:-len(ext)]
-    return filename
-
-def ensure_int(val):
-    """Safely convert value to int by stripping common parameter prefixes."""
-    if val is None:
-        return 0
-    s = str(val).lower()
-    for prefix in ['npos', 'nneg', 'nsize', 'fgsm', 'ncal', 'n_neighbors', 'bs']:
-        if s.startswith(prefix):
-            s = s[len(prefix):]
-    try:
-        # Handle cases like 'npos1' or already clean numbers
-        return int(float(s))
-    except ValueError:
-        return 0
-
-def get_model_params_path(_args):
-    """Construct the standardized relative path for model parameters folders."""
-    # Ensure every numeric param is clean before adding prefix
-    nsize = ensure_int(_args.new_size)
-    fgsm = ensure_int(_args.fgsm)
-    ncal = ensure_int(_args.n_calibration)
-    npos = ensure_int(_args.n_positives)
-    nneg = ensure_int(_args.n_negatives)
-    n_neighbors = ensure_int(_args.n_neighbors)
-    
-    dataset_name = _args.path.split("/")[-1]
-    
-    # Strip "prototypes_" prefix if present (training may add it)
-    proto_val = str(_args.prototypes_to_use)
-    if proto_val.startswith("prototypes_"):
-        proto_val = proto_val[len("prototypes_"):]
-    
-    # Get distance function and normalize values
-    dist_fct_val = str(getattr(_args, 'dist_fct', 'euclidean'))
-    normalize_val = str(getattr(_args, 'normalize', 'no'))
-    
-    params = f'{dataset_name}/nsize{nsize}/fgsm{fgsm}/ncal{ncal}/' \
-             f'{_args.classif_loss}/{_args.dloss}/prototypes_{proto_val}/' \
-             f'npos{npos}/nneg{nneg}/' \
-             f'norm{normalize_val}/' \
-             f'dist_{dist_fct_val}/' \
-             f'knn{n_neighbors}'
-    return params
+from otitenet.utils.kde import make_kde_classifier
+from otitenet.app.utils import (
+    strip_extension,
+    ensure_int,
+    get_model_params_path,
+    extract_params_from_log_path,
+    build_params_from_args,
+    get_calibration_metrics,
+    _make_model_selection_key,
+    _lookup_model_number,
+    _ensure_model_number_map,
+    _unique_preserve_order,
+    set_random_seeds,
+)
+from otitenet.app.database import (
+    create_db,
+    ensure_results_model_id,
+    ensure_best_models_registry_nsize,
+    check_ds_exists,
+    list_image_results,
+    fetch_model_by_log_path,
+    resolve_model_id,
+    insert_score,
+)
+from otitenet.app.image_processing import get_image, preprocess_image
+from otitenet.app.model_loading import (
+    resolve_model_paths,
+    load_saved_search_params,
+    load_model_parameters,
+    load_model_and_prototypes,
+    load_model_for_log_path,
+    clear_cached_model,
+)
+from otitenet.app.inference import (
+    predict_label_from_prototypes as _predict_label_from_prototypes,
+    predict_with_prototype_distance_ratio as _predict_with_prototype_distance_ratio,
+    predict_with_kde as _predict_with_kde,
+)
+from otitenet.app.ui_helpers import choose_dataset
+from otitenet.app.args import get_args, build_args_from_sidebar
+from otitenet.app.analysis import get_or_build_knn, run_analysis_on_file
 
 # Your model imports
 import argparse
 import random
 
 # Set random seeds for reproducibility (must match training)
-random.seed(1)
-torch.manual_seed(1)
-np.random.seed(1)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(1)
+set_random_seeds(1)
 
 # ---- Load datasets from /data ---- #
 data_dir = './data'
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ---- MySQL Database Setup ---- #
-@st.cache_resource
-def get_db_connection():
-    try:
-        conn = mysql.connector.connect(
-            host="localhost",
-            user="y_user",
-            password="password",
-            database="results_db",
-            buffered=True,
-            autocommit=True
-        )
-        return conn
-    except Error as e:
-        st.error(f"❌ Database connection error: {e}")
-        st.stop()
-
-def create_db():
-    try:
-        conn = get_db_connection()
-        if not conn.is_connected():
-            conn.reconnect(attempts=3, delay=1)
-        
-        # Ping the server to ensure connection is alive
-        conn.ping(reconnect=True, attempts=3, delay=1)
-        
-        cursor = conn.cursor(buffered=True)
-        # Minimal check to ensure it works
-        cursor.execute("SELECT 1")
-        cursor.fetchone()
-        return conn, cursor
-    except Exception as e:
-        # If the cached connection is broken, clear cache and try one more time
-        try:
-            get_db_connection.clear()
-            conn = get_db_connection()
-            if not conn.is_connected():
-                conn.reconnect(attempts=3, delay=1)
-            conn.ping(reconnect=True, attempts=3, delay=1)
-            cursor = conn.cursor(buffered=True)
-            cursor.execute("SELECT 1")
-            cursor.fetchone()
-            return conn, cursor
-        except Exception as e2:
-            if "Too many connections" in str(e2):
-                 st.error("❌ MySQL has too many connections. Please restart MySQL service or wait for connections to timeout.")
-            else:
-                 st.error(f"❌ Database error: {e2}")
-            st.stop()
-
-
-def ensure_results_model_id(conn, cursor):
-    """Ensure `results.model_id` exists (migration fallback)."""
-    try:
-        cursor.execute(
-            """
-            SELECT COUNT(*)
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME = 'results'
-              AND COLUMN_NAME = 'model_id'
-            """
-        )
-        has_col = cursor.fetchone()[0] > 0
-        if not has_col:
-            cursor.execute("ALTER TABLE results ADD COLUMN model_id INT NULL AFTER person_id")
-            try:
-                cursor.execute(
-                    """
-                    ALTER TABLE results
-                    ADD CONSTRAINT fk_results_model_id
-                    FOREIGN KEY (model_id) REFERENCES best_models_registry(id)
-                    ON DELETE SET NULL
-                    """
-                )
-            except Exception:
-                # If FK already exists or add fails, continue without blocking runtime
-                pass
-            conn.commit()
-    except Exception:
-        # Soft-fail: do not crash app if schema check fails
-        conn.rollback()
-
-def ensure_best_models_registry_nsize(conn, cursor):
-    """Ensure `best_models_registry.nsize` exists and backfill from log_path if missing.
-    Adds column as INT NULL and parses size from the standard best_models path.
-    """
-    try:
-        cursor.execute(
-            """
-            SELECT COUNT(*)
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME = 'best_models_registry'
-              AND COLUMN_NAME = 'nsize'
-            """
-        )
-        has_col = cursor.fetchone()[0] > 0
-    except Exception:
-        # If schema introspection fails, do not block the app
-        return
-
-    if not has_col:
-        try:
-            cursor.execute("ALTER TABLE best_models_registry ADD COLUMN nsize INT NULL")
-            conn.commit()
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            # Could not add column; bail out quietly
-            return
-
-    # Backfill missing values from log_path
-    try:
-        cursor.execute(
-            """
-            SELECT id, log_path FROM best_models_registry
-            WHERE (nsize IS NULL) AND log_path IS NOT NULL AND log_path <> ''
-            """
-        )
-        rows = cursor.fetchall() or []
-        for rid, lp in rows:
-            try:
-                params = extract_params_from_log_path(lp)
-                ns = params.get('new_size')
-                if ns is None:
-                    continue
-                val = int(float(ns))
-                cursor.execute("UPDATE best_models_registry SET nsize=%s WHERE id=%s", (val, rid))
-            except Exception:
-                # Skip unparseable rows
-                continue
-        if rows:
-            conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-
-def get_image(path, size=-1, normalize='no'):
-    ops = [
-        transforms.Resize((size, size)),
-        transforms.ToTensor(),
-    ]
-    if str(normalize).lower() in ['yes', 'true', '1']:
-        ops.append(PerImageNormalize())
-    
-    transform = transforms.Compose(ops)
-    original = Image.open(path).convert('RGB')
-    if size != -1:
-        png = transforms.Resize((size, size))(original)
-    else:
-        png = original
-    print(size, png)
-    
-    return transform(original).unsqueeze(0), transform(png).unsqueeze(0)
-
-
-def choose_dataset(label, datasets, default=None, key=None):
-    """Return a dataset choice while keeping session_state and defaults in sync."""
-    if len(datasets) == 0:
-        st.warning(f"No datasets found in {data_dir}.")
-        return None
-
-    # Clear stale session values that are no longer valid to avoid selectbox errors.
-    if key and key in st.session_state and st.session_state[key] not in datasets:
-        st.session_state.pop(key, None)
-
-    # Prefer an existing, valid session value if present; otherwise fall back to default/first.
-    current = None
-    if key and key in st.session_state and st.session_state[key] in datasets:
-        current = st.session_state[key]
-    elif default in datasets:
-        current = default
-    elif datasets:
-        current = datasets[0]
-
-    index = datasets.index(current) if current in datasets else 0
-
-    if len(datasets) <= 3:
-        return st.radio(label, datasets, index=index, key=key)
-    else:
-        return st.selectbox(label, datasets, index=index, key=key)
-
-
-# ---- Database Lookup ---- #
-def check_ds_exists(cursor, filename, args):
-    cursor.execute(''' 
-        SELECT pred_label, confidence, log_path FROM results
-        WHERE filename=%s AND person_id=%s AND model_name=%s AND task=%s AND path=%s
-              AND n_neighbors=%s AND nsize=%s AND fgsm=%s AND normalize=%s AND
-              n_calibration=%s AND classif_loss=%s AND dloss=%s AND dist_fct=%s AND prototypes=%s
-              AND npos=%s AND nneg=%s
-    ''', (
-        filename,
-        st.session_state.person_id,
-        args.model_name,
-        args.task,
-        args.path,
-        str(args.n_neighbors),
-        str(args.new_size),
-        str(args.fgsm),
-        args.normalize,
-        str(args.n_calibration),
-        args.classif_loss,
-        args.dloss,
-        args.dist_fct,
-        args.prototypes_to_use,
-        str(args.n_positives),
-        str(args.n_negatives),
-    ))
-
-    row = cursor.fetchone()
-    return row
-
-
-def list_image_results(cursor, person_id, filename):
-    """Return all stored analyses for this image and person."""
-    cursor.execute('''
-        SELECT model_name, task, pred_label, confidence, log_path, timestamp,
-               nsize, fgsm, normalize, n_calibration, classif_loss, dloss, dist_fct,
-               prototypes, npos, nneg, n_neighbors, model_id
-        FROM results
-        WHERE filename=%s AND person_id=%s
-        ORDER BY timestamp DESC
-    ''', (filename, person_id))
-    return cursor.fetchall()
-
-def build_params_from_args(_args, keys):
-    parts = []
-    for key in keys:
-        value = getattr(_args, key, None)
-        if value is not None:
-            parts.append(f"{key}{value}")
-    return "/".join(parts)
-
-
-def extract_params_from_log_path(log_path: str):
-    """Derive leaderboard defaults from the stored best-model log path."""
-    params = {}
-    if not log_path:
-        return params
-    parts = log_path.strip("/").split("/")
-    try:
-        base_idx = parts.index("best_models")
-    except ValueError:
-        return params
-
-    if len(parts) > base_idx + 1:
-        params["Task"] = parts[base_idx + 1]
-    if len(parts) > base_idx + 3:
-        params["Dataset"] = parts[base_idx + 3]
-    if len(parts) > base_idx + 4:
-        nsize_part = parts[base_idx + 4]
-        if nsize_part.startswith("nsize"):
-            params["new_size"] = nsize_part[len("nsize"):]
-    if len(parts) > base_idx + 5:
-        params.setdefault("FGSM", parts[base_idx + 5])
-    if len(parts) > base_idx + 6:
-        params.setdefault("N_Calibration", parts[base_idx + 6])
-    if len(parts) > base_idx + 7:
-        params.setdefault("classif_loss", parts[base_idx + 7])
-    if len(parts) > base_idx + 8:
-        params.setdefault("DLoss", parts[base_idx + 8])
-    if len(parts) > base_idx + 9:
-        params.setdefault("Prototypes", parts[base_idx + 9])
-    if len(parts) > base_idx + 10:
-        params.setdefault("NPos", parts[base_idx + 10])
-    if len(parts) > base_idx + 11:
-        params.setdefault("NNeg", parts[base_idx + 11])
-    if len(parts) > base_idx + 12:
-        norm_part = parts[base_idx + 12]
-        if norm_part.startswith("norm"):
-            params.setdefault("Normalize", norm_part[len("norm"):])
-        else:
-            params.setdefault("Normalize", norm_part)
-    if len(parts) > base_idx + 13:
-        dist_part = parts[base_idx + 13]
-        if dist_part.startswith("dist_"):
-            params.setdefault("Dist_Fct", dist_part[len("dist_"):])
-        else:
-            params.setdefault("Dist_Fct", dist_part)
-    if len(parts) > base_idx + 14:
-        knn_part = parts[base_idx + 14]
-        if knn_part.startswith("knn"):
-            params.setdefault("N_Neighbors", knn_part[len("knn"):])
-        else:
-            params.setdefault("N_Neighbors", knn_part)
-    return params
-
-
-def fetch_model_by_log_path(cursor, log_path: str):
-    cursor.execute(
-        """
-        SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss,
-               n_calibration, accuracy, mcc, normalize, n_neighbors, log_path
-        FROM best_models_registry
-        WHERE log_path=%s
-        LIMIT 1
-        """,
-        (log_path,),
-    )
-    return cursor.fetchone()
-
-
-def _resolve_model_id(cursor, args, log_path: str):
-    """Best-effort lookup of best_models_registry.id for the current run."""
-    try:
-        explicit = getattr(args, "model_id", None)
-        if explicit not in (None, "", "None"):
-            return int(explicit)
-    except Exception:
-        pass
-
-    if log_path:
-        candidates = [log_path]
-        lp_trim = str(log_path).rstrip("/")
-        if lp_trim.endswith("/queries"):
-            candidates.append(lp_trim[: -len("/queries")])
-        for lp in _unique_preserve_order(candidates):
-            try:
-                cursor.execute("SELECT id FROM best_models_registry WHERE log_path=%s LIMIT 1", (lp,))
-                row = cursor.fetchone()
-                if row:
-                    return int(row[0])
-            except Exception:
-                pass
-
-    try:
-        cursor.execute(
-            """
-            SELECT id FROM best_models_registry
-            WHERE model_name=%s AND nsize=%s AND fgsm=%s AND prototypes=%s AND npos=%s AND nneg=%s AND dloss=%s
-                  AND dist_fct=%s AND classif_loss=%s AND n_calibration=%s AND normalize=%s AND n_neighbors=%s
-            ORDER BY id ASC
-            LIMIT 1
-            """,
-            (
-                getattr(args, "model_name", None),
-                str(getattr(args, "new_size", None)),
-                str(getattr(args, "fgsm", None)),
-                getattr(args, "prototypes_to_use", None),
-                str(getattr(args, "n_positives", None)),
-                str(getattr(args, "n_negatives", None)),
-                getattr(args, "dloss", None),
-                getattr(args, "dist_fct", None),
-                getattr(args, "classif_loss", None),
-                str(getattr(args, "n_calibration", None)),
-                getattr(args, "normalize", None),
-                str(getattr(args, "n_neighbors", None)),
-            ),
-        )
-        row = cursor.fetchone()
-        if row:
-            return int(row[0])
-    except Exception:
-        return None
-
-    return None
-
-
+# ---- Calibration Constants ---- #
 LEADERBOARD_CAL_CACHE_KEY = "calibration_metrics_cache"
 LEADERBOARD_CAL_POS_LABEL = "NotNormal"
 LEADERBOARD_CAL_N_BINS = 10
 
 
-def _compute_calibration_metrics(log_path: str):
-    """Compute calibration metrics from the saved validation predictions."""
-    if not log_path:
-        return {"error": "Missing log path"}
-    csv_path = os.path.join(log_path, "valid_predictions.csv")
-    if not os.path.exists(csv_path):
-        return {"error": "valid_predictions.csv not found"}
-
-    try:
-        df_cal = pd.read_csv(csv_path)
-    except Exception as exc:
-        return {"error": f"Could not read valid_predictions.csv: {exc}"}
-
-    required_cols = {"label", f"probs_{LEADERBOARD_CAL_POS_LABEL}"}
-    missing = required_cols.difference(df_cal.columns)
-    if missing:
-        return {"error": f"Missing columns: {', '.join(sorted(missing))}"}
-
-    y_true = (df_cal["label"] == LEADERBOARD_CAL_POS_LABEL).astype(int)
-    y_prob = df_cal[f"probs_{LEADERBOARD_CAL_POS_LABEL}"].astype(float)
-    valid_mask = ~(np.isnan(y_prob.values) | np.isinf(y_prob.values) | np.isnan(y_true.values.astype(float)))
-    y_true_filt = y_true.values[valid_mask].astype(int)
-    y_prob_filt = np.clip(y_prob.values[valid_mask], 0.0, 1.0).astype(float)
-
-    uniq_vals = np.unique(y_true_filt)
-    if len(y_true_filt) == 0 or set(uniq_vals) != {0, 1}:
+def _compute_batch_effect_from_predictions(preds, batch_labels):
+    preds = np.asarray(preds)
+    batch_labels = np.asarray(batch_labels)
+    if preds.shape[0] == 0 or batch_labels.shape[0] == 0 or preds.shape[0] != batch_labels.shape[0]:
         return {
-            "error": "Calibration requires binary labels and valid probabilities",
-            "n_samples": int(len(y_true_filt)),
+            'batch_entropy_norm': np.nan,
+            'batch_nmi': np.nan,
+            'batch_ari': np.nan,
         }
 
-    try:
-        prob_true, prob_pred = calibration_curve(
-            y_true_filt,
-            y_prob_filt,
-            n_bins=LEADERBOARD_CAL_N_BINS,
-        )
-        ece_val = expected_calibration_error(
-            y_prob_filt,
-            y_true_filt,
-            n_bins=LEADERBOARD_CAL_N_BINS,
-        )
-        brier_val = brier_score(y_prob_filt, y_true_filt)
-    except Exception as exc:
-        return {"error": f"Calibration computation failed: {exc}"}
+    unique_batches = np.unique(batch_labels)
+    unique_preds = np.unique(preds)
+
+    # Early exit only if we have <= 1 batch (nothing to measure mix across)
+    if unique_batches.size <= 1:
+        return {
+            'batch_entropy_norm': np.nan,
+            'batch_nmi': np.nan,
+            'batch_ari': np.nan,
+        }
+
+    contingency = np.zeros((unique_preds.size, unique_batches.size), dtype=float)
+    for i, pred_val in enumerate(unique_preds):
+        pred_mask = preds == pred_val
+        for j, batch_val in enumerate(unique_batches):
+            contingency[i, j] = np.sum(pred_mask & (batch_labels == batch_val))
+
+    row_sums = contingency.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    probs = contingency / row_sums
+    ent = -np.sum(np.where(probs > 0, probs * np.log(probs), 0.0), axis=1)
+    max_ent = np.log(unique_batches.size)
+    entropy_norm = float(np.mean(ent / (max_ent + 1e-12)))
+
+    # Handle degenerate single-cluster prediction case explicitly
+    if unique_preds.size <= 1:
+        nmi = 0.0
+        ari = 0.0
+    else:
+        nmi = float(normalized_mutual_info_score(batch_labels, preds))
+        ari = float(adjusted_rand_score(batch_labels, preds))
 
     return {
-        "error": None,
-        "ece": float(ece_val),
-        "brier": float(brier_val),
-        "prob_true": prob_true.tolist(),
-        "prob_pred": prob_pred.tolist(),
-        "n_points": int(len(prob_true)),
-        "n_samples": int(len(y_true_filt)),
+        'batch_entropy_norm': entropy_norm,
+        'batch_nmi': nmi,
+        'batch_ari': ari,
     }
 
+# ---- Classifier Display Names and Colors ---- #
+BASELINE_DISPLAY_NAMES = {
+    'logreg': 'Logistic Regression',
+    'ridge': 'Ridge Classifier',
+    'naive_bayes': 'Naive Bayes',
+    'linear_svc': 'Linear SVC',
+    'rbf_svc': 'RBF SVC',
+    'random_forest': 'Random Forest',
+    'gradient_boosting': 'Gradient Boosting',
+    'decision_tree': 'Decision Tree',
+    'lda': 'Linear Discriminant',
+    'qda': 'Quadratic Discriminant'
+}
 
-def get_calibration_metrics(log_path: str):
-    """Return cached calibration metrics for a given log path, computing if needed."""
-    if not log_path:
-        return None
-    cache = st.session_state.setdefault(LEADERBOARD_CAL_CACHE_KEY, {})
-    if log_path in cache:
-        return cache[log_path]
-    metrics = _compute_calibration_metrics(log_path)
-    cache[log_path] = metrics
-    return metrics
+BASELINE_DISPLAY_SHORT = {
+    'logreg': 'LogReg',
+    'ridge': 'Ridge',
+    'naive_bayes': 'NaiveBayes',
+    'linear_svc': 'LinearSVC',
+    'rbf_svc': 'RBF_SVC',
+    'random_forest': 'RandForest',
+    'gradient_boosting': 'GradBoost',
+    'decision_tree': 'DecTree',
+    'lda': 'LDA',
+    'qda': 'QDA'
+}
 
-
-def _unique_preserve_order(items):
-    """Return a list of unique items preserving first-seen order."""
-    return list(dict.fromkeys(items))
-
-
-def _make_model_selection_key(row_dict: dict) -> str:
-    """Create a stable unique key for a model parameter combination.
-
-    We cannot rely on `log_path` being unique (DB can contain multiple rows with
-    different params but same log_path), so selectors must key off the full
-    parameter combination.
-    """
-    import math
-    import numpy as np
-
-    def norm(v):
-        """Normalize values to stable strings for key generation.
-
-        - None/NaN → ""
-        - Numeric → canonical integer string (e.g., 224, 32)
-        - String → trimmed, lowercased
-        """
-        try:
-            if v is None:
-                return ""
-            # Handle pandas/numpy NaN and regular float('nan')
-            if isinstance(v, float) and math.isnan(v):
-                return ""
-            if isinstance(v, (np.floating,)) and np.isnan(v):
-                return ""
-            # Numeric to canonical int string when applicable
-            if isinstance(v, (int, np.integer)):
-                return str(int(v))
-            if isinstance(v, (float, np.floating)):
-                # If integer-like float, cast to int
-                if float(v).is_integer():
-                    return str(int(v))
-                # Else keep compact float string
-                s = ("%g" % float(v)).strip()
-                return s.lower()
-            # Strings: trim + lowercase
-            s = str(v).strip()
-            if s.lower() in {"nan", "none"}:
-                return ""
-            return s.lower()
-        except Exception:
-            return ""
-
-    parts = [
-        norm(row_dict.get("Model Name", "")),
-        norm(row_dict.get("NSize", "")),
-        norm(row_dict.get("FGSM", "")),
-        norm(row_dict.get("Prototypes", "")),
-        norm(row_dict.get("NPos", "")),
-        norm(row_dict.get("NNeg", "")),
-        norm(row_dict.get("DLoss", "")),
-        norm(row_dict.get("Dist_Fct", "")),
-        norm(row_dict.get("Classif_Loss", "")),
-        norm(row_dict.get("N_Calibration", "")),
-        norm(row_dict.get("Normalize", "")),
-        norm(row_dict.get("N_Neighbors", "")),
-    ]
-    # Do NOT include log_path in the selection key. It can legitimately differ
-    # across tables for the same parameter combination and would break mapping.
-    # Keep keys strictly based on parameter values to ensure stable cross-view mapping.
-    return "|".join(parts)
-
-def _lookup_model_number(mapping_rd: dict, model_number_map: dict) -> str:
-    """Resolve the model number from the map with graceful fallback.
-
-    1) Try exact key match with all parameters.
-    2) If not found, try a fuzzy match ignoring `N_Neighbors` when it's missing
-       in past results, matching on the other parameters only.
-    """
-    # First, attempt exact match
-    exact_key = _make_model_selection_key(mapping_rd)
-    num = model_number_map.get(exact_key)
-    if num is not None:
-        return num
-
-    # Fallback: fuzzy match on all fields except N_Neighbors
-    import math
-    import numpy as np
-    def norm(v):
-        try:
-            if v is None:
-                return ""
-            if isinstance(v, float) and math.isnan(v):
-                return ""
-            if isinstance(v, (np.floating,)) and np.isnan(v):
-                return ""
-            if isinstance(v, (int, np.integer)):
-                return str(int(v))
-            if isinstance(v, (float, np.floating)):
-                if float(v).is_integer():
-                    return str(int(v))
-                s = ("%g" % float(v)).strip()
-                return s.lower()
-            s = str(v).strip()
-            if s.lower() in {"nan", "none"}:
-                return ""
-            return s.lower()
-        except Exception:
-            return ""
-
-    expected_parts_wo_neighbors = [
-        norm(mapping_rd.get("Model Name", "")),
-        norm(mapping_rd.get("NSize", "")),
-        norm(mapping_rd.get("FGSM", "")),
-        norm(mapping_rd.get("Prototypes", "")),
-        norm(mapping_rd.get("NPos", "")),
-        norm(mapping_rd.get("NNeg", "")),
-        norm(mapping_rd.get("DLoss", "")),
-        norm(mapping_rd.get("Dist_Fct", "")),
-        norm(mapping_rd.get("Classif_Loss", "")),
-        norm(mapping_rd.get("N_Calibration", "")),
-        norm(mapping_rd.get("Normalize", "")),
-    ]
-    want_neighbors = norm(mapping_rd.get("N_Neighbors", ""))
-
-    for k, v in model_number_map.items():
-        parts = k.split("|")
-        # keys contain 12 parts (including neighbors) in the same order
-        if len(parts) < 12:
-            continue
-        # Compare without neighbors
-        if parts[:11] == expected_parts_wo_neighbors:
-            # If past result has no neighbors recorded, accept first match
-            if want_neighbors == "":
-                return v
-            # Else require neighbors to match too
-            if parts[11] == want_neighbors:
-                return v
-
-    # No match found
-    return "?"
-
-
-def _ensure_model_number_map(cursor):
-    """Ensure model_number_map and best_models_table exist in session state.
-
-    Returns (model_number_map, best_models_table).
-    """
-    model_number_map = st.session_state.get('model_number_map', {})
-    best_models_table = st.session_state.get('best_models_table', None)
-    if model_number_map and best_models_table is not None:
-        return model_number_map, best_models_table
-
-    try:
-        cursor.execute(
-            """
-             SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct,
-                 classif_loss, n_calibration, accuracy, mcc, normalize, n_neighbors, log_path, model_rank
-            FROM best_models_registry
-            WHERE model_rank IS NOT NULL
-            ORDER BY model_rank ASC
-            """
-        )
-        model_rows = cursor.fetchall()
-        use_db_rank = True
-    except Exception:
-        cursor.execute(
-            """
-             SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct,
-                 classif_loss, n_calibration, accuracy, mcc, normalize, n_neighbors, log_path
-            FROM best_models_registry
-            ORDER BY mcc DESC
-            """
-        )
-        model_rows = cursor.fetchall()
-        use_db_rank = False
-
-    if not model_rows:
-        st.session_state['model_number_map'] = model_number_map
-        return model_number_map, best_models_table
-
-    if use_db_rank:
-        cols = [
-            "Model ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg", "DLoss", "Dist_Fct",
-            "Classif_Loss", "N_Calibration", "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path", "#"
-        ]
-    else:
-        cols = [
-            "Model ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg", "DLoss", "Dist_Fct",
-            "Classif_Loss", "N_Calibration", "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path"
-        ]
-    df = pd.DataFrame(model_rows, columns=cols)
-    group_cols = [
-        "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
-        "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration", "Normalize", "N_Neighbors",
-    ]
-    _dedupe_frame = df[group_cols].copy().fillna("").astype(str)
-    df["_dedupe_key"] = _dedupe_frame.agg("|".join, axis=1)
-    df = df.sort_values("MCC", ascending=False)
-    df = df.drop_duplicates(subset=["_dedupe_key"], keep="first").drop(columns=["_dedupe_key"])
-    df = df.dropna(subset=["Log Path"])
-    df = df[df["Log Path"].astype(str) != ""]
-    df = df.reset_index(drop=True)
-    if "#" not in df.columns:
-        df.insert(0, "#", range(1, len(df) + 1))
-
-    model_number_map = {}
-    for _, r in df.iterrows():
-        rd = r.to_dict()
-        selection_key = _make_model_selection_key(rd)
-        model_number_map[selection_key] = rd.get("#", "?")
-
-    st.session_state['model_number_map'] = model_number_map
-    st.session_state['best_models_table'] = df.copy()
-    return model_number_map, df.copy()
-
-def get_args(selected_params=None):
-    if selected_params is None:
-        selected_params = st.session_state.get('selected_model_params', {})
-    selected_params_version = st.session_state.get('selected_params_version')
-    last_synced_version = st.session_state.get('selected_params_last_sync')
-    should_sync = bool(selected_params) and selected_params_version != last_synced_version
-    if should_sync:
-        st.session_state['selected_params_last_sync'] = selected_params_version
-
-    def sync_value(key, value):
-        if should_sync and value is not None:
-            st.session_state[key] = value
-    # ---- User selects paths ---- #
-    with st.sidebar:
-        st.header("Model Parameters")
-        
-        # ---- Model Selection from Leaderboard ---- #
-        st.subheader("📋 Quick Model Selection")
-        try:
-            model_rows = []
-            use_db_rank = False
-            # Try to use model_rank if available
-            try:
-                update_model_ranks()
-                cursor.execute(
-                    """
-                    SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss,
-                           n_calibration, accuracy, mcc, normalize, n_neighbors, log_path, model_rank
-                    FROM best_models_registry
-                    WHERE model_rank IS NOT NULL
-                    ORDER BY model_rank ASC
-                    """
-                )
-                model_rows = cursor.fetchall()
-                use_db_rank = True
-            except Exception:
-                # Fallback if model_rank column doesn't exist yet
-                cursor.execute(
-                    """
-                    SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss,
-                           n_calibration, accuracy, mcc, normalize, n_neighbors, log_path
-                    FROM best_models_registry
-                    ORDER BY mcc DESC
-                    """
-                )
-                model_rows = cursor.fetchall()
-                use_db_rank = False
-
-            if model_rows:
-                # Build the same deduped view as Tab1, then take the top unique rows.
-                if use_db_rank:
-                    _cols = [
-                        "Model ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg", "DLoss", "Dist_Fct",
-                        "Classif_Loss", "N_Calibration", "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path", "#"
-                    ]
-                else:
-                    _cols = [
-                        "Model ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg", "DLoss", "Dist_Fct",
-                        "Classif_Loss", "N_Calibration", "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path"
-                    ]
-                _df = pd.DataFrame(model_rows, columns=_cols)
-                
-                _group_cols = [
-                    "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
-                    "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration", "Normalize", "N_Neighbors",
-                ]
-                _dedupe_frame = _df[_group_cols].copy().fillna("").astype(str)
-                # Use row-wise join to ensure a Series (avoids pandas agg returning a DataFrame)
-                _df["_dedupe_key"] = _dedupe_frame.apply(lambda r: "|".join(r.values.tolist()), axis=1)
-                _df = _df.sort_values("MCC", ascending=False)
-                _df = _df.drop_duplicates(subset=["_dedupe_key"], keep="first").drop(columns=["_dedupe_key"])
-                _df = _df.dropna(subset=["Log Path"])
-                _df = _df[_df["Log Path"].astype(str) != ""]
-                _df = _df.reset_index(drop=True)
-                
-                # model_rank is already in the dataframe from the database query (if available)
-                # Otherwise add dynamic numbering
-                if "#" in _df.columns:
-                    # Move it to the first column
-                    cols = ["#"] + [col for col in _df.columns if col != "#"]
-                    _df = _df[cols]
-                else:
-                    # Add dynamic numbering as fallback
-                    _df.insert(0, "#", range(1, len(_df) + 1))
-
-                key_to_row = {}
-                key_to_label = {}
-                model_number_map = {}
-                for _, r in _df.iterrows():
-                    rd = r.to_dict()
-                    selection_key = _make_model_selection_key(rd)
-                    if selection_key in key_to_row:
-                        continue
-                    key_to_row[selection_key] = rd
-                    model_num = rd.get("#", "?")
-                    model_number_map[selection_key] = model_num
-                    try:
-                        key_to_label[selection_key] = (
-                            f"#{model_num} - {rd.get('Model Name')} (Size:{rd.get('NSize')}, MCC:{float(rd.get('MCC')):.3f}, Dist:{rd.get('Dist_Fct')}, Norm:{rd.get('Normalize')})"
-                        )
-                    except Exception:
-                        key_to_label[selection_key] = (
-                            f"#{model_num} - {rd.get('Model Name')} (Size:{rd.get('NSize')}, MCC:{rd.get('MCC')}, Dist:{rd.get('Dist_Fct')}, Norm:{rd.get('Normalize')})"
-                        )
-                st.session_state['model_number_map'] = model_number_map
-
-                # Auto-apply the top-ranked model so defaults come from Quick Model Selection
-                if not selected_params and len(_df) > 0:
-                    try:
-                        best_row = _df.iloc[0].to_dict()
-                        best_row.update(extract_params_from_log_path(best_row.get("Log Path")))
-                        if "N_Neighbors" in best_row:
-                            best_row["n_neighbors"] = best_row["N_Neighbors"]
-                        if "NSize" in best_row:
-                            best_row["new_size"] = best_row["NSize"]
-                        if "Dist_Fct" in best_row:
-                            best_row["dist_fct"] = best_row["Dist_Fct"]
-                        if "Classif_Loss" in best_row:
-                            best_row["classif_loss"] = best_row["Classif_Loss"]
-                        best_row["model_id"] = best_row.get("Model ID")
-
-                        selected_params = best_row
-                        st.session_state.selected_model_params = best_row
-                        st.session_state.selected_params_version = st.session_state.get('selected_params_version', 0) + 1
-                        st.session_state.selected_model_log_path = best_row.get('Log Path')
-                        best_key = _make_model_selection_key(best_row)
-                        st.session_state.selected_model_selection_key = best_key
-                        st.session_state.selected_model_version = st.session_state.get('selected_model_version', 0) + 1
-                        st.session_state.sidebar_best_model_key = best_key
-                        should_sync = True
-                    except Exception as auto_exc:
-                        st.warning(f"Could not auto-apply best model: {auto_exc}")
-
-                sidebar_options = _unique_preserve_order(list(key_to_row.keys()))
-
-                # Sync this widget to the canonical selection (log_path)
-                canonical_key = st.session_state.get('selected_model_selection_key')
-                if canonical_key and canonical_key in sidebar_options:
-                    last = st.session_state.get('sidebar_best_model_last_sync')
-                    ver = st.session_state.get('selected_model_version')
-                    if ver is not None and ver != last:
-                        st.session_state['sidebar_best_model_key'] = canonical_key
-                        st.session_state['sidebar_best_model_last_sync'] = ver
-
-                # Ensure the selectbox value is valid before rendering to avoid "not in iterable" errors.
-                current_sidebar_key = st.session_state.get('sidebar_best_model_key')
-                if current_sidebar_key not in sidebar_options:
-                    st.session_state['sidebar_best_model_key'] = sidebar_options[0] if sidebar_options else None
-
-                selected_key = st.selectbox(
-                    "Select from best models:",
-                    options=sidebar_options,
-                    format_func=lambda k: key_to_label.get(k, str(k)),
-                    index=0,
-                    key="sidebar_best_model_key",
-                )
-
-                if selected_key and st.button("✅ Apply Selected Model", key="apply_sidebar_model"):
-                    rd = key_to_row.get(selected_key)
-                    if rd:
-                        model_dict = {
-                            'Model ID': rd.get('Model ID'),
-                            'model_id': rd.get('Model ID'),
-                            'Model Name': rd.get('Model Name'),
-                            'NSize': rd.get('NSize'),
-                            'FGSM': rd.get('FGSM'),
-                            'Prototypes': rd.get('Prototypes'),
-                            'NPos': rd.get('NPos'),
-                            'NNeg': rd.get('NNeg'),
-                            'DLoss': rd.get('DLoss'),
-                            'Dist_Fct': rd.get('Dist_Fct'),
-                            'Classif_Loss': rd.get('Classif_Loss'),
-                            'N_Calibration': rd.get('N_Calibration'),
-                            'Accuracy': rd.get('Accuracy'),
-                            'MCC': rd.get('MCC'),
-                            'Normalize': rd.get('Normalize'),
-                            'N_Neighbors': rd.get('N_Neighbors'),
-                            'Log Path': rd.get('Log Path'),
-                        }
-                        model_dict.update(extract_params_from_log_path(model_dict.get("Log Path")))
-                        if "N_Neighbors" in model_dict:
-                            model_dict["n_neighbors"] = model_dict["N_Neighbors"]
-                        if "NSize" in model_dict:
-                            model_dict["new_size"] = model_dict["NSize"]
-                        if "Dist_Fct" in model_dict:
-                            model_dict["dist_fct"] = model_dict["Dist_Fct"]
-                        if "Classif_Loss" in model_dict:
-                            model_dict["classif_loss"] = model_dict["Classif_Loss"]
-
-                        st.session_state.selected_model_params = model_dict
-                        st.session_state.selected_params_version = st.session_state.get('selected_params_version', 0) + 1
-                        st.session_state.selected_model_log_path = model_dict.get('Log Path')
-                        st.session_state.selected_model_selection_key = selected_key
-                        st.session_state.selected_model_version = st.session_state.get('selected_model_version', 0) + 1
-
-                        # Eagerly sync key UI widgets so the next run reflects selection immediately
-                        try:
-                            if model_dict.get('Dataset'):
-                                st.session_state['dataset_selectbox'] = model_dict['Dataset']
-                        except Exception:
-                            pass
-                        try:
-                            if model_dict.get('Task'):
-                                st.session_state['task_selectbox'] = model_dict['Task']
-                        except Exception:
-                            pass
-                        try:
-                            if model_dict.get('new_size') is not None:
-                                st.session_state['new_size_input'] = int(float(model_dict['new_size']))
-                        except Exception:
-                            pass
-                        try:
-                            if model_dict.get('n_neighbors') is not None:
-                                st.session_state['n_neighbors_input'] = int(float(model_dict['n_neighbors']))
-                        except Exception:
-                            pass
-                        try:
-                            if model_dict.get('Dist_Fct'):
-                                st.session_state['dist_fct_selectbox'] = str(model_dict.get('Dist_Fct')).strip().lower()
-                        except Exception:
-                            pass
-                        # Other selectors (best-effort; choose_dataset etc. will validate on rerun)
-                        for key_name, dict_key in [
-                            ('model_name_selectbox', 'Model Name'),
-                            ('fgsm_selectbox', 'FGSM'),
-                            ('n_calibration_selectbox', 'N_Calibration'),
-                            ('classif_loss_selectbox', 'Classif_Loss'),
-                            ('dloss_selectbox', 'DLoss'),
-                            ('prototypes_selectbox', 'Prototypes'),
-                            ('npos_selectbox', 'NPos'),
-                            ('nneg_selectbox', 'NNeg'),
-                        ]:
-                            try:
-                                v = model_dict.get(dict_key)
-                                if v is not None:
-                                    st.session_state[key_name] = v
-                            except Exception:
-                                pass
-                        try:
-                            if model_dict.get('Normalize') in ['yes', 'no']:
-                                st.session_state['normalize_input'] = model_dict.get('Normalize')
-                        except Exception:
-                            pass
-                        st.success(f"✅ Applied: {model_dict.get('Model Name')}")
-                        st.rerun()
-        except Exception as e:
-            st.warning(f"Could not load models: {e}")
-
-        st.divider()
-        
-        available_datasets = sorted([
-            name for name in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, name))
-        ])
-        dataset_default = selected_params.get('Dataset')
-        if dataset_default not in available_datasets:
-            dataset_default = 'otite_ds_64' if 'otite_ds_64' in available_datasets else (available_datasets[0] if available_datasets else None)
-        selected_path = choose_dataset(
-            "Select --path dataset", available_datasets, default=dataset_default, key="dataset_selectbox"
-        )
-        # selected_path = choose_dataset(
-        #     "Select --path dataset", available_datasets, default='otite_ds_64'
-        # )  # No key needed, handled in choose_dataset
-        # selected_path_original = choose_dataset(
-        #     "Select --path_original dataset", available_datasets, default='otite_ds_-1'
-        # )
-
-        # ---- Other args with defaults ---- #
-        # Prefer explicit new_size from selection; else infer from dataset suffix; fallback to 224
-        new_size_raw = selected_params.get('new_size')
-        if new_size_raw is None and selected_path:
-            try:
-                new_size = int(str(selected_path).split('_')[-1])
-            except Exception:
-                new_size = 224
-        else:
-            try:
-                new_size = int(new_size_raw) if new_size_raw is not None else 224
-            except Exception:
-                new_size = 224
-        # Expose new_size control like other parameters
-        if should_sync and new_size is not None:
-            st.session_state['new_size_input'] = int(new_size)
-        new_size = st.number_input("new_size", value=int(st.session_state.get('new_size_input', new_size)), step=1, key="new_size_input")
-
-        task_root = 'logs/best_models'
-        task_list = sorted(os.listdir(task_root)) if os.path.isdir(task_root) else []
-        if not task_list:
-            st.error("No tasks found under logs/best_models.")
-            st.stop()
-        task_default = selected_params.get("Task")
-        if task_default not in task_list:
-            task_default = task_list[0]
-        sync_value('task_selectbox', task_default)
-        task = st.selectbox("task", task_list, key="task_selectbox")
-
-        model_dir = os.path.join(task_root, task)
-        model_name_list = [name for name in sorted(os.listdir(model_dir)) if not name.endswith('.csv')] if os.path.isdir(model_dir) else []
-        if not model_name_list:
-            st.error(f"No models found for task {task}.")
-            st.stop()
-        model_name_default = selected_params.get("Model Name")
-        # remove files ending in .json or any extension really
-        model_name_list = [name for name in model_name_list if not any(name.endswith(ext) for ext in ['.json', '.csv', '.txt'])]
-        if model_name_default not in model_name_list:
-            model_name_default = model_name_list[0]
-        sync_value('model_name_selectbox', model_name_default)
-        model_name = st.selectbox("Model Name", model_name_list, key="model_name_selectbox")
-
-        fgsm_dir = os.path.join(model_dir, model_name, selected_path if selected_path else 'otite_ds_64', f'nsize{new_size}')
-        fgsm_list = sorted(os.listdir(fgsm_dir)) if os.path.isdir(fgsm_dir) else []
-        if not fgsm_list:
-            st.error(f"No FGSM entries found in {fgsm_dir}.")
-            st.stop()
-        fgsm_default = selected_params.get("FGSM")
-        if fgsm_default not in fgsm_list:
-            fgsm_default = fgsm_list[0]
-        sync_value('fgsm_selectbox', fgsm_default)
-        fgsm = st.selectbox("fgsm", fgsm_list, key="fgsm_selectbox")
-
-        n_cal_dir = os.path.join(fgsm_dir, fgsm)
-        n_calibration_list = sorted(os.listdir(n_cal_dir)) if os.path.isdir(n_cal_dir) else []
-        if not n_calibration_list:
-            st.error(f"No calibration folders found in {n_cal_dir}.")
-            st.stop()
-        n_calibration_default = selected_params.get("N_Calibration")
-        if n_calibration_default not in n_calibration_list:
-            n_calibration_default = n_calibration_list[0]
-        sync_value('n_calibration_selectbox', n_calibration_default)
-        n_calibration = st.selectbox("n_calibration", n_calibration_list, key="n_calibration_selectbox")
-
-        classif_dir = os.path.join(n_cal_dir, n_calibration)
-        classif_loss_list = sorted(os.listdir(classif_dir)) if os.path.isdir(classif_dir) else []
-        if not classif_loss_list:
-            st.error(f"No classif_loss folders found in {classif_dir}.")
-            st.stop()
-        classif_loss_default = selected_params.get("classif_loss")
-        if classif_loss_default not in classif_loss_list:
-            classif_loss_default = classif_loss_list[0]
-        sync_value('classif_loss_selectbox', classif_loss_default)
-        classif_loss = st.selectbox("classif_loss", classif_loss_list, key="classif_loss_selectbox")
-
-        dloss_dir = os.path.join(classif_dir, classif_loss)
-        dloss_list = sorted(os.listdir(dloss_dir)) if os.path.isdir(dloss_dir) else []
-        if not dloss_list:
-            st.error(f"No dloss folders found in {dloss_dir}.")
-            st.stop()
-        dloss_default = selected_params.get("DLoss")
-        if dloss_default not in dloss_list:
-            dloss_default = dloss_list[0]
-        sync_value('dloss_selectbox', dloss_default)
-        dloss = st.selectbox("dloss", dloss_list, key="dloss_selectbox")
-
-        proto_dir = os.path.join(dloss_dir, dloss)
-        prototypes_list = sorted(os.listdir(proto_dir)) if os.path.isdir(proto_dir) else []
-        if not prototypes_list:
-            st.error(f"No prototype folders found in {proto_dir}.")
-            st.stop()
-        prototypes_default = selected_params.get("Prototypes")
-        if prototypes_default not in prototypes_list:
-            prototypes_default = prototypes_list[0]
-        sync_value('prototypes_selectbox', prototypes_default)
-        prototypes_to_use = st.selectbox("prototypes_to_use", prototypes_list, key="prototypes_selectbox")
-
-        npos_dir = os.path.join(proto_dir, prototypes_to_use)
-        n_positives_list = sorted(os.listdir(npos_dir)) if os.path.isdir(npos_dir) else []
-        if not n_positives_list:
-            st.error(f"No npos folders found in {npos_dir}.")
-            st.stop()
-        npos_default = str(selected_params.get("NPos")) if selected_params.get("NPos") is not None else None
-        if npos_default not in n_positives_list:
-            npos_default = n_positives_list[0]
-        sync_value('npos_selectbox', npos_default)
-        n_positives = st.selectbox('npos', n_positives_list, key="npos_selectbox")
-
-        nneg_dir = os.path.join(npos_dir, n_positives)
-        n_negatives_list = sorted(os.listdir(nneg_dir)) if os.path.isdir(nneg_dir) else []
-        if not n_negatives_list:
-            st.error(f"No nneg folders found in {nneg_dir}.")
-            st.stop()
-        nneg_default = str(selected_params.get("NNeg")) if selected_params.get("NNeg") is not None else None
-        if nneg_default not in n_negatives_list:
-            nneg_default = n_negatives_list[0]
-        sync_value('nneg_selectbox', nneg_default)
-        n_negatives = st.selectbox('nneg', n_negatives_list, key="nneg_selectbox")
-
-        # Apply optimized k from Tab 1 KNN Optimization if available
-        if 'optimized_k_value' in st.session_state:
-            n_neighbors_default = st.session_state.pop('optimized_k_value')
-            should_sync = True  # Force sync so the widget picks up the new value
-
-        n_neighbors_default = selected_params.get("n_neighbors")
-        if should_sync and n_neighbors_default is not None:
-            try:
-                st.session_state['n_neighbors_input'] = int(n_neighbors_default)
-            except (TypeError, ValueError):
-                st.session_state['n_neighbors_input'] = 1
-        n_neighbors_default_value = st.session_state.get('n_neighbors_input', 1)
-        n_neighbors = st.number_input("n_neighbors", value=int(n_neighbors_default_value), step=1, key="n_neighbors_input")
-
-        normalize_default = selected_params.get("Normalize", "no")
-        if should_sync and normalize_default is not None:
-            st.session_state['normalize_input'] = normalize_default
-        normalize = st.selectbox("normalize", ['yes', 'no'], index=1 if normalize_default == "no" else 0, key="normalize_input")
-
-        device = st.selectbox("device", ['cpu', 'cuda'], index=1, key="device_selectbox")
-        valid_dataset_default = selected_params.get('valid_dataset', 'Banque_Viscaino_Chili_2020')
-        if should_sync and valid_dataset_default is not None:
-            st.session_state['valid_dataset_input'] = valid_dataset_default
-        valid_dataset = st.text_input("valid_dataset", value=st.session_state.get('valid_dataset_input', valid_dataset_default), key="valid_dataset_input")
-        dist_fct_options = ['euclidean', 'cosine']
-        dist_fct_default = str(selected_params.get('dist_fct', 'euclidean')).strip().lower()
-        if dist_fct_default not in dist_fct_options:
-            dist_fct_default = 'euclidean'
-
-        # If Streamlit has a stale value for this widget, it can crash with
-        # "<value> is not in iterable" during serialization. Repair it before rendering.
-        current_dist_fct = st.session_state.get('dist_fct_selectbox')
-        if current_dist_fct is not None:
-            current_dist_fct = str(current_dist_fct).strip().lower()
-        if current_dist_fct not in dist_fct_options:
-            st.session_state['dist_fct_selectbox'] = dist_fct_default
-
-        if should_sync and dist_fct_default is not None:
-            st.session_state['dist_fct_selectbox'] = dist_fct_default
-
-        dist_fct = st.selectbox(
-            "dist_fct",
-            dist_fct_options,
-            index=dist_fct_options.index(st.session_state['dist_fct_selectbox']),
-            key="dist_fct_selectbox",
-        )
-        # new_size = st.number_input("new_size", value=224, step=1)
-        # seed = st.number_input("seed", value=42, step=1)
-        # bs = st.number_input("bs", value=32, step=1)
-        # groupkfold = st.number_input("groupkfold", value=1, step=1)
-        # random_recs = st.number_input("random_recs", value=0, step=1)
-
-        # Explanation parameters are fixed here to avoid cluttering the sidebar UI.
-        grad_cam_layer = int(st.session_state.get('grad_cam_layer', 7))
-        grad_cam_alpha = float(st.session_state.get('grad_cam_alpha', 0.55))
-        shap_layer = int(st.session_state.get('shap_layer', 4))
-
-        st.session_state['grad_cam_layer'] = grad_cam_layer
-        st.session_state['grad_cam_alpha'] = grad_cam_alpha
-        st.session_state['shap_layer'] = shap_layer
-
-    # ---- Build args Namespace ---- #
-    args = argparse.Namespace(
-        model_name=model_name,
-        fgsm=fgsm,
-        n_calibration=n_calibration,
-        n_neighbors=n_neighbors,
-        dloss=dloss,
-        prototypes_to_use=prototypes_to_use,
-        n_positives=n_positives,
-        n_negatives=n_negatives,
-        # new_size=new_size,
-        device=device,
-        task=task,
-        classif_loss=classif_loss,
-        # seed=seed,
-        path=os.path.join(data_dir, selected_path) if selected_path else None,
-        # path_original=os.path.join(data_dir, selected_path_original) if selected_path_original else None,
-        # bs=bs,
-        # groupkfold=groupkfold,
-        # random_recs=random_recs,
-        valid_dataset=valid_dataset,
-        dist_fct=dist_fct,
-        grad_cam_layer=grad_cam_layer,
-        grad_cam_alpha=grad_cam_alpha,
-        shap_layer=shap_layer
-    )
-
-    # TODO REMOVE THESE PARAMETERS
-    args.new_size = new_size
-    args.bs = 32
-    args.groupkfold = 1
-    args.random_recs = 0
-    args.seed = 42
-    args.normalize = normalize
-    args.model_id = selected_params.get('model_id') or selected_params.get('Model ID')
-
-    return args
+CLASSIFIER_COLORS = {
+    'knn': '#e74c3c',
+    'mean': '#3498db',
+    'kmeans': '#f39c12',
+    'gmm': '#2ecc71',
+    'logreg': '#9b59b6',
+    'ridge': '#e8daef',
+    'naive_bayes': '#1abc9c',
+    'linear_svc': '#e67e22',
+    'rbf_svc': '#d35400',
+    'random_forest': '#16a085',
+    'gradient_boosting': '#27ae60',
+    'decision_tree': '#2ecc71',
+    'lda': '#3498db',
+    'qda': '#5dade2'
+}
 
 
 # ---- Load Model and Prototypes ---- #
-@st.cache_resource
-def _resolve_model_paths(base_dir: str, normalize_val: str, dist_fct_val: str, requested_k: int):
-    """Find model/prototype paths, falling back to available knn folders if the requested one is missing."""
-    norm_dir = os.path.join(base_dir, f'norm{normalize_val}', f'dist_{dist_fct_val}')
-    requested_dir = os.path.join(norm_dir, f'knn{requested_k}')
-    model_path = os.path.join(requested_dir, 'model.pth')
-    proto_path = os.path.join(requested_dir, 'prototypes.pkl')
-    if os.path.exists(model_path) and os.path.exists(proto_path):
-        return model_path, proto_path, requested_k
 
-    # Fallback: pick the highest available knn folder under this dist
-    try:
-        candidates = []
-        for entry in os.listdir(norm_dir):
-            if entry.startswith('knn'):
-                try:
-                    k_val = int(entry[len('knn'):])
-                    cand_model = os.path.join(norm_dir, entry, 'model.pth')
-                    cand_proto = os.path.join(norm_dir, entry, 'prototypes.pkl')
-                    if os.path.exists(cand_model) and os.path.exists(cand_proto):
-                        candidates.append((k_val, cand_model, cand_proto))
-                except Exception:
-                    continue
-        if candidates:
-            # choose the closest >= requested, else max
-            candidates.sort(key=lambda x: (abs(x[0]-requested_k), -x[0]))
-            best_k, best_model, best_proto = candidates[0]
-            return best_model, best_proto, best_k
-    except Exception:
-        pass
-
-    return model_path, proto_path, requested_k
-
-
-def load_model_and_prototypes(_args):
-    # Ensure seeds are set for reproducible split
-    random.seed(1)
-    torch.manual_seed(1)
-    np.random.seed(1)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(1)
-    
-    data_getter = GetData(_args.path, _args.valid_dataset, _args)
-    data, unique_labels, unique_batches = data_getter.get_variables()
-    n_cats = len(unique_labels)
-    n_batches = len(unique_batches)
-
-    params = get_model_params_path(_args)
-    parts = params.split('/')
-    # remove the last three components: norm..., dist_..., knn...
-    base_params = '/'.join(parts[:-3])
-    base_dir = f'logs/best_models/{_args.task}/{_args.model_name}/{base_params}'
-    model_path, proto_path, resolved_k = _resolve_model_paths(base_dir, _args.normalize, _args.dist_fct, int(_args.n_neighbors))
-
-    if not (os.path.exists(model_path) and os.path.exists(proto_path)):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    # If we had to fall back, keep args in sync so downstream cache keys are correct
-    try:
-        _args.n_neighbors = resolved_k
-    except Exception:
-        pass
-
-    try:
-        model = Net(_args.device, n_cats=n_cats, n_batches=n_batches,
-                    model_name=_args.model_name, is_stn=0,
-                    n_subcenters=n_batches)
-        model.load_state_dict(torch.load(model_path, map_location=_args.device))
-        model.to(_args.device)
-        model.eval()
-
-        shap_model = Net_shap(_args.device, n_cats=n_cats, n_batches=n_batches,
-                              model_name=_args.model_name, is_stn=0,
-                              n_subcenters=n_batches)
-        shap_model.load_state_dict(torch.load(model_path, map_location=_args.device))
-        shap_model.to(_args.device)
-        shap_model.eval()
-    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-        if "out of memory" in str(e) or isinstance(e, torch.cuda.OutOfMemoryError):
-            print("Warning: GPU OOM during model loading. Falling back to CPU.")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            _args.device = 'cpu'
-            device_str = 'cpu' # Update local var if needed, though _args is used
-            
-            model = Net('cpu', n_cats=n_cats, n_batches=n_batches,
-                        model_name=_args.model_name, is_stn=0,
-                        n_subcenters=n_batches)
-            model.load_state_dict(torch.load(model_path, map_location='cpu'))
-            model.to('cpu')
-            model.eval()
-
-            shap_model = Net_shap('cpu', n_cats=n_cats, n_batches=n_batches,
-                                  model_name=_args.model_name, is_stn=0,
-                                  n_subcenters=n_batches)
-            shap_model.load_state_dict(torch.load(model_path, map_location='cpu'))
-            shap_model.to('cpu')
-            shap_model.eval()
-        else:
-            raise e
-
-    with open(proto_path, 'rb') as f:
-        proto_obj = pickle.load(f)
-    prototypes = {'combined': proto_obj.prototypes, 'class': proto_obj.class_prototypes, 'batch': proto_obj.batch_prototypes}
-
-    return model, shap_model, prototypes, _args.new_size, _args.device, data, unique_labels, unique_batches, data_getter
-
-# Safe cache clear for the model/prototype loader
-def _clear_cached_model():
-    try:
-            _clear_cached_model()
-    except Exception:
-        pass
 
 # ---- Fast KNN Cache for Inference ---- #
-def _get_model_cache_key_from_args(_args):
-    """Build a stable cache key for the current model selection."""
-    return "|".join([
-        str(_args.path),
-        str(_args.device),
-        str(_args.model_name),
-        str(_args.new_size),
-        str(_args.fgsm),
-        str(_args.prototypes_to_use),
-        str(_args.n_positives),
-        str(_args.n_negatives),
-        str(_args.dloss),
-        str(_args.dist_fct),
-        str(_args.classif_loss),
-        str(_args.n_calibration),
-        str(_args.normalize),
-        str(_args.n_neighbors),
-    ])
+# (Imported from otitenet.app.analysis module)
 
-def get_or_build_knn(_args, data, unique_labels, unique_batches, prototypes):
-    """Return a cached KNN for the selected model; build once if missing.
-
-    This avoids re-running predict loops for 'valid'/'test' during inference.
-    """
-    cache = st.session_state.setdefault('knn_cache', {})
-    key = _get_model_cache_key_from_args(_args)
-    if key in cache:
-        return cache[key]['knn'], cache[key]['unique_labels']
-
-    # Build loaders and encode 'train' set once to fit KNN
-    train = TrainAE(_args, _args.path, load_tb=False, log_metrics=False, keep_models=True,
-                    log_inputs=False, log_plots=False, log_tb=False, log_neptune=False,
-                    log_mlflow=False, groupkfold=_args.groupkfold)
-    train.n_batches = len(unique_batches)
-    train.n_cats = len(unique_labels)
-    train.unique_batches = unique_batches
-    train.unique_labels = unique_labels
-    train.epoch = 1
-    train.params = {
-        'n_neighbors': _args.n_neighbors,
-        'lr': 0,
-        'wd': 0,
-        'smoothing': 0,
-        'is_transform': 0,
-        'valid_dataset': _args.valid_dataset
-    }
-    train.set_arcloss()
-
-    lists, traces = get_empty_traces()
-    loaders = get_images_loaders(
-        data=data,
-        random_recs=_args.random_recs,
-        weighted_sampler=0,
-        is_transform=0,
-        samples_weights=None,
-        epoch=1,
-        unique_labels=unique_labels,
-        triplet_dloss=_args.dloss, bs=_args.bs,
-        prototypes_to_use=_args.prototypes_to_use,
-        prototypes=prototypes,
-        size=_args.new_size,
-        normalize=_args.normalize,
-    )
-
-    # Encode the train set
-    with torch.no_grad():
-        try:
-            # Minimal model load just for encoding: reuse cached model via load_model_and_prototypes
-            model, _, _, _, _, _, _, _, _ = load_model_and_prototypes(_args)
-            train.model = model
-            _, lists, _ = train.loop('train', None, 0, loaders['train'], lists, traces)
-        except Exception as e:
-            st.error(f"❌ Could not encode training set for KNN: {e}")
-            raise
-
-    # Fit KNN
-    import numpy as np
-    train_encs = np.concatenate(lists['train']['encoded_values'])
-    train_cats = np.concatenate(lists['train']['cats'])
-    if _args.classif_loss not in ['ce', 'hinge']:
-        nn_count = int(_args.n_neighbors) if train_encs.shape[0] >= int(_args.n_neighbors) else train_encs.shape[0]
-        knn = KNN(n_neighbors=nn_count, metric='minkowski')
-        knn.fit(train_encs, train_cats)
-    else:
-        # If classification is CE/hinge, use linear head via model for probabilities; fallback to 1-NN
-        knn = KNN(n_neighbors=1, metric='minkowski')
-        knn.fit(train_encs, train_cats)
-
-    cache[key] = {'knn': knn, 'unique_labels': unique_labels}
-    return knn, unique_labels
-
-# ---- Image Preprocessing ---- #
-def preprocess_image(img: Image.Image, size: int, normalize='no'):
-    img = img.resize((size, size))
-    img_array = np.array(img).astype(np.float32) / 255.0
-    img_array = img_array.transpose(2, 0, 1)  # HWC → CHW
-    tensor = torch.tensor(img_array)
-    
-    if str(normalize).lower() in ['yes', 'true', '1']:
-        per_img_norm = PerImageNormalize()
-        tensor = per_img_norm(tensor)
-    
-    tensor = tensor.unsqueeze(0).to(device)
-    return tensor
-
-# ---- Database Insertion Function ---- #
-def insert_score(cursor, conn, filename, args, pred_label, confidence, log_path):
-    """Upsert the result row (respecting unique constraint) and upsert usage summary."""
-    model_id = _resolve_model_id(cursor, args, log_path)
-    query = '''
-        INSERT INTO results (
-            filename, model_name, task, path, n_neighbors, nsize, fgsm, normalize, n_calibration, classif_loss,
-            dloss, dist_fct, prototypes, npos, nneg, pred_label, confidence, log_path, person_id, model_id
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE
-            pred_label = VALUES(pred_label),
-            confidence = VALUES(confidence),
-            log_path = VALUES(log_path),
-            person_id = VALUES(person_id),
-            model_id = VALUES(model_id),
-            timestamp = CURRENT_TIMESTAMP
-    '''
-    values = (
-        filename, args.model_name, args.task, args.path, str(args.n_neighbors), str(args.new_size), str(args.fgsm),
-        args.normalize, str(args.n_calibration), args.classif_loss, args.dloss, args.dist_fct, args.prototypes_to_use,
-        str(args.n_positives), str(args.n_negatives), pred_label, confidence, log_path,
-        st.session_state.person_id, model_id
-    )
-    try:
-        cursor.execute(query, values)
-    except mysql.connector.errors.IntegrityError:
-        # If the unique key blocks insertion, perform an explicit update to refresh timestamp and values
-        update_q = '''
-            UPDATE results
-            SET pred_label=%s, confidence=%s, log_path=%s, person_id=%s, model_id=%s, timestamp=CURRENT_TIMESTAMP
-            WHERE filename=%s AND model_name=%s AND task=%s AND path=%s AND n_neighbors=%s AND nsize=%s AND fgsm=%s
-                  AND normalize=%s AND n_calibration=%s AND classif_loss=%s AND dloss=%s AND dist_fct=%s AND prototypes=%s
-                  AND npos=%s AND nneg=%s
-        '''
-        update_vals = (
-            pred_label, confidence, log_path, st.session_state.person_id, model_id,
-            filename, args.model_name, args.task, args.path, str(args.n_neighbors), str(args.new_size), str(args.fgsm),
-            args.normalize, str(args.n_calibration), args.classif_loss, args.dloss, args.dist_fct, args.prototypes_to_use,
-            str(args.n_positives), str(args.n_negatives)
-        )
-        cursor.execute(update_q, update_vals)
-
-    summary_query = '''
-        INSERT INTO model_usage_summary (
-            model_name, task, path, nsize, fgsm, normalize, n_calibration, classif_loss,
-            dloss, dist_fct, prototypes, npos, nneg, n_neighbors, num_samples_analyzed
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE
-            num_samples_analyzed = num_samples_analyzed + 1,
-            last_used = CURRENT_TIMESTAMP
-    '''
-    summary_values = (
-        args.model_name, args.task, args.path, str(args.new_size), str(args.fgsm),
-        args.normalize, str(args.n_calibration), args.classif_loss, args.dloss, args.dist_fct, args.prototypes_to_use,
-        str(args.n_positives), str(args.n_negatives), str(args.n_neighbors), 1
-    )
-    cursor.execute(summary_query, summary_values)
-    conn.commit()
-
-# ---- Helper: Predict label from class prototypes ---- #
-def _predict_label_from_prototypes(embedding_tensor: torch.Tensor, class_prototypes: dict, dist_fct_name: str = 'euclidean'):
-    """Return the nearest class label to the embedding using provided prototypes.
-    Works with either Euclidean or cosine distance, averaging over multiple prototypes per class.
-    """
-    try:
-        emb = embedding_tensor.detach().cpu()
-        if emb.ndim == 1:
-            emb = emb.unsqueeze(0)
-
-        # For cosine, we maximize similarity; for euclidean, we minimize distance
-        best_label = None
-        best_score = -float('inf') if dist_fct_name == 'cosine' else float('inf')
-
-        if str(dist_fct_name).lower() == 'cosine':
-            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
-
-        for label, proto in class_prototypes.items():
-            if proto is None:
-                continue
-            proto_t = torch.as_tensor(proto, dtype=emb.dtype)
-            if proto_t.ndim == 1:
-                proto_t = proto_t.unsqueeze(0)
-
-            if str(dist_fct_name).lower() == 'cosine':
-                proto_t = torch.nn.functional.normalize(proto_t, p=2, dim=1)
-                sim = torch.mm(emb, proto_t.t())  # (1,k)
-                score = torch.max(sim).item()  # higher is better
-                if score > best_score:
-                    best_score = score
-                    best_label = label
-            else:
-                dists = torch.cdist(emb, proto_t)  # (1,k)
-                score = torch.min(dists).item()  # lower is better
-                if score < best_score:
-                    best_score = score
-                    best_label = label
-
-        return best_label
-    except Exception:
-        return None
-
-def _predict_with_prototype_distance_ratio(embedding_tensor: torch.Tensor, class_prototypes: dict, dist_fct_name: str = 'euclidean'):
-    """
-    Predict using distance ratio to class prototypes.
-    Probability is calculated as inverse distance ratio: prob(class) = (1/dist_to_proto) / sum(1/dist_to_all_protos)
-    Returns the class with highest probability.
-    """
-    try:
-        emb = embedding_tensor.detach().cpu()
-        if emb.ndim == 1:
-            emb = emb.unsqueeze(0)
-
-        # Compute distances to each class prototype
-        distances = {}
-        for label, proto in class_prototypes.items():
-            if proto is None:
-                continue
-            proto_t = torch.as_tensor(proto, dtype=emb.dtype)
-            if proto_t.ndim == 1:
-                proto_t = proto_t.unsqueeze(0)
-
-            if str(dist_fct_name).lower() == 'cosine':
-                # For cosine distance, use 1 - similarity
-                emb_norm = torch.nn.functional.normalize(emb, p=2, dim=1)
-                proto_norm = torch.nn.functional.normalize(proto_t, p=2, dim=1)
-                sim = torch.mm(emb_norm, proto_norm.t())
-                dist = (1.0 - torch.max(sim)).item()
-            else:
-                # For euclidean distance
-                dists = torch.cdist(emb, proto_t)
-                dist = torch.min(dists).item()
-            
-            distances[label] = dist
-
-        # Compute inverse distance probabilities
-        inv_distances = {label: 1.0 / (dist + 1e-8) for label, dist in distances.items()}
-        total_inv = sum(inv_distances.values())
-        probas = {label: inv_dist / total_inv for label, inv_dist in inv_distances.items()}
-        
-        # Return class with highest probability
-        best_label = max(probas, key=probas.get)
-        return best_label
-    except Exception as e:
-        print(f"Error in prototype distance ratio prediction: {e}")
-        return None
-
-# ---- Cached loader for single model by log_path (used by Ensemble tab) ---- #
-@st.cache_resource
-def load_model_for_log_path(log_path: str, model_name: str, device: str = 'cpu'):
-    try:
-        model_pth = os.path.join(log_path, 'model.pth')
-        proto_pkl = os.path.join(log_path, 'prototypes.pkl')
-        if not os.path.exists(model_pth) or not os.path.exists(proto_pkl):
-            raise FileNotFoundError(f"Missing model or prototypes under {log_path}")
-
-        state_dict = torch.load(model_pth, map_location=device)
-        n_batches = state_dict['dann.weight'].shape[0]
-        n_cats = state_dict['linear.weight'].shape[0]
-        n_subcenters = state_dict['subcenters'].shape[1]
-
-        model = Net(device, n_cats=n_cats, n_batches=n_batches,
-                    model_name=model_name, is_stn=0, n_subcenters=n_subcenters)
-        model.load_state_dict(state_dict)
-        model.to(device)
-        model.eval()
-
-        with open(proto_pkl, 'rb') as f:
-            proto_obj = pickle.load(f)
-        class_protos = proto_obj.class_prototypes['train']
-
-        return model, class_protos
-    except Exception as e:
-        raise RuntimeError(f"Failed to load model for ensemble from {log_path}: {e}")
-
-# ---- Reusable Analysis Function ---- #
-def run_analysis_on_file(filename, file_bytes, _args, force_reanalyze=False, show_validation_metrics=True, fast_infer=False):
-    """Run complete analysis on a file and return results."""
-    # Make sure model numbering is available even if user didn't open Tab 1/2 first
-    model_number_map, best_models_table = _ensure_model_number_map(cursor)
-    params = get_model_params_path(_args)
-    complete_log_path = f"logs/best_models/{_args.task}/{_args.model_name}/{params}/queries"
-    
-    # Check if already analyzed
-    exists = None if force_reanalyze else check_ds_exists(cursor, filename, _args)
-    
-    if exists is not None and not force_reanalyze:
-        # Load previous results (indices match SELECT pred_label, confidence, log_path)
-        pred_label = exists[0]
-        pred_confidence = exists[1]
-        log_path = exists[2]
-        st.info(
-            f"✅ Already analyzed with this exact model & params → Pred: {pred_label} (conf {pred_confidence:.2f})."
-        )
-        return pred_label, pred_confidence, log_path, exists
-    
-    # Run fresh analysis
-    st.info("🔄 Running analysis...")
-    with st.spinner("Loading model and processing image..."):
-        # Ensure reproducible split: reset seeds before data loading
-        random.seed(1)
-        torch.manual_seed(1)
-        np.random.seed(1)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(1)
-        
-        model, shap_model, prototypes, image_size, device_str, data, unique_labels, unique_batches, data_getter = \
-            load_model_and_prototypes(_args)
-        
-        save_path = os.path.join('data/queries', filename)
-        with open(save_path, 'wb') as f:
-            f.write(file_bytes)
-        
-        # Load saved hyperparameters
-        params_path = os.path.join(f'logs/best_models/{_args.task}/{_args.model_name}',
-                                   f'{_args.path.split("/")[-1]}/nsize{_args.new_size}/{_args.fgsm}/{_args.n_calibration}/'
-                                   f'{_args.classif_loss}/{_args.dloss}/{_args.prototypes_to_use}/'
-                                   f'{_args.n_positives}/{_args.n_negatives}',
-                                   'params.json')
-        saved_search = {}
-        if os.path.exists(params_path):
-            try:
-                with open(params_path, 'r', encoding='utf-8') as f:
-                    payload = json.load(f)
-                    saved_search = payload.get('search_params', {}) or {}
-            except Exception:
-                saved_search = {}
-        
-        # Do not override sidebar-selected n_neighbors from saved search params.
-        # The user's current selection should take precedence over training-time defaults.
-        
-        # Prepare inference resources
-        params = get_model_params_path(_args)
-        train_complete_log_path = f'logs/best_models/{_args.task}/{_args.model_name}/{params}'
-
-        if not fast_infer:
-            loaders = get_images_loaders(data=data,
-                                         random_recs=_args.random_recs,
-                                         weighted_sampler=0,
-                                         is_transform=0,
-                                         samples_weights=None,
-                                         epoch=1,
-                                         unique_labels=unique_labels,
-                                         triplet_dloss=_args.dloss, bs=_args.bs,
-                                         prototypes_to_use=_args.prototypes_to_use,
-                                         prototypes=prototypes,
-                                         size=_args.new_size,
-                                         normalize=_args.normalize)
-            # Build or reuse cached KNN once per model selection
-            knn, unique_labels_knn = get_or_build_knn(_args, data, unique_labels, unique_batches, prototypes)
-            nets = {'cnn': shap_model, 'knn': knn}
-        else:
-            loaders = None
-            unique_labels_knn = unique_labels
-            nets = {'cnn': shap_model, 'knn': None}
-        
-        original, image = get_image(f'data/queries/{filename}', size=image_size, normalize=_args.normalize)
-        
-        # Optionally fetch cached validation metrics; bulk analysis can skip this entirely
-        valid_acc = None
-        valid_mcc = None
-        valid_metrics_source = None
-        if show_validation_metrics:
-            # Resolve the correct model_id based on log_path or model parameters
-            resolved_model_id = _resolve_model_id(cursor, _args, train_complete_log_path)
-            
-            # Prefer metrics that match the exact model ID we are using right now
-            current_model_row = None
-            try:
-                if best_models_table is not None and not best_models_table.empty and resolved_model_id is not None:
-                    match = best_models_table[best_models_table["Model ID"] == resolved_model_id]
-                    if not match.empty:
-                        current_model_row = match.iloc[0].to_dict()
-            except Exception:
-                current_model_row = None
-
-            if current_model_row:
-                try:
-                    reg_acc = current_model_row.get('Accuracy')
-                    reg_mcc = current_model_row.get('MCC')
-                    if reg_acc is not None and reg_mcc is not None:
-                        valid_acc = float(reg_acc)
-                        valid_mcc = float(reg_mcc)
-                        valid_metrics_source = 'registry'
-                except Exception:
-                    pass
-
-            params_path_metrics = os.path.join(train_complete_log_path, "params.json")
-            if valid_metrics_source is None and os.path.exists(params_path_metrics):
-                try:
-                    with open(params_path_metrics, "r", encoding="utf-8") as f:
-                        params_payload = json.load(f)
-                    best_metrics = params_payload.get("best_metrics", {})
-                    valid_metrics = best_metrics.get("valid", {})
-                    acc_list = valid_metrics.get("acc") or []
-                    mcc_list = valid_metrics.get("mcc") or []
-                    if isinstance(acc_list, list) and acc_list:
-                        valid_acc = float(acc_list[-1])
-                    if isinstance(mcc_list, list) and mcc_list:
-                        valid_mcc = float(mcc_list[-1])
-                    if valid_acc is not None and valid_mcc is not None:
-                        valid_metrics_source = 'params.json'
-                except Exception as e:
-                    st.warning(f"Could not read saved validation metrics: {e}")
-            if valid_acc is None or valid_mcc is None:
-                valid_metrics_source = None
-        
-        # Get prediction (fast prototype-based or KNN)
-        with torch.no_grad():
-            emb_tensor = nets['cnn'](image.to(device_str))
-            if fast_infer:
-                class_protos = prototypes.get('class', {}).get('train', {}) if isinstance(prototypes, dict) else {}
-                pred_lbl_fast = _predict_with_prototype_distance_ratio(emb_tensor, class_protos, dist_fct_name=str(_args.dist_fct).lower())
-                if pred_lbl_fast is None:
-                    pred_label = unique_labels[0]
-                    pred_confidence = 0.0
-                else:
-                    pred_label = pred_lbl_fast
-                    pred_confidence = 1.0
-            else:
-                embedding = emb_tensor.detach().cpu().numpy()
-                pred_probs = nets['knn'].predict_proba(embedding)
-                pred_class = int(np.argmax(pred_probs, axis=1)[0])
-                pred_confidence = float(pred_probs[0, pred_class]) if pred_probs.ndim == 2 else float(np.max(pred_probs))
-                pred_label = unique_labels[pred_class]
-        
-        if show_validation_metrics:
-            if valid_metrics_source == 'registry':
-                st.write(f"**Validation Accuracy (from registry):** {valid_acc:.3f}")
-                st.write(f"**Validation MCC (from registry):** {valid_mcc:.3f}")
-            elif valid_metrics_source == 'params.json':
-                st.write(f"**Validation Accuracy (from params.json):** {valid_acc:.3f}")
-                st.write(f"**Validation MCC (from params.json):** {valid_mcc:.3f}")
-            else:
-                st.info("Validation metrics unavailable (skipped recomputation to speed up inference).")
-        st.write(f"**Predicted Label:** {pred_label} ({pred_confidence:.2f} confidence)")
-        st.caption(
-            f"Model run → id: {_args.model_id}, name: {_args.model_name}, size: {_args.new_size}, fgsm: {_args.fgsm}, dist: {_args.dist_fct}, protos: {_args.prototypes_to_use}, normalize: {_args.normalize}"
-        )
-        
-        # Insert into database
-        insert_score(cursor, conn, filename, _args, pred_label, pred_confidence, complete_log_path)
-        st.success("✅ Results saved to database.")
-
-        # Track the model number used for this run so the UI can show it immediately
-        selection_key = _make_model_selection_key({
-            "Model Name": _args.model_name,
-            "NSize": _args.new_size,
-            "FGSM": _args.fgsm,
-            "Prototypes": _args.prototypes_to_use,
-            "NPos": _args.n_positives,
-            "NNeg": _args.n_negatives,
-            "DLoss": _args.dloss,
-            "Dist_Fct": _args.dist_fct,
-            "Classif_Loss": _args.classif_loss,
-            "N_Calibration": _args.n_calibration,
-            "Normalize": _args.normalize,
-            "N_Neighbors": getattr(_args, "n_neighbors", None),
-        })
-        model_number = model_number_map.get(selection_key, "?")
-        if model_number == "?" and best_models_table is not None and not best_models_table.empty:
-            try:
-                match = best_models_table[best_models_table["Log Path"] == complete_log_path]
-                if not match.empty:
-                    model_number = match.iloc[0].get("#", model_number)
-            except Exception:
-                pass
-        st.session_state['last_model_number'] = model_number
-    
-    return pred_label, pred_confidence, complete_log_path, None
 
 # ---- Streamlit UI ---- #
 
@@ -1962,6 +348,69 @@ with st.sidebar.expander("🗑️ Remove a result"):
             except Error as e:
                 st.error(f"❌ Could not delete result: {e}")
 
+with st.sidebar.expander("🧹 Clear a table"):
+    try:
+        cursor.execute("SHOW TABLES")
+        _all_tables = [row[0] for row in cursor.fetchall()]
+        _clearable_tables = [t for t in _all_tables if t != "best_models_registry"]
+
+        if not _clearable_tables:
+            st.info("No clearable tables found.")
+        else:
+            selected_table_to_clear = st.selectbox(
+                "Select table to clear",
+                options=sorted(_clearable_tables),
+                key="clear_table_selectbox",
+            )
+            st.caption("`best_models_registry` is protected and cannot be cleared from this option.")
+            
+            clear_action = st.radio(
+                "Select action",
+                options=["Clear data (TRUNCATE)", "Delete table (DROP)"],
+                key="clear_action_radio",
+                help="TRUNCATE removes all rows but keeps table structure. DROP completely removes the table from database."
+            )
+
+            if st.button("Proceed", key="clear_table_btn"):
+                st.session_state['pending_clear_table'] = selected_table_to_clear
+                st.session_state['pending_clear_action'] = clear_action
+
+            pending_table = st.session_state.get('pending_clear_table')
+            pending_action = st.session_state.get('pending_clear_action', 'Clear data (TRUNCATE)')
+            if pending_table:
+                action_desc = "clear all data from" if "TRUNCATE" in pending_action else "completely delete"
+                st.warning(f"⚠️ Are you sure you want to {action_desc} table `{pending_table}`?")
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("Yes, proceed", key="confirm_clear_table_btn"):
+                        try:
+                            cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+                            if "DROP" in pending_action:
+                                cursor.execute(f"DROP TABLE `{pending_table}`")
+                                success_msg = f"✅ Deleted table: {pending_table}"
+                            else:
+                                cursor.execute(f"TRUNCATE TABLE `{pending_table}`")
+                                success_msg = f"✅ Cleared table: {pending_table}"
+                            cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+                            conn.commit()
+                            st.success(success_msg)
+                            st.session_state.pop('pending_clear_table', None)
+                            st.session_state.pop('pending_clear_action', None)
+                            st.rerun()
+                        except Error as e:
+                            try:
+                                cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+                            except Exception:
+                                pass
+                            st.error(f"❌ Could not {action_desc} table {pending_table}: {e}")
+                with c2:
+                    if st.button("Cancel", key="cancel_clear_table_btn"):
+                        st.session_state.pop('pending_clear_table', None)
+                        st.session_state.pop('pending_clear_action', None)
+                        st.info("Operation canceled.")
+    except Error as e:
+        st.error(f"❌ Could not load table list: {e}")
+
     with st.sidebar:
         if st.button("🚪 Log Out"):
             st.session_state.user_email = None
@@ -1974,8 +423,22 @@ if st.session_state.person_id is None:
     st.warning("👤 Please select a family member to proceed.")
     st.stop()
 
+# ---- Display Current Optimization Selection in Sidebar ---- #
+st.sidebar.markdown("---")
+st.sidebar.markdown("**🎯 Current Optimization:**")
+if 'k_opt_current_selection' in st.session_state:
+    current_selection = st.session_state['k_opt_current_selection']
+    if current_selection.get('type') == 'knn':
+        st.sidebar.success(f"✅ KNN with k={current_selection.get('k')}\n\nMCC: {current_selection.get('mcc', '?'):.4f}")
+    else:
+        strategy = current_selection.get('strategy', '?').upper()
+        n_comp = current_selection.get('n_comp', '?')
+        st.sidebar.success(f"✅ {strategy} Strategy\nn_comp={n_comp}\n\nMCC: {current_selection.get('mcc', '?'):.4f}")
+else:
+    st.sidebar.info("No optimization applied yet.\nRun 'Optimize k' in Tab 1.")
+
 # ---- Load sidebar parameters BEFORE tabs (always visible) ---- #
-args = get_args()
+args = get_args(cursor, data_dir)
 
 # ---- Create Tabs ---- #
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["🏆 Model Selection", "📂 Past Results", "🔬 New Analysis", "🤝 Ensemble", "🖼️ Grad-CAM Gallery"])
@@ -2091,27 +554,25 @@ with tab1:
         
         if len(plot_df) > 0:
             col1, col2 = st.columns(2)
-            
             with col1:
                 st.markdown("**MCC vs ECE**")
-                fig1, ax1 = plt.subplots(figsize=(6, 4))
+                fig1, ax1 = plt.subplots(figsize=(6, 3.5))
                 ax1.scatter(plot_df["MCC"], plot_df["ECE"], alpha=0.6, s=50)
                 ax1.set_xlabel("MCC (higher is better)", fontsize=10)
                 ax1.set_ylabel("ECE (lower is better)", fontsize=10)
                 ax1.set_title("Expected Calibration Error vs MCC", fontsize=11)
                 ax1.grid(True, alpha=0.3)
-                st.pyplot(fig1)
+                st.pyplot(fig1, use_container_width=True)
                 plt.close(fig1)
-            
             with col2:
                 st.markdown("**MCC vs Brier Score**")
-                fig2, ax2 = plt.subplots(figsize=(6, 4))
+                fig2, ax2 = plt.subplots(figsize=(6, 3.5))
                 ax2.scatter(plot_df["MCC"], plot_df["Brier"], alpha=0.6, s=50, color='orange')
                 ax2.set_xlabel("MCC (higher is better)", fontsize=10)
                 ax2.set_ylabel("Brier Score (lower is better)", fontsize=10)
                 ax2.set_title("Brier Score vs MCC", fontsize=11)
                 ax2.grid(True, alpha=0.3)
-                st.pyplot(fig2)
+                st.pyplot(fig2, use_container_width=True)
                 plt.close(fig2)
         else:
             st.info("Calibration metrics not available for plotting. Run models to compute ECE and Brier scores.")
@@ -2192,20 +653,21 @@ with tab1:
                                 # Sort by predicted prob for a smooth curve
                                 df_curve = pd.DataFrame({"prob_pred": prob_pred, "prob_true": prob_true}).sort_values("prob_pred")
 
-                                # Matplotlib plot
-                                fig, ax = plt.subplots(figsize=(6, 4))
-                                ax.plot(df_curve["prob_pred"], df_curve["prob_true"], marker='o', linewidth=1.5,
+                                col_curve, col_line = st.columns(2)
+                                with col_curve:
+                                    fig, ax = plt.subplots(figsize=(6, 3.5))
+                                    ax.plot(df_curve["prob_pred"], df_curve["prob_true"], marker='o', linewidth=1.5,
                                         label=f"Model #{row_dict.get('#', '?')} (ECE: {ece_val:.4f}, Brier: {brier_val:.4f})")
-                                ax.plot([0, 1], [0, 1], linestyle='--', color='gray', label="Perfectly calibrated")
-                                ax.set_xlabel("Mean predicted probability")
-                                ax.set_ylabel("Fraction of positives")
-                                ax.set_title("Calibration Curve (Validation Set)")
-                                ax.legend()
-                                ax.grid(alpha=0.3)
-                                st.pyplot(fig)
-
-                                # Alt: simple line chart for quick glance
-                                st.line_chart(df_curve.set_index('prob_pred'))
+                                    ax.plot([0, 1], [0, 1], linestyle='--', color='gray', label="Perfectly calibrated")
+                                    ax.set_xlabel("Mean predicted probability")
+                                    ax.set_ylabel("Fraction of positives")
+                                    ax.set_title("Calibration Curve")
+                                    ax.legend()
+                                    ax.grid(alpha=0.3)
+                                    st.pyplot(fig, use_container_width=True)
+                                    plt.close(fig)
+                                # with col_line:
+                                #     st.line_chart(df_curve.set_index('prob_pred'))
                             else:
                                 st.info("Not enough bins to render a calibration curve (need at least 2 points).")
 
@@ -2235,6 +697,7 @@ with tab1:
 
                     st.success(f"✅ Selected model #{row_dict.get('#', '?')}: {row_dict.get('Model Name')}")
                     st.info("Switch to '🔬 New Analysis' tab to upload an image and run analysis with this model.")
+                    # Only update session state and rerun; defer any heavy computation until user interacts with analysis or optimization controls
                     st.rerun()
                 
             if st.session_state.get('selected_model_params'):
@@ -2262,13 +725,2743 @@ with tab1:
         st.session_state.pop('k_opt_curve', None)
         st.session_state['k_opt_model_key'] = current_model_key
 
-    def _optimize_k_for_args(_args, min_k: int = 1, max_k: int = 20):
-        # Load model + datasets
-        model, _, prototypes, _, _, data, unique_labels, unique_batches, _ = load_model_and_prototypes(_args)
+    # Display cached results immediately if they exist for current model
+    if 'optimized_k_value' in st.session_state and st.session_state.get('k_opt_model_key') == current_model_key:
+        best_val = st.session_state['optimized_k_value']
+        mcc_val = st.session_state['k_opt_best_mcc']
+        st.success(f"✅ Previous Optimization Found: {best_val} (Validation MCC: {mcc_val:.3f})")
+        
+        # Display cached comparison plot if available
+        proto_results = st.session_state.get('k_opt_proto_results', {})
+        mcc_curve = st.session_state.get('k_opt_curve', [])
+        
+        if mcc_curve and proto_results:
+            try:
+                fig_compare, ax_compare = plt.subplots(figsize=(6, 3.5))
+                
+                # Plot KNN curve
+                curve_df = pd.DataFrame(mcc_curve)
+                curve_df = curve_df.sort_values('k')
+                ax_compare.plot(curve_df['k'], curve_df['mcc'], marker='o', linewidth=2.5, 
+                               markersize=7, label='KNN', color='#e74c3c', zorder=3)
+                
+                # Plot prototype strategies
+                colors = {'mean': '#3498db', 'kmeans': '#f39c12', 'gmm': '#2ecc71'}
+                for strategy in ['mean', 'kmeans', 'gmm']:
+                    result = proto_results.get(strategy, {})
+                    per_components = result.get('per_components', [])
+                    if per_components:
+                        per_df = pd.DataFrame(per_components).sort_values('n_components')
+                        ax_compare.plot(per_df['n_components'], per_df['mcc'], marker='s', linewidth=2.5,
+                                      markersize=7, label=f'{strategy.capitalize()}', 
+                                      color=colors.get(strategy, '#95a5a6'), zorder=2)
+                
+                best_knn_mcc = st.session_state.get('k_opt_best_mcc', 0)
+                ax_compare.axhline(y=best_knn_mcc, color='#e74c3c', linestyle='--', linewidth=1.5, 
+                                  alpha=0.6, zorder=1)
+                
+                ax_compare.set_xlabel('k (KNN) / n_components (Prototypes)', fontsize=12, fontweight='bold')
+                ax_compare.set_ylabel('Validation MCC', fontsize=12, fontweight='bold')
+                ax_compare.set_title('KNN vs Prototype Strategies: MCC Comparison', fontsize=13, fontweight='bold')
+                ax_compare.legend(loc='best', fontsize=11, framealpha=0.95)
+                ax_compare.grid(True, alpha=0.3)
+                ax_compare.set_ylim([min(curve_df['mcc'].min() - 0.05, min([r.get('best_mcc', 1) for r in proto_results.values() if r.get('best_mcc')]) - 0.05), 
+                                    min(1.0, max(curve_df['mcc'].max(), max([r.get('best_mcc', 0) for r in proto_results.values() if r.get('best_mcc')]) + 0.1))])
+                
+                plt.tight_layout()
+                st.pyplot(fig_compare, use_container_width=True)
+                plt.close(fig_compare)
+            except Exception as e:
+                st.warning(f"Could not display cached chart: {e}")
+        
+        st.divider()
+
+    def _get_aug_cache_dir(_args, split_name: str):
+        """Directory storing cached per-round augmentations for one split."""
+        params = get_model_params_path(_args)
+        parts = params.split('/')
+        base_params = '/'.join(parts[:-3])
+        base_dir = f'logs/best_models/{_args.task}/{_args.model_name}/{base_params}'
+        cache_dir = os.path.join(base_dir, f"norm{_args.normalize}", 'aug_cache', split_name)
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
+
+    def _load_or_build_aug_round_cache(_args, split_name: str, inputs, aug_idx: int, aug_transform):
+        """Load one augmentation round from disk, or compute and save it once."""
+        cache_dir = _get_aug_cache_dir(_args, split_name)
+        cache_file = os.path.join(cache_dir, f"aug_{int(aug_idx)}.pkl")
+
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    obj = pickle.load(f)
+                arr = obj.get('data') if isinstance(obj, dict) and 'data' in obj else obj
+                if not isinstance(arr, np.ndarray):
+                    arr = np.asarray(arr)
+                if arr.shape[0] == len(inputs):
+                    print(f"[AugCache] Loaded {split_name} aug_{aug_idx} from {cache_file}")
+                    return arr
+                print(f"[AugCache] Shape mismatch for {cache_file}: expected {len(inputs)} samples, got {arr.shape[0]}. Rebuilding.")
+            except Exception as e:
+                print(f"[AugCache] Failed loading {cache_file}: {e}. Rebuilding.")
+
+        print(f"[AugCache] Building {split_name} aug_{aug_idx} cache ({len(inputs)} samples)...")
+        augmented = []
+        pbar = tqdm(range(len(inputs)),
+                    total=len(inputs),
+                    desc=f"[AugCache] {split_name} aug_{aug_idx}",
+                    unit="img",
+                    dynamic_ncols=True)
+        for idx in pbar:
+            sample = aug_transform(inputs[idx])
+            augmented.append(sample.detach().cpu().numpy().astype(np.float16))
+
+        arr = np.stack(augmented, axis=0) if augmented else np.empty((0,), dtype=np.float16)
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump({'data': arr, 'dtype': str(arr.dtype), 'shape': arr.shape}, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f"[AugCache] Saved {split_name} aug_{aug_idx} to {cache_file}")
+        except Exception as e:
+            print(f"[AugCache] Failed saving {cache_file}: {e}")
+        return arr
+
+    # Use shared prototype computation from encoding_utils
+    def _optimize_k_for_args(_args, min_k: int = 1, max_k: int = 20,
+                              skip_knn: bool = False, skip_baselines: bool = False,
+                              skip_prototypes: bool = False):
+        # Load model + datasets and prototypes with n_aug
+        n_aug = getattr(_args, 'n_aug', 1)
+        
+        # Try to load prototypes with n_aug, compute if not exists
+        # ---- Device: always prefer CUDA when available ----
+        effective_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if getattr(_args, 'device', 'cpu') != effective_device:
+            print(f"[Device] ⚠️  args.device='{getattr(_args, 'device', 'cpu')}' overridden → '{effective_device}'")
+        _args.device = effective_device
+        if effective_device == 'cuda':
+            dev_name = torch.cuda.get_device_name(torch.cuda.current_device())
+            print(f"[Device] ✅ Using GPU: {dev_name} (CUDA:{torch.cuda.current_device()})")
+        else:
+            print("[Device] ⚠️  Using CPU — no CUDA device detected!")
+
+        try:
+            prototypes = _compute_and_save_prototypes_with_naug(_args, n_aug, force_recompute=False)
+        except Exception as e:
+            st.warning(f"Could not load/compute prototypes with n_aug={n_aug}: {e}. Using default prototypes.")
+            print(f"[Encode] Loading model (fallback — no cached prototypes)...")
+            model, _, prototypes, _, _, data, unique_labels, unique_batches, _ = load_model_and_prototypes(_args)
+        else:
+            print(f"[Encode] Loading model for embedding pass...")
+            model, _, _, _, _, data, unique_labels, unique_batches, _ = load_model_and_prototypes(_args)
+            print(f"[Encode] Model loaded. train={len(data['inputs']['train'])} valid={len(data['inputs']['valid'])} samples")
 
         # Prepare a minimal TrainAE wrapper to encode sets (reuse utilities used elsewhere)
         train = TrainAE(_args, _args.path, load_tb=False, log_metrics=False, keep_models=True,
-                        log_inputs=False, log_plots=False, log_tb=False, log_neptune=False,
+                        log_inputs=False, log_plots=False, log_tb=False, log_tracking=False,
+                        log_mlflow=False, groupkfold=_args.groupkfold)
+        train.n_batches = len(unique_batches)
+        train.n_cats = len(unique_labels)
+        train.unique_batches = unique_batches
+        train.unique_labels = unique_labels
+        train.epoch = 1
+        train.model = model
+        train.params = {'n_neighbors': int(_args.n_neighbors)}
+        train.set_arcloss()
+
+        # --- Encode train/valid with optional augmentation (train only) ---
+        base_transform = transforms.Compose([
+            transforms.ToTensor()
+        ])
+        knn_aug_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(degrees=(-180, 180)),
+            transforms.RandomApply(
+                [transforms.RandomResizedCrop(
+                    size=_args.new_size,
+                    scale=(0.8, 1.0),
+                    ratio=(0.8, 1.2)
+                )], p=0.5),
+        ])
+
+        def _encode_split(split_name: str, n_aug_split: int = 1):
+            inputs = data['inputs'][split_name]
+            labels = data['labels'][split_name]
+            batches = data['batches'][split_name]
+            n_total = len(inputs)
+            n_batches_enc = max(1, (n_total + _args.bs - 1) // _args.bs)
+
+            # Build/load each augmentation round once, then reuse by sample index.
+            aug_round_cache = {}
+            if split_name == 'train' and int(n_aug_split) > 0:
+                for aug_idx in range(1, int(n_aug_split) + 1):
+                    aug_round_cache[aug_idx] = _load_or_build_aug_round_cache(
+                        _args, split_name, inputs, aug_idx, knn_aug_transform
+                    )
+
+            encs = []
+            labs = []
+            doms = []
+            _enc_pbar = tqdm(
+                range(0, n_total, _args.bs),
+                total=n_batches_enc,
+                desc=f"[Encode] {split_name}",
+                unit="batch",
+                dynamic_ncols=True,
+            )
+            with torch.no_grad():
+                for bidx, i in enumerate(_enc_pbar):
+                    _enc_pbar.set_postfix(samples=f"{min(i+_args.bs, n_total)}/{n_total}")
+                    batch_inputs = inputs[i:i + _args.bs]
+                    batch_labels = labels[i:i + _args.bs]
+                    batch_batches = batches[i:i + _args.bs]
+                    transformed = []
+                    labs_batch = []
+                    doms_batch = []
+                    for j in range(len(batch_inputs)):
+                        # Always include original; n_aug_split is number of extra augmentations
+                        repeats = 1 + max(0, n_aug_split) if split_name == 'train' else 1
+                        for r in range(repeats):
+                            # r == 0 -> original; r > 0 -> augmented (when n_aug_split > 0)
+                            if split_name == 'train' and r > 0:
+                                cache_arr = aug_round_cache.get(r)
+                                cache_idx = i + j
+                                if isinstance(cache_arr, np.ndarray) and cache_idx < cache_arr.shape[0]:
+                                    sample = torch.from_numpy(cache_arr[cache_idx]).float()
+                                else:
+                                    sample = knn_aug_transform(batch_inputs[j])
+                            else:
+                                sample = base_transform(batch_inputs[j])
+                            transformed.append(sample)
+                            labs_batch.append(batch_labels[j])
+                            doms_batch.append(batch_batches[j])
+                    if not transformed:
+                        continue
+                    tensor_batch = torch.stack(transformed).to(_args.device)
+                    encoded, _ = model(tensor_batch)
+                    encs.append(encoded.detach().cpu().numpy())
+                    labs.extend(labs_batch)
+                    doms.extend(doms_batch)
+            return np.concatenate(encs), np.array(labs), np.array(doms)
+
+        train_encs, train_cats, train_batches = _encode_split('train', n_aug_split=n_aug)
+        valid_encs, valid_cats, valid_batches = _encode_split('valid', n_aug_split=1)
+        try:
+            test_encs, _, test_batches = _encode_split('test', n_aug_split=1)
+        except Exception:
+            test_encs = np.empty((0, valid_encs.shape[1]), dtype=valid_encs.dtype)
+            test_batches = np.empty((0,), dtype=valid_batches.dtype)
+
+        all_encs_parts = [arr for arr in [train_encs, valid_encs, test_encs] if isinstance(arr, np.ndarray) and arr.shape[0] > 0]
+        all_batches_parts = [arr for arr in [train_batches, valid_batches, test_batches] if isinstance(arr, np.ndarray) and arr.shape[0] > 0]
+        if all_encs_parts and all_batches_parts:
+            all_dataset_encs = np.concatenate(all_encs_parts, axis=0)
+            all_dataset_batches = np.concatenate(all_batches_parts, axis=0)
+        else:
+            all_dataset_encs = valid_encs
+            all_dataset_batches = valid_batches
+
+        # Use ML module for comprehensive classifier search
+        include_proto = st.session_state.get('include_prototypes', True)
+        best_k_final, best_mcc_final, all_results = find_best_classifier(
+            train_encs, train_cats,
+            valid_encs, valid_cats,
+            min_k=min_k,
+            max_k=max_k,
+            include_knn=(not skip_knn),
+            include_baselines=(not skip_baselines),
+            include_prototypes=(include_proto and not skip_prototypes),
+            prototype_strategies=['mean', 'kmeans', 'gmm'],
+            max_components=10
+        )
+        
+        # Compute batch-effect metrics for every prediction path (incl. all KNN k)
+        batch_effects = {'knn_per_k': [], 'baselines': {}, 'prototypes': {}}
+
+        if not skip_knn:
+            max_k_eff = min(int(max_k), int(train_encs.shape[0]))
+            for k in tqdm(range(int(min_k), max_k_eff + 1),
+                          total=max_k_eff - int(min_k) + 1,
+                          desc=f"[BatchEff] KNN k={min_k}..{max_k_eff}",
+                          unit="k",
+                          dynamic_ncols=True):
+                knn_model = fit_knn_classifier(train_encs, train_cats, n_neighbors=k, metric='minkowski')
+                knn_preds = knn_model.predict(all_dataset_encs)
+                metrics_k = _compute_batch_effect_from_predictions(knn_preds, all_dataset_batches)
+                batch_effects['knn_per_k'].append({'k': int(k), **metrics_k})
+
+        if not skip_baselines:
+            baseline_results = all_results.get('baselines', {})
+            for baseline_name, baseline_data in baseline_results.items():
+                clf_entry = baseline_data.get('classifier', None) if isinstance(baseline_data, dict) else None
+                clf_obj = clf_entry.get('classifier', None) if isinstance(clf_entry, dict) else clf_entry
+                if clf_obj is None:
+                    continue
+                try:
+                    baseline_preds = clf_obj.predict(all_dataset_encs)
+                    batch_effects['baselines'][baseline_name] = _compute_batch_effect_from_predictions(
+                        baseline_preds, all_dataset_batches
+                    )
+                except Exception:
+                    continue
+
+        if not skip_prototypes:
+            proto_results_be = all_results.get('prototypes', {})
+        else:
+            proto_results_be = {}
+        for strategy_name, strategy_data in proto_results_be.items():
+            if not isinstance(strategy_data, dict):
+                continue
+            best_n_components = strategy_data.get('best_n_components', None)
+            if best_n_components is None:
+                continue
+            try:
+                proto_dict = compute_prototypes_by_strategy(
+                    train_encs,
+                    train_cats,
+                    strategy=strategy_name,
+                    n_components=int(best_n_components),
+                    random_state=1,
+                )
+                proto_vecs, proto_labels = flatten_prototype_dict(proto_dict)
+                if proto_vecs.size == 0:
+                    continue
+                proto_knn = fit_knn_classifier(proto_vecs, proto_labels, n_neighbors=1, metric='minkowski')
+                proto_preds = proto_knn.predict(all_dataset_encs)
+                batch_effects['prototypes'][strategy_name] = _compute_batch_effect_from_predictions(
+                    proto_preds, all_dataset_batches
+                )
+            except Exception:
+                continue
+
+        all_results['batch_effects'] = batch_effects
+
+        # Extract detailed results for backward compatibility
+        mcc_per_k = all_results.get('knn', {}).get('mcc_per_k', [])
+        proto_results = all_results.get('prototypes', {})
+        baseline_results = all_results.get('baselines', {})
+
+        return best_k_final, float(best_mcc_final), mcc_per_k, all_results
+
+    def _compute_and_save_prototypes_with_naug(_args, n_aug: int, force_recompute: bool = False):
+        """Compute prototypes with specific n_aug and save them for future use.
+        
+        Args:
+            _args: Arguments with model configuration
+            n_aug: Number of augmentations per image
+            force_recompute: If True, recompute even if cached prototypes exist
+            
+        Returns:
+            prototypes: Dict with 'combined', 'class', 'batch' prototypes
+        """
+        # ---- Device: always prefer CUDA when available ----
+        effective_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if getattr(_args, 'device', 'cpu') != effective_device:
+            print(f"[Device] ⚠️  args.device='{getattr(_args, 'device', 'cpu')}' overridden → '{effective_device}'")
+        _args.device = effective_device
+        if effective_device == 'cuda':
+            dev_name = torch.cuda.get_device_name(torch.cuda.current_device())
+            print(f"[Device] ✅ Using GPU: {dev_name} (CUDA:{torch.cuda.current_device()})")
+        else:
+            print("[Device] ⚠️  Using CPU — no CUDA device detected!")
+
+        # Build path for prototypes with n_aug
+        params = get_model_params_path(_args)
+        parts = params.split('/')
+        base_params = '/'.join(parts[:-3])
+        base_dir = f'logs/best_models/{_args.task}/{_args.model_name}/{base_params}'
+        model_path, _, resolved_k = resolve_model_paths(base_dir, _args.normalize, _args.dist_fct, int(_args.n_neighbors))
+        
+        # Get directory from model path
+        model_dir = os.path.dirname(model_path)
+        proto_path_with_naug = os.path.join(model_dir, f'prototypes_naug{n_aug}.pkl')
+        
+        print(f"[Proto] Looking for prototypes at: {proto_path_with_naug}")
+        
+        # Load existing prototypes if available and not forcing recompute
+        if os.path.exists(proto_path_with_naug) and not force_recompute:
+            print(f"[Proto] Found cached prototypes, loading from {proto_path_with_naug}")
+            with open(proto_path_with_naug, 'rb') as f:
+                proto_obj = pickle.load(f)
+
+            # Support both legacy Prototypes objects and dict-only saves
+            if isinstance(proto_obj, dict):
+                prototypes = proto_obj
+            else:
+                prototypes = {
+                    'combined': proto_obj.prototypes,
+                    'class': proto_obj.class_prototypes,
+                    'batch': proto_obj.batch_prototypes
+                }
+            print(f"[Proto] Successfully loaded prototypes with n_aug={n_aug}")
+            return prototypes
+        
+        print(f"[Proto] Computing new prototypes with n_aug={n_aug}...")
+        
+        # Otherwise, compute new prototypes with n_aug
+        # Load model and data
+        print(f"[Proto] Loading model and dataset...")
+        model, _, _, _, _, data, unique_labels, unique_batches, _ = load_model_and_prototypes(_args)
+        print(f"[Proto] Model loaded. Training samples: {len(data['inputs']['train'])}")
+        
+        # Prepare TrainAE wrapper to encode with augmentation
+        train = TrainAE(_args, _args.path, load_tb=False, log_metrics=False, keep_models=True,
+                        log_inputs=False, log_plots=False, log_tb=False, log_tracking=False,
+                        log_mlflow=False, groupkfold=_args.groupkfold)
+        train.n_batches = len(unique_batches)
+        train.n_cats = len(unique_labels)
+        train.unique_batches = unique_batches
+        train.unique_labels = unique_labels
+        train.epoch = 1
+        train.model = model
+        train.params = {'n_aug': n_aug}
+        train.set_arcloss()
+        
+        # Initialize Prototypes object with strategy from args
+        proto_strategy = getattr(_args, 'prototype_strategy', 'mean')
+        proto_components = getattr(_args, 'prototype_components', 1)
+        proto_seed = getattr(_args, 'seed', 1)
+        proto_obj = Prototypes(
+            unique_labels,
+            unique_batches,
+            strategy=proto_strategy,
+            components=proto_components,
+            random_state=proto_seed,
+        )
+        
+        lists, traces = get_empty_traces()
+        
+        # Apply augmentation and encode like make_encoded_values does
+        print(f"[Proto] Encoding train set with n_aug={n_aug}...")
+        
+        # Base transform (no augmentation)
+        base_transform = transforms.Compose([
+            transforms.ToTensor()
+        ])
+        
+        # Augmentations dedicated to KNN expansion
+        knn_aug_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(degrees=(-180, 180)),
+            transforms.RandomApply(
+                [transforms.RandomResizedCrop(
+                    size=_args.new_size,
+                    scale=(0.8, 1.0),
+                    ratio=(0.8, 1.2)
+                )], p=0.5),
+        ])
+        
+        # Collect encoded samples and metadata
+        all_encoded = []
+        all_labels = []
+        all_domains = []
+        
+        train_inputs = data['inputs']['train']
+        train_labels = data['labels']['train']
+        train_batches = data['batches']['train']
+
+        # Build/load each augmentation round once, then reuse by sample index.
+        aug_round_cache = {}
+        if int(n_aug) > 0:
+            for aug_idx in range(1, int(n_aug) + 1):
+                aug_round_cache[aug_idx] = _load_or_build_aug_round_cache(
+                    _args, 'train', train_inputs, aug_idx, knn_aug_transform
+                )
+        
+        # Process in batches
+        n_train = len(train_inputs)
+        n_batches_proto = max(1, (n_train + _args.bs - 1) // _args.bs)
+        _proto_pbar = tqdm(
+            range(0, n_train, _args.bs),
+            total=n_batches_proto,
+            desc=f"[Proto] Encoding n_aug={n_aug}",
+            unit="batch",
+            dynamic_ncols=True,
+        )
+        for batch_idx, i in enumerate(_proto_pbar):
+            _proto_pbar.set_postfix(samples=f"{min(i+_args.bs, n_train)}/{n_train}")
+            batch_inputs = train_inputs[i:i + _args.bs]
+            batch_labels = train_labels[i:i + _args.bs]
+            batch_batches = train_batches[i:i + _args.bs]
+            
+            transformed_samples = []
+            labels_for_batch = []
+            batches_for_batch = []
+            
+            for j in range(len(batch_inputs)):
+                # Always include original + n_aug extra augmented copies
+                repeats = 1 + max(0, n_aug)
+                for r in range(repeats):
+                    if r == 0:
+                        sample = base_transform(batch_inputs[j])
+                    else:
+                        cache_arr = aug_round_cache.get(r)
+                        cache_idx = i + j
+                        if isinstance(cache_arr, np.ndarray) and cache_idx < cache_arr.shape[0]:
+                            sample = torch.from_numpy(cache_arr[cache_idx]).float()
+                        else:
+                            sample = knn_aug_transform(batch_inputs[j])
+                    transformed_samples.append(sample)
+                    labels_for_batch.append(batch_labels[j])
+                    batches_for_batch.append(batch_batches[j])
+            
+            if not transformed_samples:
+                continue
+            
+            # Stack and encode
+            transformed_tensor = torch.stack(transformed_samples).to(_args.device)
+            with torch.no_grad():
+                encoded, _ = model(transformed_tensor)
+            
+            all_encoded.append(encoded.detach().cpu().numpy())
+            all_labels.extend(labels_for_batch)
+            all_domains.extend(batches_for_batch)
+        
+        # Prepare lists structure for prototypes computation
+        lists['train']['encoded_values'] = all_encoded
+        lists['train']['labels'] = [np.array(all_labels)]
+        lists['train']['domains'] = [np.array(all_domains)]
+        
+        print(f"[Proto] Computing prototypes from {len(all_encoded)} batches with {sum(len(b) for b in all_encoded)} total samples...")
+        # Compute prototypes from encoded values
+        proto_obj.set_prototypes('train', lists)
+        
+        # Ensure directory exists
+        os.makedirs(model_dir, exist_ok=True)
+        
+        # Save prototypes with n_aug suffix (store plain dict to avoid pickle class issues)
+        prototypes = {
+            'combined': proto_obj.prototypes,
+            'class': proto_obj.class_prototypes,
+            'batch': proto_obj.batch_prototypes
+        }
+
+        print(f"[Proto] Saving prototypes to {proto_path_with_naug}...")
+        try:
+            with open(proto_path_with_naug, 'wb') as f:
+                pickle.dump(prototypes, f)
+            print(f"[Proto] ✅ Successfully saved prototypes to {proto_path_with_naug}")
+        except Exception as e:
+            print(f"[Proto] ❌ Failed to save prototypes: {e}")
+            raise
+
+        return prototypes
+
+    def _get_optimization_cache_file(_args):
+        """Get path to optimization cache file for this model."""
+        params = get_model_params_path(_args)
+        parts = params.split('/')
+        base_params = '/'.join(parts[:-3])
+        base_dir = f'logs/best_models/{_args.task}/{_args.model_name}/{base_params}'
+        # Keep a single cache per model setup and normalization.
+        # Older runs stored cache under dist_*/knn*/; _load_optimization_cache merges them.
+        cache_dir = os.path.join(base_dir, f"norm{_args.normalize}")
+        return os.path.join(cache_dir, 'knn_optimization_cache.pkl')
+
+    def _merge_optimization_cache(target_cache, source_cache):
+        """Merge source cache into target cache, keeping best MCC per n_aug."""
+        if not isinstance(source_cache, dict):
+            return target_cache
+        for n_aug_key, result in source_cache.items():
+            try:
+                n_aug_int = int(n_aug_key)
+            except Exception:
+                continue
+            current = target_cache.get(n_aug_int)
+            if current is None:
+                target_cache[n_aug_int] = result
+                continue
+
+            current_mcc = float(current.get('best_mcc', -1)) if isinstance(current, dict) else -1
+            new_mcc = float(result.get('best_mcc', -1)) if isinstance(result, dict) else -1
+            if new_mcc > current_mcc:
+                target_cache[n_aug_int] = result
+        return target_cache
+
+    def _load_optimization_cache(_args):
+        """Load cached optimization results for different n_aug values.
+
+        Also merges legacy caches saved under dist_*/knn*/ subfolders.
+        """
+        cache_file = _get_optimization_cache_file(_args)
+        cache_dir = os.path.dirname(cache_file)
+        merged_cache = {}
+
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    merged_cache = _merge_optimization_cache(merged_cache, pickle.load(f))
+            except Exception as e:
+                print(f"[Cache] Could not load optimization cache: {e}")
+
+        # Backward compatibility: merge older split cache files.
+        legacy_pattern = os.path.join(cache_dir, 'dist_*', 'knn*', 'knn_optimization_cache.pkl')
+        legacy_files = glob.glob(legacy_pattern)
+        merged_from_legacy = False
+        for legacy_file in legacy_files:
+            try:
+                with open(legacy_file, 'rb') as f:
+                    legacy_cache = pickle.load(f)
+                merged_cache = _merge_optimization_cache(merged_cache, legacy_cache)
+                merged_from_legacy = True
+            except Exception as e:
+                print(f"[Cache] Could not load legacy cache {legacy_file}: {e}")
+
+        # Persist merged legacy cache into the unified location.
+        if merged_from_legacy and merged_cache:
+            try:
+                _save_optimization_cache(_args, merged_cache)
+                print(f"[Cache] ✅ Merged {len(legacy_files)} legacy cache file(s) into unified cache")
+            except Exception as e:
+                print(f"[Cache] Could not persist merged cache: {e}")
+
+        return merged_cache
+
+    def _save_optimization_cache(_args, cache_data):
+        """Save optimization results cache."""
+        cache_file = _get_optimization_cache_file(_args)
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        with open(cache_file, 'wb') as f:
+            pickle.dump(cache_data, f)
+        print(f"[Cache] ✅ Saved optimization cache for {len(cache_data)} n_aug values")
+
+    def _strip_classifier_objects(baseline_results):
+        """Strip unpicklable classifier objects, keeping only metrics."""
+        clean = {}
+        for name, result in baseline_results.items():
+            if not isinstance(result, dict):
+                continue
+            clean[name] = {
+                'mcc': result.get('mcc'),
+                'acc': result.get('acc'),
+                'best_params': result.get('best_params'),
+            }
+        return clean
+
+    def _strip_prototype_results(proto_results):
+        """Strip potentially problematic objects from prototype results."""
+        clean = {}
+        for strategy, result in proto_results.items():
+            if not isinstance(result, dict):
+                continue
+            clean[strategy] = {
+                'best_mcc': result.get('best_mcc'),
+                'best_n_components': result.get('best_n_components'),
+                'n_prototypes': result.get('n_prototypes'),
+                'per_components': result.get('per_components', []),
+            }
+        return clean
+
+    def _save_optimization_result(_args, n_aug, best_k, best_mcc, all_results):
+        """Save optimization result including all classifier approaches with n_aug tracking.
+        
+        Args:
+            _args: Model arguments
+            n_aug: Data augmentation count used for this optimization
+            best_k: Best k value found
+            best_mcc: Best MCC score achieved
+            all_results: Dict with results from find_best_classifier containing:
+                - 'knn': KNN results with best_k and mcc_per_k
+                - 'baselines': NB, LogReg, SVC results
+                - 'prototypes': Prototype strategy results (mean, kmeans, gmm)
+        """
+        cache = _load_optimization_cache(_args)
+        
+        # Extract classifier-specific results for explicit n_aug tracking
+        baseline_results = all_results.get('baselines', {})
+        proto_results = all_results.get('prototypes', {})
+        knn_results = all_results.get('knn', {})
+        
+        # Extract batch effects from all_results
+        batch_effects = all_results.get('batch_effects', {})
+        
+        # Strip unpicklable objects (classifier instances) before saving
+        clean_baselines = _strip_classifier_objects(baseline_results)
+        clean_prototypes = _strip_prototype_results(proto_results)
+        
+        # Store with explicit classifier type and n_aug
+        cache[int(n_aug)] = {
+            'cache_version': 2,  # Version the cache for future compatibility
+            'n_aug': int(n_aug),
+            'best_k': best_k,  # Best overall
+            'best_mcc': float(best_mcc),  # Best overall
+            'timestamp': datetime.now().isoformat(),
+            # Baselines - only plain metrics, no classifier objects
+            'baselines': clean_baselines,
+            # KNN results
+            'knn': {
+                'n_aug_applied': int(n_aug),
+                'best_k': knn_results.get('best_k', best_k),
+                'mcc_per_k': knn_results.get('mcc_per_k', []),
+            },
+            # Prototypes results - only metrics
+            'prototypes': clean_prototypes,
+            # Batch effects - containing metrics for all approaches
+            'batch_effects': batch_effects,
+        }
+        _save_optimization_cache(_args, cache)
+
+    def _is_cache_complete(entry, max_k):
+        """Return True only if all expected model types are present and KNN covers up to max_k.
+
+        An entry is considered incomplete if:
+        - It has no knn.mcc_per_k (KNN was never computed)
+        - The highest k in mcc_per_k is below max_k (user increased batch_k_max)
+        - It has no baselines (e.g. very old cache format)
+        - It has no prototypes (e.g. very old cache format)
+        """
+        if not isinstance(entry, dict):
+            return False
+        # --- KNN check ---
+        knn = entry.get('knn', {})
+        mcc_per_k = knn.get('mcc_per_k', []) if isinstance(knn, dict) else []
+        if not mcc_per_k:
+            return False
+        # Determine the highest k that was evaluated
+        highest_k = 0
+        for item in mcc_per_k:
+            if isinstance(item, dict):
+                k_val = item.get('k')
+                if k_val is not None:
+                    highest_k = max(highest_k, int(k_val))
+            else:
+                # Legacy: list of plain floats indexed by k-1
+                highest_k = len(mcc_per_k)
+        if highest_k < int(max_k):
+            return False
+        # --- Baselines check ---
+        if not entry.get('baselines'):
+            return False
+        # --- Prototypes check ---
+        if not entry.get('prototypes'):
+            return False
+        return True
+
+    def _what_is_missing(entry, max_k):
+        """Return a dict describing which parts are absent/incomplete in a cache entry.
+
+        Returns:
+            {'knn': bool, 'baselines': bool, 'prototypes': bool}
+            True means the part needs to be computed.
+        """
+        if not isinstance(entry, dict):
+            return {'knn': True, 'baselines': True, 'prototypes': True}
+        missing = {'knn': False, 'baselines': False, 'prototypes': False}
+        # --- KNN ---
+        knn = entry.get('knn', {})
+        mcc_per_k = knn.get('mcc_per_k', []) if isinstance(knn, dict) else []
+        if not mcc_per_k:
+            missing['knn'] = True
+        else:
+            highest_k = 0
+            for item in mcc_per_k:
+                if isinstance(item, dict):
+                    k_val = item.get('k')
+                    if k_val is not None:
+                        highest_k = max(highest_k, int(k_val))
+                else:
+                    highest_k = len(mcc_per_k)
+            if highest_k < int(max_k):
+                missing['knn'] = True
+        # --- Baselines ---
+        if not entry.get('baselines'):
+            missing['baselines'] = True
+        # --- Prototypes ---
+        if not entry.get('prototypes'):
+            missing['prototypes'] = True
+        return missing
+
+    def _merge_partial_optimization_result(_args, n_aug, new_all_results):
+        """Merge partial new results into an existing cache entry, recomputing best_k/best_mcc.
+
+        Only the sub-sections present in new_all_results are updated; existing sections
+        (knn / baselines / prototypes) are preserved when the new results dict omits them.
+        """
+        cache = _load_optimization_cache(_args)
+        existing = cache.get(int(n_aug), {})
+
+        # --- Merge KNN ---
+        new_knn = new_all_results.get('knn', {})
+        if new_knn and new_knn.get('mcc_per_k'):
+            existing['knn'] = {
+                'n_aug_applied': int(n_aug),
+                'best_k': new_knn.get('best_k'),
+                'mcc_per_k': new_knn.get('mcc_per_k', []),
+            }
+
+        # --- Merge baselines ---
+        new_baselines = new_all_results.get('baselines', {})
+        if new_baselines:
+            existing['baselines'] = _strip_classifier_objects(new_baselines)
+
+        # --- Merge prototypes ---
+        new_prototypes = new_all_results.get('prototypes', {})
+        if new_prototypes:
+            existing['prototypes'] = _strip_prototype_results(new_prototypes)
+
+        # --- Merge batch effects ---
+        new_be = new_all_results.get('batch_effects', {})
+        existing_be = existing.get('batch_effects', {'knn_per_k': [], 'baselines': {}, 'prototypes': {}})
+        if new_be.get('knn_per_k'):
+            existing_be['knn_per_k'] = new_be['knn_per_k']
+        if new_be.get('baselines'):
+            existing_be.setdefault('baselines', {}).update(new_be['baselines'])
+        if new_be.get('prototypes'):
+            existing_be.setdefault('prototypes', {}).update(new_be['prototypes'])
+        existing['batch_effects'] = existing_be
+
+        # --- Recompute best_k / best_mcc from all available data ---
+        best_k_overall, best_mcc_overall = None, -1.0
+        # From KNN
+        for item in existing.get('knn', {}).get('mcc_per_k', []):
+            if isinstance(item, dict):
+                k_val = item.get('k'); mcc = item.get('mcc', -1)
+                if mcc > best_mcc_overall:
+                    best_mcc_overall = mcc
+                    best_k_overall = k_val
+        # From prototypes
+        for strategy, strat_data in existing.get('prototypes', {}).items():
+            if not isinstance(strat_data, dict):
+                continue
+            mcc = strat_data.get('best_mcc', -1) or -1
+            if mcc > best_mcc_overall:
+                best_mcc_overall = mcc
+                best_k_overall = f'protot_{strategy}_{strat_data.get("best_n_components")}'
+        # From baselines
+        for bl_name, bl_data in existing.get('baselines', {}).items():
+            if not isinstance(bl_data, dict):
+                continue
+            mcc = bl_data.get('mcc', -1) or -1
+            if mcc > best_mcc_overall:
+                best_mcc_overall = mcc
+                best_k_overall = f'baseline_{bl_name}'
+
+        existing.update({
+            'cache_version': 2,
+            'n_aug': int(n_aug),
+            'best_k': best_k_overall,
+            'best_mcc': float(best_mcc_overall) if best_mcc_overall > -1 else 0.0,
+            'timestamp': datetime.now().isoformat(),
+        })
+        cache[int(n_aug)] = existing
+        _save_optimization_cache(_args, cache)
+
+
+    # ========================= EMBEDDING-BASED CLASSIFIER OPTIMIZATION ========================= #
+    st.markdown("---")
+    st.markdown("### 🧠 Learned Embedding Classification")
+    st.caption("This section optimizes classifiers using embeddings from the trained deep learning model.")
+    n_aug_values = []
+    batch_k_max = 20
+    
+    # Add n_aug control with comma-separated custom values
+    # Only show N_Aug controls if in N_Aug Mode
+    if st.session_state.get('opt_mode', 'N_Aug Mode') == 'N_Aug Mode':
+        col_naug_label, col_naug_input = st.columns([1.5, 2])
+        
+        with col_naug_label:
+            st.markdown("**N_Aug Values (comma-separated):**")
+        
+        with col_naug_input:
+            n_aug_input = st.text_input(
+                "Enter augmentation levels",
+                value="0,1,10,100",
+                key="tab1_n_aug_input",
+                help="Enter comma-separated values (e.g., 0,1,5,10,50,100). Will test each value."
+            )
+        
+        # Parse and validate input
+        try:
+            n_aug_values = [int(x.strip()) for x in n_aug_input.split(',') if x.strip()]
+            n_aug_values = sorted(list(set(n_aug_values)))  # Remove duplicates and sort
+            if not n_aug_values or any(v < 0 for v in n_aug_values):
+                st.error("N_Aug values must be non-negative integers")
+                n_aug_values = []
+            else:
+                st.success(f"✅ Will test n_aug = {n_aug_values}")
+        except ValueError:
+            st.error("Invalid input. Please enter comma-separated integers (e.g., 0,1,10,100)")
+            n_aug_values = []
+    
+    # Buttons for batch operations
+    col_k_cfg_label, col_k_cfg_input = st.columns([1.5, 2])
+    with col_k_cfg_label:
+        st.markdown("**KNN Max k (batch optimize):**")
+    with col_k_cfg_input:
+        batch_k_max = int(st.number_input(
+            "Max k for Optimize All / Force Reoptimize",
+            min_value=2,
+            max_value=500,
+            value=20,
+            step=1,
+            key="tab1_batch_k_max",
+            help="Default is 20. Increase this to test more neighbors in batch optimization."
+        ))
+
+    col_btn_recompute, col_btn_optimize, col_btn_force = st.columns([1, 1, 1])
+    
+    with col_btn_recompute:
+        if st.button("🔄 Recompute All", key="tab1_recompute_all",
+                     help="Recompute prototypes for all n_aug values"):
+            if n_aug_values:
+                with st.spinner(f"Computing prototypes for n_aug = {n_aug_values}..."):
+                    for n_aug_opt in n_aug_values:
+                        try:
+                            args.n_aug = int(n_aug_opt)
+                            _compute_and_save_prototypes_with_naug(args, int(n_aug_opt), force_recompute=True)
+                            st.success(f"✅ n_aug={n_aug_opt} done")
+                        except Exception as e:
+                            st.error(f"❌ n_aug={n_aug_opt} failed: {e}")
+                # Force rerun to refresh UI and show latest optimization results
+                st.rerun()
+            else:
+                st.warning("No valid n_aug values to process")
+    
+    with col_btn_optimize:
+        if st.button("⚡ Optimize All", key="tab1_optimize_all",
+                     help="Run KNN optimization (k=1..Max k) + all classifiers for all n_aug values (skips fully cached)"):
+            if n_aug_values:
+                with st.spinner(f"Optimizing for n_aug = {n_aug_values}..."):
+                    cache = _load_optimization_cache(args)
+                    skipped = 0
+                    computed = 0
+                    for n_aug_opt in n_aug_values:
+                        cached_entry = cache.get(int(n_aug_opt))
+                        # Check per-component what's missing
+                        missing = _what_is_missing(cached_entry, int(batch_k_max)) if cached_entry is not None else {'knn': True, 'baselines': True, 'prototypes': True}
+                        if not any(missing.values()):
+                            st.info(f"↩️  n_aug={n_aug_opt}: Already fully cached (MCC={cached_entry.get('best_mcc'):.3f})")
+                            skipped += 1
+                            continue
+
+                        # Report exactly what will be computed
+                        parts_to_compute = [k for k, v in missing.items() if v]
+                        if cached_entry is not None:
+                            st.info(f"⚠️  n_aug={n_aug_opt}: Computing missing parts: {parts_to_compute}")
+                        
+                        try:
+                            args.n_aug = int(n_aug_opt)
+                            _compute_and_save_prototypes_with_naug(args, int(n_aug_opt), force_recompute=False)
+                            # Only run the parts that are actually missing
+                            _, _, _, partial_results = _optimize_k_for_args(
+                                args, 1, int(batch_k_max),
+                                skip_knn=not missing['knn'],
+                                skip_baselines=not missing['baselines'],
+                                skip_prototypes=not missing['prototypes'],
+                            )
+                            # Merge partial results into existing cache entry (preserves existing parts)
+                            _merge_partial_optimization_result(args, n_aug_opt, partial_results)
+                            # Re-read to show updated best MCC
+                            updated_cache = _load_optimization_cache(args)
+                            updated_entry = updated_cache.get(int(n_aug_opt), {})
+                            st.success(f"✅ n_aug={n_aug_opt}: computed {parts_to_compute} → best MCC={updated_entry.get('best_mcc', '?')}")
+                            computed += 1
+                        except Exception as e:
+                            st.error(f"❌ n_aug={n_aug_opt} failed: {e}")
+                st.info(f"💾 Done! Computed: {computed} new/partial, Skipped: {skipped} cached")
+            else:
+                st.warning("No valid n_aug values to process")
+    
+    with col_btn_force:
+        if st.button("🔥 Force Reoptimize", key="tab1_force_optimize",
+                     help="Force recompute ALL optimizations (KNN k=1..Max k + all classifiers) even if cached"):
+            if n_aug_values:
+                with st.spinner(f"Force optimizing for n_aug = {n_aug_values}..."):
+                    computed = 0
+                    for n_aug_opt in n_aug_values:
+                        try:
+                            args.n_aug = int(n_aug_opt)
+                            # Ensure prototypes exist
+                            _compute_and_save_prototypes_with_naug(args, int(n_aug_opt), force_recompute=True)
+                            # Run optimization: tests KNN k=1..batch_k_max, all baselines, all prototype strategies
+                            best_k, best_mcc, mcc_curve, all_results = _optimize_k_for_args(args, 1, int(batch_k_max))
+                            # Save result with all classifier results (overwrites cache)
+                            _save_optimization_result(args, n_aug_opt, best_k, best_mcc, all_results)
+                            st.success(f"✅ n_aug={n_aug_opt}: {best_k} (MCC={best_mcc:.3f})")
+                            computed += 1
+                        except Exception as e:
+                            st.error(f"❌ n_aug={n_aug_opt} failed: {e}")
+                            import traceback
+                            st.code(traceback.format_exc())
+                st.success(f"💾 Done! Computed: {computed} optimizations")
+                st.rerun()
+            else:
+                st.warning("No valid n_aug values to process")
+
+    
+    # Display cached best scores for all n_aug values
+    cache = _load_optimization_cache(args)
+    if cache:
+        st.markdown("---")
+        st.markdown("**📊 Optimization Results Summary (Learned Embeddings):**")
+        st.caption("Results based on deep learning model embeddings. For raw pixel classification, see 'Raw Data Classification' section below.")
+        
+        # Find the absolute best across all n_aug values
+        best_overall = None
+        best_overall_mcc = -1
+        for n_aug_val, result in cache.items():
+            mcc = result.get('best_mcc', -1)
+            if mcc > best_overall_mcc:
+                best_overall_mcc = mcc
+                best_overall = (n_aug_val, result)
+        
+        # Display best overall result prominently
+        if best_overall:
+            n_aug_best, result_best = best_overall
+            best_k_str = str(result_best.get('best_k', '?'))
+            
+            # Extract strategy info
+            if isinstance(best_k_str, str) and best_k_str.startswith('protot_'):
+                parts = best_k_str.split('_')
+                strategy = parts[1] if len(parts) > 1 else 'unknown'
+                n_comp = parts[2] if len(parts) > 2 else '?'
+                approach_label = f"{strategy.upper()} Prototype (n_comp={n_comp})"
+            elif isinstance(best_k_str, str) and best_k_str.startswith('baseline_'):
+                baseline_name = best_k_str.replace('baseline_', '')
+                approach_label = BASELINE_DISPLAY_NAMES.get(baseline_name, baseline_name.upper())
+            else:
+                approach_label = f"KNN (k={best_k_str})"
+            
+            st.success(f"🏆 **Best Overall:** n_aug={n_aug_best} using {approach_label} → **MCC: {best_overall_mcc:.4f}**")
+            st.caption(f"Tested on: {result_best.get('timestamp', 'unknown')[:10]}")
+            
+            st.markdown("**Select plot to display:**")
+            plot_options = [
+                ("KNN", "knn"),
+                ("Prototypes KMEANS", "kmeans"),
+                ("Prototypes GMM", "gmm"),
+                ("Prototypes MEAN", "mean"),
+            ]
+            plot_labels = [x[0] for x in plot_options]
+            plot_keys = [x[1] for x in plot_options]
+            selected_plot = st.radio("Plot type", plot_labels, index=0, horizontal=True, key="knn_proto_plot_radio")
+            plot_idx = plot_labels.index(selected_plot)
+            plot_key = plot_keys[plot_idx]
+            
+            # Respect exactly the n_aug values entered by the user.
+            cache_by_int = {}
+            for k, v in cache.items():
+                try:
+                    cache_by_int[int(k)] = v
+                except Exception:
+                    continue
+
+            if n_aug_values:
+                filtered_cache = {k: cache_by_int[k] for k in n_aug_values if k in cache_by_int}
+                missing_n_aug = [k for k in n_aug_values if k not in cache_by_int]
+                if missing_n_aug:
+                    st.warning(f"No cached result for selected n_aug: {missing_n_aug}")
+            else:
+                filtered_cache = cache_by_int
+
+            if not filtered_cache:
+                st.info("No matching cached n_aug values to plot for current selection.")
+
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                if plot_key == "knn" and filtered_cache:
+                    plot_knn_mcc_curves(filtered_cache)
+                elif filtered_cache:
+                    plot_prototype_mcc_curves(filtered_cache, plot_key)
+        
+        # Show summary table: Best per model type (including all variants)
+        st.markdown("**Best Results per Model Type:**")
+        
+        # Aggregate best results per approach type across all n_aug values
+        # Pre-populate ALL model types (even if not tested)
+        approach_best = {}
+        
+        # Initialize KNN
+        approach_best['KNN'] = {
+            'Approach': 'KNN',
+            'MCC': -1,
+            'Details': 'Not tested',
+            'Date': '-',
+            'Is Best': False,
+            'Batch Entropy': np.nan,
+            'Batch NMI': np.nan,
+            'Batch ARI': np.nan
+        }
+        
+        # Initialize all prototype strategies
+        for strategy in ['mean', 'kmeans', 'gmm']:
+            approach_best[f"Prototype: {strategy.upper()}"] = {
+                'Approach': f"Prototype: {strategy.upper()}",
+                'MCC': -1,
+                'Details': 'Not tested',
+                'Date': '-',
+                'Is Best': False,
+                'Batch Entropy': np.nan,
+                'Batch NMI': np.nan,
+                'Batch ARI': np.nan
+            }
+        
+        # Initialize all baselines
+        for baseline_name, baseline_display in BASELINE_DISPLAY_NAMES.items():
+            approach_best[baseline_display] = {
+                'Approach': baseline_display,
+                'MCC': -1,
+                'Details': 'Not tested',
+                'Date': '-',
+                'Is Best': False,
+                'Batch Entropy': np.nan,
+                'Batch NMI': np.nan,
+                'Batch ARI': np.nan
+            }
+        
+        # Now populate with actual results from cache
+        for n_aug_val, result in cache.items():
+            timestamp = result.get('timestamp', 'unknown')
+            best_k_overall = result.get('best_k')
+            best_mcc_overall = result.get('best_mcc')
+            
+            # Check KNN from detailed results
+            knn_data = result.get('knn', {})
+            mcc_list = knn_data.get('mcc_per_k', [])
+            batch_effects_data = result.get('batch_effects', {})
+            if mcc_list:
+                # Handle both formats: list of dicts [{'k': 1, 'mcc': 0.5}, ...] or list of floats [0.5, 0.6, ...]
+                valid_mccs_with_k = []
+                for k_idx, item in enumerate(mcc_list):
+                    if isinstance(item, dict):
+                        # Dict format: {'k': 1, 'valid_mcc': 0.5, 'train_mcc': 0.5}
+                        mcc_val = item.get('valid_mcc')
+                        k_val = item.get('k', k_idx + 1)
+                        if mcc_val is not None and isinstance(mcc_val, (int, float)):
+                            valid_mccs_with_k.append((float(mcc_val), int(k_val)))
+                    elif isinstance(item, (int, float)) and item is not None:
+                        # Plain number format
+                        valid_mccs_with_k.append((float(item), k_idx + 1))
+                
+                if valid_mccs_with_k:
+                    best_knn_mcc, best_k = max(valid_mccs_with_k, key=lambda x: x[0])
+                    if best_knn_mcc > approach_best['KNN']['MCC']:
+                        # Extract batch metrics for this k
+                        batch_metrics = {'batch_entropy_norm': np.nan, 'batch_nmi': np.nan, 'batch_ari': np.nan}
+                        knn_batch_list = batch_effects_data.get('knn_per_k', [])
+                        for batch_item in knn_batch_list:
+                            if isinstance(batch_item, dict) and batch_item.get('k') == best_k:
+                                batch_metrics = {
+                                    'batch_entropy_norm': batch_item.get('batch_entropy_norm', np.nan),
+                                    'batch_nmi': batch_item.get('batch_nmi', np.nan),
+                                    'batch_ari': batch_item.get('batch_ari', np.nan)
+                                }
+                                break
+                        
+                        approach_best['KNN'] = {
+                            'Approach': 'KNN',
+                            'MCC': float(best_knn_mcc),
+                            'Details': f"k={best_k}, n_aug={n_aug_val}",
+                            'Date': timestamp[:10],
+                            'Is Best': False,
+                            'Batch Entropy': batch_metrics['batch_entropy_norm'],
+                            'Batch NMI': batch_metrics['batch_nmi'],
+                            'Batch ARI': batch_metrics['batch_ari']
+                        }
+            # Fallback: Check if best_k is a plain number (KNN was overall winner)
+            elif isinstance(best_k_overall, (int, float)) and best_mcc_overall is not None:
+                if float(best_mcc_overall) > approach_best['KNN']['MCC']:
+                    # Extract batch metrics for this k
+                    batch_metrics = {'batch_entropy_norm': np.nan, 'batch_nmi': np.nan, 'batch_ari': np.nan}
+                    knn_batch_list = batch_effects_data.get('knn_per_k', [])
+                    for batch_item in knn_batch_list:
+                        if isinstance(batch_item, dict) and batch_item.get('k') == int(best_k_overall):
+                            batch_metrics = {
+                                'batch_entropy_norm': batch_item.get('batch_entropy_norm', np.nan),
+                                'batch_nmi': batch_item.get('batch_nmi', np.nan),
+                                'batch_ari': batch_item.get('batch_ari', np.nan)
+                            }
+                            break
+                    
+                    approach_best['KNN'] = {
+                        'Approach': 'KNN',
+                        'MCC': float(best_mcc_overall),
+                        'Details': f"k={int(best_k_overall)}, n_aug={n_aug_val}",
+                        'Date': timestamp[:10],
+                        'Is Best': False,
+                        'Batch Entropy': batch_metrics['batch_entropy_norm'],
+                        'Batch NMI': batch_metrics['batch_nmi'],
+                        'Batch ARI': batch_metrics['batch_ari']
+                    }
+            
+            # Check all prototype strategies
+            proto_data = result.get('prototypes', {})
+            for strategy in ['mean', 'kmeans', 'gmm']:
+                strat_data = proto_data.get(strategy, {})
+                if strat_data and 'best_mcc' in strat_data:
+                    mcc_val = strat_data.get('best_mcc')
+                    best_n_comp = strat_data.get('best_n_components', '?')
+                    if mcc_val is not None and isinstance(mcc_val, (int, float)):
+                        approach_key = f"Prototype: {strategy.upper()}"
+                        if float(mcc_val) > approach_best[approach_key]['MCC']:
+                            # Extract batch metrics for this prototype strategy
+                            proto_batch_data = batch_effects_data.get('prototypes', {}).get(strategy, {})
+                            batch_metrics = {
+                                'batch_entropy_norm': proto_batch_data.get('batch_entropy_norm', np.nan),
+                                'batch_nmi': proto_batch_data.get('batch_nmi', np.nan),
+                                'batch_ari': proto_batch_data.get('batch_ari', np.nan)
+                            }
+                            
+                            approach_best[approach_key] = {
+                                'Approach': approach_key,
+                                'MCC': float(mcc_val),
+                                'Details': f"n_comp={best_n_comp}, n_aug={n_aug_val}",
+                                'Date': timestamp[:10],
+                                'Is Best': False,
+                                'Batch Entropy': batch_metrics['batch_entropy_norm'],
+                                'Batch NMI': batch_metrics['batch_nmi'],
+                                'Batch ARI': batch_metrics['batch_ari']
+                            }
+            
+            # Check all baselines
+            baseline_data = result.get('baselines', {})
+            for baseline_name, baseline_display in BASELINE_DISPLAY_NAMES.items():
+                b_data = baseline_data.get(baseline_name, {})
+                if b_data and 'mcc' in b_data:
+                    mcc_val = b_data.get('mcc')
+                    if mcc_val is not None and isinstance(mcc_val, (int, float)):
+                        if float(mcc_val) > approach_best[baseline_display]['MCC']:
+                            # Extract batch metrics for this baseline
+                            baseline_batch_data = batch_effects_data.get('baselines', {}).get(baseline_name, {})
+                            batch_metrics = {
+                                'batch_entropy_norm': baseline_batch_data.get('batch_entropy_norm', np.nan),
+                                'batch_nmi': baseline_batch_data.get('batch_nmi', np.nan),
+                                'batch_ari': baseline_batch_data.get('batch_ari', np.nan)
+                            }
+                            
+                            approach_best[baseline_display] = {
+                                'Approach': baseline_display,
+                                'MCC': float(mcc_val),
+                                'Details': f"n_aug={n_aug_val}",
+                                'Date': timestamp[:10],
+                                'Is Best': False,
+                                'Batch Entropy': batch_metrics['batch_entropy_norm'],
+                                'Batch NMI': batch_metrics['batch_nmi'],
+                                'Batch ARI': batch_metrics['batch_ari']
+                            }
+        
+        # Also check session state for recent optimization results (from "Optimize k on validation")
+        if 'optimized_k_value' in st.session_state and 'k_opt_best_mcc' in st.session_state:
+            session_k = st.session_state.get('optimized_k_value')
+            session_mcc = st.session_state.get('k_opt_best_mcc')
+            session_n_aug = getattr(args, 'n_aug', 1)
+            
+            # Get all results including batch_effects from session state
+            session_all_results = st.session_state.get('k_opt_proto_results', {})
+            
+            # Update KNN if session state has better result
+            if isinstance(session_k, int) and session_mcc is not None:
+                if float(session_mcc) > approach_best['KNN']['MCC']:
+                    # Extract batch metrics from session state
+                    session_batch_effects = session_all_results.get('batch_effects', {})
+                    knn_batch_list = session_batch_effects.get('knn_per_k', [])
+                    batch_metrics = {'batch_entropy_norm': np.nan, 'batch_nmi': np.nan, 'batch_ari': np.nan}
+                    for batch_item in knn_batch_list:
+                        if isinstance(batch_item, dict) and batch_item.get('k') == session_k:
+                            batch_metrics = {
+                                'batch_entropy_norm': batch_item.get('batch_entropy_norm', np.nan),
+                                'batch_nmi': batch_item.get('batch_nmi', np.nan),
+                                'batch_ari': batch_item.get('batch_ari', np.nan)
+                            }
+                            break
+                    
+                    approach_best['KNN'] = {
+                        'Approach': 'KNN',
+                        'MCC': float(session_mcc),
+                        'Details': f"k={session_k}, n_aug={session_n_aug}",
+                        'Date': 'Recent',
+                        'Is Best': False,
+                        'Batch Entropy': batch_metrics['batch_entropy_norm'],
+                        'Batch NMI': batch_metrics['batch_nmi'],
+                        'Batch ARI': batch_metrics['batch_ari']
+                    }
+            
+            # Check if session state has prototype results
+            if isinstance(session_all_results, dict):
+                proto_results = session_all_results.get('prototypes', {})
+                session_batch_effects = session_all_results.get('batch_effects', {})
+                for strategy in ['mean', 'kmeans', 'gmm']:
+                    result = proto_results.get(strategy, {})
+                    mcc_val = result.get('best_mcc')
+                    best_n_comp = result.get('best_n_components', '?')
+                    if mcc_val is not None and isinstance(mcc_val, (int, float)):
+                        approach_key = f"Prototype: {strategy.upper()}"
+                        if float(mcc_val) > approach_best[approach_key]['MCC']:
+                            # Extract batch metrics for this prototype strategy
+                            proto_batch_data = session_batch_effects.get('prototypes', {}).get(strategy, {})
+                            batch_metrics = {
+                                'batch_entropy_norm': proto_batch_data.get('batch_entropy_norm', np.nan),
+                                'batch_nmi': proto_batch_data.get('batch_nmi', np.nan),
+                                'batch_ari': proto_batch_data.get('batch_ari', np.nan)
+                            }
+                            
+                            approach_best[approach_key] = {
+                                'Approach': approach_key,
+                                'MCC': float(mcc_val),
+                                'Details': f"n_comp={best_n_comp}, n_aug={session_n_aug}",
+                                'Date': 'Recent',
+                                'Is Best': False,
+                                'Batch Entropy': batch_metrics['batch_entropy_norm'],
+                                'Batch NMI': batch_metrics['batch_nmi'],
+                                'Batch ARI': batch_metrics['batch_ari']
+                            }
+                
+                # Check baseline results from session state
+                baseline_results = session_all_results.get('baselines', {})
+                for baseline_name, baseline_display in BASELINE_DISPLAY_NAMES.items():
+                    b_data = baseline_results.get(baseline_name, {})
+                    if b_data and 'mcc' in b_data:
+                        mcc_val = b_data.get('mcc')
+                        if mcc_val is not None and isinstance(mcc_val, (int, float)):
+                            if float(mcc_val) > approach_best[baseline_display]['MCC']:
+                                # Extract batch metrics for this baseline
+                                baseline_batch_data = session_batch_effects.get('baselines', {}).get(baseline_name, {})
+                                batch_metrics = {
+                                    'batch_entropy_norm': baseline_batch_data.get('batch_entropy_norm', np.nan),
+                                    'batch_nmi': baseline_batch_data.get('batch_nmi', np.nan),
+                                    'batch_ari': baseline_batch_data.get('batch_ari', np.nan)
+                                }
+                                
+                                approach_best[baseline_display] = {
+                                    'Approach': baseline_display,
+                                    'MCC': float(mcc_val),
+                                    'Details': f"n_aug={session_n_aug}",
+                                    'Date': 'Recent',
+                                    'Is Best': False,
+                                    'Batch Entropy': batch_metrics['batch_entropy_norm'],
+                                    'Batch NMI': batch_metrics['batch_nmi'],
+                                    'Batch ARI': batch_metrics['batch_ari']
+                                }
+        
+        # Mark overall best
+        for approach_key in approach_best:
+            if approach_best[approach_key]['MCC'] > 0 and abs(approach_best[approach_key]['MCC'] - best_overall_mcc) < 1e-4:
+                approach_best[approach_key]['Is Best'] = '🏆'
+            else:
+                approach_best[approach_key]['Is Best'] = ''
+        
+        # Filter out models that were not tested (MCC = -1) and convert to DataFrame
+        tested_approaches = {k: v for k, v in approach_best.items() if v['MCC'] >= 0}
+        
+        if tested_approaches:
+            approach_df = pd.DataFrame(list(tested_approaches.values()))
+            approach_df = approach_df.sort_values('MCC', ascending=False)
+            st.dataframe(approach_df, use_container_width=True, hide_index=True)
+            st.caption(f"💾 Showing best result per model type from {len(cache)} cached optimization(s)")
+        else:
+            st.info("No model results available yet.")
+        
+        # Also show all n_aug configurations in expandable section
+        with st.expander("📋 View All N_Aug Configurations"):
+            cache_data = []
+            for n_aug_val, result in sorted(cache.items()):
+                best_k = result.get('best_k', '?')
+                mcc = result.get('best_mcc', 0)
+                
+                # Extract strategy
+                if isinstance(best_k, str) and best_k.startswith('protot_'):
+                    parts = best_k.split('_')
+                    strategy = parts[1] if len(parts) > 1 else 'unknown'
+                    approach = f"{strategy.upper()}"
+                elif isinstance(best_k, str) and best_k.startswith('baseline_'):
+                    baseline_name = best_k.replace('baseline_', '')
+                    approach = baseline_name.upper().replace('_', ' ')
+                else:
+                    approach = "KNN"
+                
+                is_best = (mcc == best_overall_mcc)
+                
+                cache_data.append({
+                    'N_Aug': n_aug_val,
+                    'Approach': approach,
+                    'Best K/Strategy': str(best_k),
+                    'MCC': float(mcc),
+                    'Is Best': '🏆' if is_best else '',
+                    'Date': result.get('timestamp', 'unknown')[:10]
+                })
+            
+            cache_df = pd.DataFrame(cache_data)
+            cache_df = cache_df.sort_values('MCC', ascending=False)
+            st.dataframe(cache_df, use_container_width=True, hide_index=True)
+        
+        # Show detailed results for ALL models/approaches across all n_aug
+        with st.expander("🔍 View All Models/Approaches (Detailed Results)"):
+            all_models_data = []
+            
+            for n_aug_val in sorted(cache.keys()):
+                result = cache[n_aug_val]
+                batch_effects = result.get('batch_effects', {})
+                
+                # KNN results (all k values tested)
+                knn_data = result.get('knn', {})
+                mcc_per_k = knn_data.get('mcc_per_k', [])
+                knn_batch_by_k = {
+                    int(item.get('k')): item
+                    for item in batch_effects.get('knn_per_k', [])
+                    if isinstance(item, dict) and item.get('k') is not None
+                }
+                for k_idx, item in enumerate(mcc_per_k):
+                    if isinstance(item, dict):
+                        mcc_val = item.get('valid_mcc')
+                        k_val = item.get('k', k_idx + 1)
+                    else:
+                        mcc_val = item
+                        k_val = k_idx + 1
+                    if isinstance(mcc_val, (int, float)):
+                        bm = knn_batch_by_k.get(int(k_val), {})
+                        all_models_data.append({
+                            'N_Aug': n_aug_val,
+                            'Model Type': 'KNN',
+                            'Configuration': f'k={int(k_val)}',
+                            'MCC': float(mcc_val),
+                            'Batch Entropy': bm.get('batch_entropy_norm', np.nan),
+                            'Batch NMI': bm.get('batch_nmi', np.nan),
+                            'Batch ARI': bm.get('batch_ari', np.nan),
+                            'Date': result.get('timestamp', 'unknown')[:10]
+                        })
+                
+                # Prototype results (all strategies and components)
+                proto_data = result.get('prototypes', {})
+                for strategy in ['mean', 'kmeans', 'gmm']:
+                    strat_data = proto_data.get(strategy, {})
+                    if strat_data:
+                        proto_bm = batch_effects.get('prototypes', {}).get(strategy, {})
+                        per_components = strat_data.get('per_components', [])
+                        if not per_components:
+                            per_components = strat_data.get('mcc_per_n_components', [])
+                        for comp_info in per_components:
+                            if isinstance(comp_info, dict):
+                                n_comp = comp_info.get('n_components', '?')
+                                mcc_val = comp_info.get('mcc', 0)
+                                all_models_data.append({
+                                    'N_Aug': n_aug_val,
+                                    'Model Type': f'{strategy.upper()} Prototype',
+                                    'Configuration': f'n_comp={n_comp}',
+                                    'MCC': float(mcc_val),
+                                    'Batch Entropy': proto_bm.get('batch_entropy_norm', np.nan),
+                                    'Batch NMI': proto_bm.get('batch_nmi', np.nan),
+                                    'Batch ARI': proto_bm.get('batch_ari', np.nan),
+                                    'Date': result.get('timestamp', 'unknown')[:10]
+                                })
+                
+                # Baseline results
+                baseline_data = result.get('baselines', {})
+                for baseline_name in BASELINE_DISPLAY_NAMES.keys():
+                    b_data = baseline_data.get(baseline_name, {})
+                    if b_data and 'mcc' in b_data:
+                        base_bm = batch_effects.get('baselines', {}).get(baseline_name, {})
+                        all_models_data.append({
+                            'N_Aug': n_aug_val,
+                            'Model Type': BASELINE_DISPLAY_NAMES.get(baseline_name, baseline_name.upper()),
+                            'Configuration': '-',
+                            'MCC': float(b_data.get('mcc', 0)),
+                            'Batch Entropy': base_bm.get('batch_entropy_norm', np.nan),
+                            'Batch NMI': base_bm.get('batch_nmi', np.nan),
+                            'Batch ARI': base_bm.get('batch_ari', np.nan),
+                            'Date': result.get('timestamp', 'unknown')[:10]
+                        })
+            
+            if all_models_data:
+                all_models_df = pd.DataFrame(all_models_data)
+                all_models_df = all_models_df.sort_values(['MCC', 'Model Type'], ascending=[False, True])
+                st.dataframe(all_models_df, use_container_width=True, hide_index=True)
+                st.caption(f"📊 Showing {len(all_models_data)} total configurations across {len(cache)} n_aug value(s)")
+            else:
+                st.info("No detailed model data available yet.")
+        
+    # Create visualization: Best MCC per model type (across all n_aug values)
+    if len(cache) > 0:
+        st.markdown("---")
+        st.markdown("**📈 Best Performance per Model (Optimal N_Aug) - Using Learned Embeddings:**")
+        st.caption("These results use embeddings from the trained deep learning model, not raw pixel data.")
+        col_perf, col_empty = st.columns(2)
+        with col_perf:
+            fig_naug, ax_naug = plt.subplots(figsize=(12, 7))
+            color_map = CLASSIFIER_COLORS
+            model_types = ['knn', 'mean', 'kmeans', 'gmm'] + sorted(BASELINE_DISPLAY_NAMES.keys())
+            model_best = {}
+            for model_type in model_types:
+                best_mcc = -1
+                best_n_aug = None
+                for n_aug_val in cache.keys():
+                    result = cache[n_aug_val]
+                    mcc = None
+                    if model_type == 'knn':
+                        knn_data = result.get('knn', {})
+                        mcc_list = knn_data.get('mcc_per_k', [])
+                        if mcc_list and isinstance(mcc_list, list):
+                            valid_mccs = []
+                            for item in mcc_list:
+                                if isinstance(item, dict):
+                                    mcc_val = item.get('valid_mcc')
+                                    if mcc_val is not None and isinstance(mcc_val, (int, float)):
+                                        valid_mccs.append(float(mcc_val))
+                                elif isinstance(item, (int, float)) and item is not None:
+                                    valid_mccs.append(float(item))
+                            if valid_mccs:
+                                mcc = max(valid_mccs)
+                    elif model_type in ['mean', 'kmeans', 'gmm']:
+                        proto_data = result.get('prototypes', {})
+                        strat_data = proto_data.get(model_type, {})
+                        if strat_data and 'best_mcc' in strat_data:
+                            mcc_val = strat_data.get('best_mcc')
+                            if mcc_val is not None and isinstance(mcc_val, (int, float)):
+                                mcc = float(mcc_val)
+                    else:
+                        baseline_data = result.get('baselines', {})
+                        b_data = baseline_data.get(model_type, {})
+                        if b_data and 'mcc' in b_data:
+                            mcc_val = b_data.get('mcc')
+                            if mcc_val is not None and isinstance(mcc_val, (int, float)):
+                                mcc = float(mcc_val)
+                    if mcc is not None and mcc > best_mcc:
+                        best_mcc = mcc
+                        best_n_aug = n_aug_val
+                model_best[model_type] = {
+                    'mcc': best_mcc if best_mcc >= 0 else 0,
+                    'n_aug': best_n_aug
+                }
+            labels = []
+            mccs = []
+            colors = []
+            n_aug_labels = []
+            for model_type in model_types:
+                best_info = model_best[model_type]
+                mccs.append(best_info['mcc'])
+                n_aug_labels.append(f"n_aug={best_info['n_aug']}" if best_info['n_aug'] is not None else "N/A")
+                colors.append(color_map.get(model_type, '#95a5a6'))
+                if model_type == 'knn':
+                    labels.append('KNN')
+                elif model_type in ['mean', 'kmeans', 'gmm']:
+                    labels.append(f'{model_type.capitalize()}\nPrototype')
+                else:
+                    labels.append(BASELINE_DISPLAY_SHORT.get(model_type, model_type.upper()))
+            x = np.arange(len(labels))
+            bars = ax_naug.bar(x, mccs, color=colors, alpha=0.85, edgecolor='black', linewidth=1.2)
+            for i, (bar, mcc, n_aug_label) in enumerate(zip(bars, mccs, n_aug_labels)):
+                height = bar.get_height()
+                y_offset = 0.01 if height >= 0 else -0.01
+                v_align = 'bottom' if height >= 0 else 'top'
+                ax_naug.text(bar.get_x() + bar.get_width()/2., height,
+                           f'{mcc:.3f}\n{n_aug_label}',
+                           ha='center', va=v_align, fontsize=9, fontweight='bold')
+            ax_naug.set_xticks(x)
+            ax_naug.set_xticklabels(labels, fontsize=10, rotation=45, ha='right')
+            ax_naug.set_xlabel('Model Type', fontsize=12, fontweight='bold')
+            ax_naug.set_ylabel('Best MCC Score', fontsize=12, fontweight='bold')
+            ax_naug.set_title('Model Comparison: Best MCC Achieved (with Optimal N_Aug)', fontsize=13, fontweight='bold')
+            if mccs:
+                y_min = min(mccs)
+                y_max = max(mccs)
+                if y_min == y_max:
+                    pad = 0.1 if y_max == 0 else abs(y_max) * 0.15
+                else:
+                    pad = (y_max - y_min) * 0.15
+                ax_naug.set_ylim([y_min - pad, y_max + pad])
+            else:
+                ax_naug.set_ylim([-0.1, 1.05])
+            ax_naug.grid(True, alpha=0.3, axis='y')
+            plt.tight_layout()
+            st.pyplot(fig_naug, use_container_width=True)
+            plt.close(fig_naug)
+        with col_empty:
+            pass
+    else:
+        # Single KNN Mode: simplified interface
+        st.info("ℹ️ **Single KNN Mode** - Running one-shot optimization on current settings")
+    
+    # Raw Data Analysis Section (shown regardless of mode)
+    # ============================================
+    # Second visualization: Best Performance per Model (with Raw Data)
+    st.markdown("---")
+    st.markdown("### 🖼️ Raw Pixel Data Classification")
+    st.markdown("**📊 Best Performance per Model (Raw Data - No Embeddings):**")
+    st.caption("This section tests classifiers directly on raw pixel values, bypassing the deep learning model.")
+    
+    # ---- Raw Data Computation Options ---- #
+    st.markdown("**⚙️ Raw Data Options:**")
+    raw_opt_cols = st.columns([2, 2, 2, 2])
+
+    with raw_opt_cols[0]:
+        include_knn = st.checkbox(
+            "Include KNN",
+            value=st.session_state.get('raw_include_knn', True),
+            key="raw_include_knn_checkbox",
+            help="Test KNN classifier (k=1-20)"
+        )
+        st.session_state['raw_include_knn'] = include_knn
+
+    with raw_opt_cols[1]:
+        include_proto = st.checkbox(
+            "Include Prototypes",
+            value=st.session_state.get('include_prototypes', True),
+            key="raw_include_proto_checkbox",
+            help="Test mean/kmeans/gmm prototype strategies"
+        )
+        st.session_state['include_prototypes'] = include_proto
+
+    with raw_opt_cols[2]:
+        include_baseline = st.checkbox(
+            "Include Baselines",
+            value=st.session_state.get('include_baselines', True),
+            key="raw_include_baseline_checkbox",
+            help="Test 10 baseline classifiers (LogReg, NB, SVC, etc.)"
+        )
+        st.session_state['include_baselines'] = include_baseline
+
+    with raw_opt_cols[3]:
+        raw_n_aug_input = st.text_input(
+            "Raw N_Aug values",
+            value=st.session_state.get('raw_n_aug_input', "0"),
+            key="raw_n_aug_input",
+            help="Comma-separated n_aug values to test, e.g. 0,1,10"
+        )
+
+    # Parse raw n_aug values
+    try:
+        raw_n_aug_values = sorted(set(int(x.strip()) for x in str(raw_n_aug_input).split(",") if x.strip()))
+        if any(v < 0 for v in raw_n_aug_values):
+            st.error("Raw N_Aug values must be non-negative integers")
+            raw_n_aug_values = []
+        elif raw_n_aug_values:
+            st.success(f"✅ Raw n_aug values to test: {raw_n_aug_values}")
+        else:
+            st.warning("Please enter at least one raw n_aug value")
+    except ValueError:
+        st.error("Invalid Raw N_Aug input. Example: 0,1,10")
+        raw_n_aug_values = []
+
+    # Advanced Options Section
+    with st.expander("⚙️ Advanced Model Options", expanded=False):
+        st.markdown("**Model Selection:**")
+        model_options = [
+            'knn', 'mean', 'kmeans', 'gmm',
+            'decision_tree', 'gradient_boosting', 'lda', 'linear_svc', 'svc',
+            'logreg', 'naive_bayes', 'qda', 'random_forest', 'ridge'
+        ]
+        model_display_names = {
+            'knn': 'KNN',
+            'mean': 'Mean Prototype',
+            'kmeans': 'KMeans Prototype',
+            'gmm': 'GMM Prototype',
+            'decision_tree': 'Decision Tree',
+            'gradient_boosting': 'Gradient Boosting',
+            'lda': 'LDA',
+            'linear_svc': 'Linear SVC',
+            'svc': 'SVC',
+            'logreg': 'Logistic Regression',
+            'naive_bayes': 'Naive Bayes',
+            'qda': 'QDA',
+            'random_forest': 'Random Forest',
+            'ridge': 'Ridge Classifier'
+        }
+        # Use session_state to track selected models
+        if 'advanced_selected_models' not in st.session_state:
+            # Default to KNN and basic classifiers for first use
+            st.session_state['advanced_selected_models'] = ['knn', 'logreg', 'ridge', 'naive_bayes']
+        selected_models = st.session_state['advanced_selected_models']
+        # Render model selection as checkboxes
+        checkbox_cols = st.columns(4)
+        for idx, model in enumerate(model_options):
+            col = checkbox_cols[idx % 4]
+            is_selected = model in selected_models
+            checked = col.checkbox(model_display_names.get(model, model), value=is_selected, key=f"model_checkbox_{model}")
+            if checked and not is_selected:
+                selected_models.append(model)
+            elif not checked and is_selected:
+                selected_models.remove(model)
+        st.session_state['advanced_selected_models'] = selected_models.copy()
+        # Show selected models as chips
+        if selected_models:
+            st.markdown("Selected: " + ", ".join([model_display_names.get(m, m) for m in selected_models]))
+        else:
+            st.markdown("No models selected.")
+
+        # ...existing code...
+    # Render hyperparameter menus for each selected model after the Advanced Model Options menu
+    from otitenet.app.classifier_param_ui import (
+        random_forest_params_ui,
+        knn_params_ui,
+        logreg_params_ui,
+        ridge_params_ui,
+        naive_bayes_params_ui,
+        mean_prototype_params_ui,
+        kmeans_prototype_params_ui,
+        gmm_prototype_params_ui,
+        decision_tree_params_ui,
+        gradient_boosting_params_ui,
+        lda_params_ui,
+        linear_svc_params_ui,
+        svc_params_ui,
+        qda_params_ui
+    )
+    classifier_params = {}
+    for model in selected_models:
+        with st.expander(f"Advanced Options for {model_display_names.get(model, model)}", expanded=False):
+            params = None
+            type_map = None
+            if model == 'knn':
+                params = knn_params_ui()
+                type_map = {'n_neighbors': int}
+            elif model == 'mean':
+                params = mean_prototype_params_ui()
+            elif model == 'kmeans':
+                params = kmeans_prototype_params_ui()
+            elif model == 'gmm':
+                params = gmm_prototype_params_ui()
+            elif model == 'decision_tree':
+                params = decision_tree_params_ui()
+                type_map = {'max_depth': int, 'min_samples_split': int, 'min_samples_leaf': int, 'max_features': str}
+            elif model == 'gradient_boosting':
+                params = gradient_boosting_params_ui()
+                type_map = {'n_estimators': int, 'learning_rate': float, 'max_depth': int}
+            elif model == 'lda':
+                params = lda_params_ui()
+            elif model == 'linear_svc':
+                params = linear_svc_params_ui()
+                type_map = {'max_iter': int}
+            elif model == 'svc':
+                params = svc_params_ui()
+                type_map = {'max_iter': int}
+            elif model == 'logreg':
+                params = logreg_params_ui()
+                type_map = {'logreg_max_iter': int, 'C': float}
+            elif model == 'naive_bayes':
+                params = naive_bayes_params_ui()
+                type_map = {'var_smoothing': float}
+            elif model == 'qda':
+                params = qda_params_ui()
+                type_map = {'reg_param': float}
+            elif model == 'random_forest':
+                params = random_forest_params_ui()
+                type_map = {'n_estimators': int, 'max_depth': int, 'min_samples_split': int, 'min_samples_leaf': int, 'max_features': str, 'random_state': int}
+            elif model == 'ridge':
+                params = ridge_params_ui()
+                type_map = {'alpha': float}
+            # Convert param values to correct types if type_map is provided
+            if params:
+                typed_params = {}
+                for k, v in params.items():
+                    if type_map and k in type_map:
+                        try:
+                            typed_params[k] = type_map[k](v) if v != '' else None
+                        except Exception:
+                            typed_params[k] = v
+                    else:
+                        typed_params[k] = v
+                # Force number of prototypes to be a string entry if present
+                for proto_key in ['n_prototypes', 'num_prototypes', 'n_components', 'prototype_components']:
+                    if proto_key in typed_params:
+                        typed_params[proto_key] = str(typed_params[proto_key])
+                
+                # Extract special parameters that need to be at top level for classifiers.py
+                # (e.g., max_iter for various classifiers, kernel for SVC, etc.)
+                if model == 'logreg' and 'logreg_max_iter' in typed_params:
+                    classifier_params['logreg_max_iter'] = typed_params.pop('logreg_max_iter')
+                elif model == 'svc':
+                    if 'max_iter' in typed_params:
+                        classifier_params['svc_max_iter'] = typed_params.pop('max_iter')
+                    if 'kernel' in typed_params:
+                        classifier_params['svc_kernel'] = typed_params.pop('kernel')
+                elif model == 'linear_svc' and 'max_iter' in typed_params:
+                    classifier_params['linearsvc_max_iter'] = typed_params.pop('max_iter')
+                elif model == 'random_forest':
+                    if 'n_estimators' in typed_params:
+                        classifier_params['rfc_n_estimators'] = typed_params.pop('n_estimators')
+                    # Remove random_state as classifiers.py hardcodes it to 1
+                    typed_params.pop('random_state', None)
+                elif model == 'gradient_boosting':
+                    if 'n_estimators' in typed_params:
+                        classifier_params['gbc_n_estimators'] = typed_params.pop('n_estimators')
+                    
+                classifier_params[f'{model}_params'] = typed_params
+
+    # Example: Split comma-separated values for grid search
+    def get_grid_search_param_combinations(params_dict, type_map=None):
+        """
+        Given a dict of param_name: str_value (comma-separated),
+        return a dict of param_name: list of values for grid search, converting to correct types if type_map is provided.
+        type_map: dict of param_name: type (e.g., int, float, str)
+        """
+        grid_params = {}
+        for k, v in params_dict.items():
+            vals = [s.strip() for s in v.split(',') if s.strip()]
+            if type_map and k in type_map:
+                try:
+                    grid_params[k] = [type_map[k](x) for x in vals]
+                except Exception:
+                    grid_params[k] = vals
+            else:
+                grid_params[k] = vals
+        return grid_params
+
+    # Example usage for grid search:
+    # type_map = {'n_neighbors': int, 'max_depth': int, 'learning_rate': float, ...}
+    # param_grid = get_grid_search_param_combinations(params_dict, type_map)
+
+    
+    col_raw_info, col_raw_btn = st.columns([3, 1])
+    
+    with col_raw_info:
+        st.info("ℹ️ This section compares classifier performance on raw image data (no learned embeddings).")
+    
+    # Helpers for raw-data model caching
+    def _raw_cache_dir(local_args):
+        try:
+            ds_name = os.path.basename(str(getattr(local_args, 'path', './data')).rstrip('/'))
+            nsize = ensure_int(getattr(local_args, 'new_size', None))
+            base = os.path.join('logs', 'raw_data', ds_name)
+            if nsize:
+                base = os.path.join(base, f"size_{nsize}")
+            os.makedirs(base, exist_ok=True)
+            return base
+        except Exception:
+            return os.path.join('logs', 'raw_data')
+
+    def _save_baseline_models(cache_dir, baselines_dict):
+        """Save baseline classifiers as they become available."""
+        for name, data_b in baselines_dict.items():
+            try:
+                clf = data_b.get('classifier')
+                if clf is not None:
+                    outp = os.path.join(cache_dir, f"baseline_{name}.joblib")
+                    joblib.dump(clf, outp)
+            except Exception as e:
+                st.warning(f"Could not save baseline {name}: {e}")
+
+    def _save_knn_model(cache_dir, train_raw, train_labels, best_k_val):
+        """Fit and save KNN model immediately."""
+        try:
+            if best_k_val is not None:
+                knn = fit_knn_classifier(train_raw, train_labels, n_neighbors=int(best_k_val))
+                outp_knn = os.path.join(cache_dir, f"knn_k{int(best_k_val)}.joblib")
+                joblib.dump(knn, outp_knn)
+                return outp_knn
+        except Exception as e:
+            st.warning(f"Could not save KNN: {e}")
+        return None
+
+    def _save_raw_summary(cache_dir, n_aug, knn_results, baseline_results, proto_results, batch_effects=None):
+        """Save raw-data results under a given n_aug key."""
+        try:
+            pkl = os.path.join(cache_dir, 'raw_results.pkl')
+
+            if os.path.exists(pkl):
+                with open(pkl, 'rb') as fh:
+                    full_cache = pickle.load(fh)
+            else:
+                full_cache = {}
+
+            # Backward compatibility: if old cache format is flat, wrap it
+            if not isinstance(full_cache, dict) or any(k in full_cache for k in ['knn', 'baselines', 'prototypes']):
+                full_cache = {}
+
+            full_cache[int(n_aug)] = {
+                'timestamp': datetime.now().isoformat(),
+                'n_aug': int(n_aug),
+                'knn': knn_results or {},
+                'baselines': {k: {'mcc': v.get('mcc')} for k, v in (baseline_results or {}).items()},
+                'prototypes': proto_results or {},
+                'batch_effects': batch_effects or {},
+            }
+
+            with open(pkl, 'wb') as fh:
+                pickle.dump(full_cache, fh)
+
+        except Exception as save_exc:
+            st.warning(f"Could not save raw results summary: {save_exc}")
+
+    def _get_progress_file(cache_dir):
+        """Path to progress checkpoint file."""
+        return os.path.join(cache_dir, '.progress.pkl')
+
+    def _save_progress(cache_dir, stage, data):
+        """Save progress checkpoint for resumable computation."""
+        try:
+            with open(_get_progress_file(cache_dir), 'wb') as fh:
+                pickle.dump({'stage': stage, **data}, fh)
+        except Exception:
+            pass
+
+    def _clear_progress(cache_dir):
+        """Clear progress checkpoint when computation completes."""
+        try:
+            prog_file = _get_progress_file(cache_dir)
+            if os.path.exists(prog_file):
+                os.remove(prog_file)
+        except Exception:
+            pass
+
+    def _load_raw_results(cache_dir):
+        try:
+            pkl = os.path.join(cache_dir, 'raw_results.pkl')
+            if os.path.exists(pkl):
+                with open(pkl, 'rb') as fh:
+                    cache = pickle.load(fh)
+
+                # Convert legacy flat format to empty or wrapped form
+                if isinstance(cache, dict) and any(k in cache for k in ['knn', 'baselines', 'prototypes']):
+                    cache = {
+                        0: {
+                            'timestamp': 'legacy',
+                            'n_aug': 0,
+                            'knn': cache.get('knn', {}),
+                            'baselines': cache.get('baselines', {}),
+                            'prototypes': cache.get('prototypes', {}),
+                            'batch_effects': cache.get('batch_effects', {}),
+                        }
+                    }
+                return cache
+        except Exception as load_exc:
+            st.warning(f"Could not load raw results cache: {load_exc}")
+        return {}
+
+    with col_raw_btn:
+        do_skip = st.button("⚡ Optimize Raw (Skip Cached)", key="compute_raw_skip_cached_btn",
+                            help="Load cached raw results if available; otherwise compute and save")
+        do_force = st.button("🔥 Force Retrain Raw", key="compute_raw_force_btn",
+                             help="Recompute raw classifiers and overwrite cache/models")
+
+        if do_skip or do_force:
+            # Validate that models are selected
+            selected_models = st.session_state.get('advanced_selected_models', [])
+            if not selected_models:
+                st.error("❌ No models selected! Please select at least one model type (KNN, Baselines, or Prototypes) in the Advanced Model Options above.")
+                st.stop()
+
+            if not raw_n_aug_values:
+                st.error("❌ No valid raw n_aug values provided.")
+                st.stop()
+            
+            progress_placeholder = st.empty()
+            progress_bar = st.progress(0)
+            try:
+                cache_dir = _raw_cache_dir(args)
+                existing_cache = _load_raw_results(cache_dir)
+                all_run_results = {}
+                total_runs = len(raw_n_aug_values)
+
+                for run_idx, n_aug_raw in enumerate(raw_n_aug_values):
+                    run_label = f"({run_idx + 1}/{total_runs})"
+                    stage_idx = 0
+
+                    run_has_knn = 'knn' in selected_models and st.session_state.get('raw_include_knn', True)
+                    baseline_selected = [m for m in selected_models if m in BASELINE_DISPLAY_NAMES]
+                    run_has_baselines = bool(baseline_selected) and st.session_state.get('include_baselines', True)
+                    proto_selected = [m for m in selected_models if m in ['mean', 'kmeans', 'gmm']]
+                    run_has_prototypes = bool(proto_selected) and st.session_state.get('include_prototypes', True)
+                    stage_count = 2 + int(run_has_knn) + int(run_has_baselines) + int(run_has_prototypes)
+
+                    progress_placeholder.info(
+                        f"📦 Processing raw n_aug={n_aug_raw} {run_label} | stage {stage_idx}/{stage_count}: preparing"
+                    )
+                    progress_bar.progress(int(((run_idx + (stage_idx / stage_count)) / total_runs) * 100))
+
+                    if (not do_force) and int(n_aug_raw) in existing_cache:
+                        progress_placeholder.info(
+                            f"↩️ Using cached result for raw n_aug={n_aug_raw} {run_label}"
+                        )
+                        all_run_results[int(n_aug_raw)] = existing_cache[int(n_aug_raw)]
+                        progress_bar.progress(int((run_idx + 1) / total_runs * 100))
+                        continue
+
+                    progress_placeholder.info(
+                        f"📥 Loading model/data for raw n_aug={n_aug_raw} {run_label}"
+                    )
+                    _, _, _, _, _, data, unique_labels, unique_batches, _ = load_model_and_prototypes(args)
+                    stage_idx += 1
+                    progress_bar.progress(int(((run_idx + (stage_idx / stage_count)) / total_runs) * 100))
+
+                    train_raw = data['inputs']['train'].reshape(len(data['inputs']['train']), -1)
+                    valid_raw = data['inputs']['valid'].reshape(len(data['inputs']['valid']), -1)
+                    train_labels = data['labels']['train']
+                    valid_labels = data['labels']['valid']
+                    train_batches = np.asarray(data['batches']['train'])
+                    valid_batches = np.asarray(data['batches']['valid'])
+                    test_raw_data = data['inputs'].get('test', None)
+                    test_raw = test_raw_data.reshape(len(test_raw_data), -1) if test_raw_data is not None and len(test_raw_data) > 0 else np.empty((0, train_raw.shape[1]), dtype=train_raw.dtype)
+                    test_batches_data = data['batches'].get('test', None)
+                    test_batches = np.asarray(test_batches_data) if test_batches_data is not None else np.empty((0,), dtype=valid_batches.dtype)
+
+                    all_raw_parts = [arr for arr in [train_raw, valid_raw, test_raw] if isinstance(arr, np.ndarray) and arr.shape[0] > 0]
+                    all_batch_parts = [arr for arr in [train_batches, valid_batches, test_batches] if isinstance(arr, np.ndarray) and arr.shape[0] > 0]
+                    all_dataset_raw = np.concatenate(all_raw_parts, axis=0) if all_raw_parts else valid_raw
+                    all_dataset_batches = np.concatenate(all_batch_parts, axis=0) if all_batch_parts else valid_batches
+
+                    all_results_raw = {
+                        'baselines': {},
+                        'prototypes': {},
+                        'knn': {},
+                        'batch_effects': {'knn_per_k': [], 'baselines': {}, 'prototypes': {}}
+                    }
+
+                    if run_has_knn:
+                        progress_placeholder.info(
+                            f"🤖 Running KNN for raw n_aug={n_aug_raw} {run_label}"
+                        )
+                        best_k_knn, best_mcc_knn, mcc_per_k = evaluate_knn_with_k_search(
+                            train_raw, train_labels, valid_raw, valid_labels, min_k=1, max_k=20
+                        )
+                        all_results_raw['knn'] = {'best_k': best_k_knn, 'best_mcc': best_mcc_knn, 'mcc_per_k': mcc_per_k}
+
+                        max_k_eff = min(20, int(train_raw.shape[0]))
+                        for k in range(1, max_k_eff + 1):
+                            try:
+                                knn_model = fit_knn_classifier(train_raw, train_labels, n_neighbors=k, metric='minkowski')
+                                knn_preds = knn_model.predict(all_dataset_raw)
+                                metrics_k = _compute_batch_effect_from_predictions(knn_preds, all_dataset_batches)
+                                all_results_raw['batch_effects']['knn_per_k'].append({'k': int(k), **metrics_k})
+                            except Exception:
+                                continue
+                        _save_knn_model(cache_dir, train_raw, train_labels, best_k_knn)
+                        stage_idx += 1
+                        progress_bar.progress(int(((run_idx + (stage_idx / stage_count)) / total_runs) * 100))
+
+                    if run_has_baselines:
+                        progress_placeholder.info(
+                            f"🧪 Running baselines ({', '.join(baseline_selected)}) for raw n_aug={n_aug_raw} {run_label}"
+                        )
+                        baseline_classifier_params = {}
+                        for model in baseline_selected:
+                            params_key = f"{model}_params"
+                            if params_key in classifier_params:
+                                baseline_classifier_params[params_key] = classifier_params[params_key]
+                            if model == 'logreg' and 'logreg_max_iter' in classifier_params:
+                                baseline_classifier_params['logreg_max_iter'] = classifier_params['logreg_max_iter']
+                            elif model == 'svc':
+                                if 'svc_max_iter' in classifier_params:
+                                    baseline_classifier_params['svc_max_iter'] = classifier_params['svc_max_iter']
+                                if 'svc_kernel' in classifier_params:
+                                    baseline_classifier_params['svc_kernel'] = classifier_params['svc_kernel']
+                            elif model == 'linear_svc' and 'linearsvc_max_iter' in classifier_params:
+                                baseline_classifier_params['linearsvc_max_iter'] = classifier_params['linearsvc_max_iter']
+                            elif model == 'random_forest' and 'rfc_n_estimators' in classifier_params:
+                                baseline_classifier_params['rfc_n_estimators'] = classifier_params['rfc_n_estimators']
+                            elif model == 'gradient_boosting' and 'gbc_n_estimators' in classifier_params:
+                                baseline_classifier_params['gbc_n_estimators'] = classifier_params['gbc_n_estimators']
+
+                        baseline_results = evaluate_baseline_classifiers(
+                            train_raw,
+                            train_labels,
+                            valid_raw,
+                            valid_labels,
+                            progress_placeholder,
+                            baseline_classifier_params
+                        )
+                        all_results_raw['baselines'] = {k: v for k, v in baseline_results.items() if k in baseline_selected}
+                        for baseline_name, baseline_data in all_results_raw['baselines'].items():
+                            clf_obj = baseline_data.get('classifier', None) if isinstance(baseline_data, dict) else None
+                            if clf_obj is None:
+                                continue
+                            try:
+                                baseline_preds = clf_obj.predict(all_dataset_raw)
+                                all_results_raw['batch_effects']['baselines'][baseline_name] = _compute_batch_effect_from_predictions(
+                                    baseline_preds, all_dataset_batches
+                                )
+                            except Exception:
+                                continue
+                        _save_baseline_models(cache_dir, all_results_raw['baselines'])
+                        stage_idx += 1
+                        progress_bar.progress(int(((run_idx + (stage_idx / stage_count)) / total_runs) * 100))
+
+                    if run_has_prototypes:
+                        progress_placeholder.info(
+                            f"🧬 Running prototypes ({', '.join(proto_selected)}) for raw n_aug={n_aug_raw} {run_label}"
+                        )
+                        proto_results = optimize_prototype_components(
+                            train_raw, train_labels, valid_raw, valid_labels,
+                            strategies=proto_selected,
+                            max_components=10
+                        )
+                        all_results_raw['prototypes'] = {k: v for k, v in proto_results.items() if k in proto_selected}
+                        for strategy_name, strategy_data in all_results_raw['prototypes'].items():
+                            if not isinstance(strategy_data, dict):
+                                continue
+                            best_n_components = strategy_data.get('best_n_components', None)
+                            if best_n_components is None:
+                                continue
+                            try:
+                                proto_dict = compute_prototypes_by_strategy(
+                                    train_raw,
+                                    train_labels,
+                                    strategy=strategy_name,
+                                    n_components=int(best_n_components),
+                                    random_state=1,
+                                )
+                                proto_vecs, proto_labels = flatten_prototype_dict(proto_dict)
+                                if proto_vecs.size == 0:
+                                    continue
+                                proto_knn = fit_knn_classifier(proto_vecs, proto_labels, n_neighbors=1, metric='minkowski')
+                                proto_preds = proto_knn.predict(all_dataset_raw)
+                                all_results_raw['batch_effects']['prototypes'][strategy_name] = _compute_batch_effect_from_predictions(
+                                    proto_preds, all_dataset_batches
+                                )
+                            except Exception:
+                                continue
+                        stage_idx += 1
+                        progress_bar.progress(int(((run_idx + (stage_idx / stage_count)) / total_runs) * 100))
+
+                    progress_placeholder.info(
+                        f"💾 Saving cache entry for raw n_aug={n_aug_raw} {run_label}"
+                    )
+                    _save_raw_summary(
+                        cache_dir=cache_dir,
+                        n_aug=n_aug_raw,
+                        knn_results=all_results_raw['knn'],
+                        baseline_results=all_results_raw['baselines'],
+                        proto_results=all_results_raw['prototypes'],
+                        batch_effects=all_results_raw['batch_effects'],
+                    )
+                    stage_idx += 1
+                    progress_bar.progress(int(((run_idx + (stage_idx / stage_count)) / total_runs) * 100))
+
+                    all_run_results[int(n_aug_raw)] = {
+                        'timestamp': datetime.now().isoformat(),
+                        'n_aug': int(n_aug_raw),
+                        **all_results_raw,
+                    }
+                    progress_bar.progress(int((run_idx + 1) / total_runs * 100))
+
+                _clear_progress(cache_dir)
+                st.session_state['raw_data_results'] = all_run_results
+                progress_placeholder.empty()
+                st.success("✅ Raw data classification complete for all requested n_aug values.")
+                st.rerun()
+
+            except Exception as e:
+                progress_placeholder.empty()
+                progress_bar.empty()
+                st.error(f"❌ Error computing raw data metrics: {e}")
+                st.error(traceback.format_exc())
+        
+        # Visualization for raw data results
+        # Visualization for raw data results
+        # Original single-run plot
+        fig_raw, ax_raw = plt.subplots(figsize=(6, 3.5))
+        cache = _load_raw_results(_raw_cache_dir(args))
+        model_types = ['knn', 'mean', 'kmeans', 'gmm'] + sorted(BASELINE_DISPLAY_NAMES.keys())
+        labels = []
+        mccs = []
+        colors = []
+        n_aug_labels = []
+        has_valid_mcc = False
+        if cache:
+            for model_type in model_types:
+                best_mcc = -1
+                best_n_aug = None
+                for n_aug, result in cache.items():
+                    mcc = None
+                    # Defensive: ensure result is a dict
+                    if not isinstance(result, dict):
+                        continue
+                    if model_type == 'knn':
+                        knn_data = result.get('knn', {})
+                        mcc_list = knn_data.get('mcc_per_k', [])
+                        if mcc_list:
+                            valid_mccs = [float(item.get('valid_mcc')) for item in mcc_list if isinstance(item, dict) and item.get('valid_mcc') is not None]
+                            if valid_mccs:
+                                mcc = max(valid_mccs)
+                        # fallback: try best_mcc
+                        if mcc is None:
+                            mcc = knn_data.get('best_mcc')
+                            if mcc is not None:
+                                mcc = float(mcc)
+                    elif model_type in ['mean', 'kmeans', 'gmm']:
+                        proto_data = result.get('prototypes', {})
+                        strat_data = proto_data.get(model_type, {})
+                        if strat_data and 'best_mcc' in strat_data:
+                            val = strat_data.get('best_mcc')
+                            if val is not None and isinstance(val, (int, float)):
+                                mcc = float(val)
+                    else:
+                        baseline_data = result.get('baselines', {})
+                        b_data = baseline_data.get(model_type, {})
+                        if b_data and 'mcc' in b_data:
+                            val = b_data.get('mcc')
+                            if val is not None and isinstance(val, (int, float)):
+                                mcc = float(val)
+                    if mcc is not None:
+                        has_valid_mcc = True
+                    if mcc is not None and mcc > best_mcc:
+                        best_mcc = mcc
+                        best_n_aug = n_aug
+                mccs.append(best_mcc if best_mcc > -1 else 0)
+                n_aug_labels.append(f"n_aug={best_n_aug}" if best_n_aug is not None else "n_aug=N/A")
+                colors.append(CLASSIFIER_COLORS.get(model_type, '#95a5a6'))
+                if model_type == 'knn':
+                    labels.append('KNN')
+                elif model_type in ['mean', 'kmeans', 'gmm']:
+                    labels.append(f'{model_type.capitalize()}\nPrototype')
+                else:
+                    labels.append(BASELINE_DISPLAY_SHORT.get(model_type, model_type.upper()))
+            x = np.arange(len(labels))
+            bars = ax_raw.bar(x, mccs, color=colors, alpha=0.85, edgecolor='black', linewidth=1.2)
+            for bar, mcc, n_aug_label in zip(bars, mccs, n_aug_labels):
+                height = bar.get_height()
+                if height > 0:
+                    ax_raw.text(
+                        bar.get_x() + bar.get_width()/2.,
+                        height,
+                        f'{mcc:.3f}\n{n_aug_label}',
+                        ha='center',
+                        va='bottom',
+                        fontsize=8,
+                        fontweight='bold'
+                    )
+                elif height < 0:
+                    ax_raw.text(
+                        bar.get_x() + bar.get_width()/2.,
+                        height,
+                        f'{mcc:.3f}\n{n_aug_label}',
+                        ha='center',
+                        va='top',
+                        fontsize=8,
+                        fontweight='bold'
+                    )
+            ax_raw.set_xticks(x)
+            ax_raw.set_xticklabels(labels, fontsize=10, rotation=45, ha='right')
+            ax_raw.set_xlabel('Model Type', fontsize=12, fontweight='bold')
+            ax_raw.set_ylabel('Best MCC Score', fontsize=12, fontweight='bold')
+            ax_raw.set_title('Model Comparison: Best MCC on Raw Data (Best per Model)', fontsize=13, fontweight='bold')
+            if mccs:
+                y_min = min(mccs)
+                y_max = max(mccs)
+                if y_min == y_max:
+                    pad = 0.1 if y_max == 0 else abs(y_max) * 0.15
+                else:
+                    pad = (y_max - y_min) * 0.15
+                ax_raw.set_ylim([y_min - pad, y_max + pad])
+            else:
+                ax_raw.set_ylim([-0.1, 0.2])
+            ax_raw.grid(True, alpha=0.3, axis='y')
+            # Show warning only when no valid MCC was found in cache at all
+            if not has_valid_mcc:
+                ax_raw.text(0.5, 0.5, 'Cache exists but no valid MCC scores found.\nCheck if optimization completed successfully.', 
+                           ha='center', va='center', fontsize=11, style='italic',
+                           transform=ax_raw.transAxes, color='red', alpha=0.7, 
+                           bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.3))
+        else:
+            ax_raw.text(0.5, 0.5, 'Raw Data Metrics\nNot Yet Computed\n\nClick "Compute Raw Data Metrics" to start', 
+                       ha='center', va='center', fontsize=14, fontweight='bold',
+                       transform=ax_raw.transAxes, color='gray', alpha=0.5)
+            ax_raw.set_xlim(0, 1)
+            ax_raw.set_ylim(0, 1)
+            ax_raw.axis('off')
+            ax_raw.set_title('Model Comparison: Best MCC on Raw Data', fontsize=13, fontweight='bold', pad=20)
+        plt.tight_layout()
+        st.pyplot(fig_raw, use_container_width=True)
+        plt.close(fig_raw)
+
+        # Additional multi-n_aug plot
+        fig_multi_naug, ax_multi_naug = plt.subplots(figsize=(7, 4))
+        cache = _load_raw_results(_raw_cache_dir(args))
+        n_aug_input = st.session_state.get('raw_n_aug_input', "0")
+        if isinstance(n_aug_input, int):
+            n_aug_values = [n_aug_input]
+        elif isinstance(n_aug_input, str):
+            n_aug_values = [int(x.strip()) for x in n_aug_input.split(',') if x.strip()]
+        else:
+            n_aug_values = []
+        model_types = ['knn', 'mean', 'kmeans', 'gmm'] + sorted(BASELINE_DISPLAY_NAMES.keys())
+        color_map = CLASSIFIER_COLORS
+        if cache and n_aug_values:
+            width = 0.8 / len(n_aug_values) if len(n_aug_values) > 1 else 0.6
+            x = np.arange(len(model_types))
+            has_valid_mcc_multi = False
+            for idx, n_aug in enumerate(n_aug_values):
+                result = cache.get(n_aug)
+                if not result:
+                    continue
+                mccs = []
+                for model_type in model_types:
+                    mcc = None
+                    if model_type == 'knn':
+                        knn_data = result.get('knn', {})
+                        mcc_list = knn_data.get('mcc_per_k', [])
+                        if mcc_list:
+                            valid_mccs = [float(item.get('valid_mcc')) for item in mcc_list if isinstance(item, dict) and item.get('valid_mcc') is not None]
+                            if valid_mccs:
+                                mcc = max(valid_mccs)
+                    elif model_type in ['mean', 'kmeans', 'gmm']:
+                        proto_data = result.get('prototypes', {})
+                        strat_data = proto_data.get(model_type, {})
+                        if strat_data and 'best_mcc' in strat_data:
+                            val = strat_data.get('best_mcc')
+                            if val is not None and isinstance(val, (int, float)):
+                                mcc = float(val)
+                    else:
+                        baseline_data = result.get('baselines', {})
+                        b_data = baseline_data.get(model_type, {})
+                        if b_data and 'mcc' in b_data:
+                            val = b_data.get('mcc')
+                            if val is not None and isinstance(val, (int, float)):
+                                mcc = float(val)
+                    if mcc is not None:
+                        has_valid_mcc_multi = True
+                    mccs.append(mcc if mcc is not None else 0)
+                bars = ax_multi_naug.bar(x + idx * width, mccs, width=width, color=[color_map.get(mt, '#95a5a6') for mt in model_types], alpha=0.85, edgecolor='black', linewidth=1.2, label=f'n_aug={n_aug}')
+                for bar, mcc in zip(bars, mccs):
+                    height = bar.get_height()
+                    if height > 0:  # Only show label if bar has height
+                        ax_multi_naug.text(bar.get_x() + bar.get_width()/2., height,
+                                   f'{mcc:.3f}',
+                                   ha='center', va='bottom', fontsize=8, fontweight='bold')
+            ax_multi_naug.set_xticks(x + width * (len(n_aug_values)-1)/2)
+            ax_multi_naug.set_xticklabels([BASELINE_DISPLAY_SHORT.get(mt, mt.upper()) if mt not in ['knn', 'mean', 'kmeans', 'gmm'] else (mt.capitalize() + ('\nPrototype' if mt in ['mean', 'kmeans', 'gmm'] else '')) for mt in model_types], fontsize=10, rotation=45, ha='right')
+            ax_multi_naug.set_xlabel('Model Type', fontsize=12, fontweight='bold')
+            ax_multi_naug.set_ylabel('Best MCC Score', fontsize=12, fontweight='bold')
+            ax_multi_naug.set_title('Model Comparison: Best MCC on Raw Data (Selected n_aug)', fontsize=13, fontweight='bold')
+            if ax_multi_naug.patches:
+                heights = [bar.get_height() for bar in ax_multi_naug.patches]
+                y_min = min(heights)
+                y_max = max(heights)
+                if y_min == y_max:
+                    pad = 0.1 if y_max == 0 else abs(y_max) * 0.15
+                else:
+                    pad = (y_max - y_min) * 0.15
+                ax_multi_naug.set_ylim([y_min - pad, y_max + pad])
+            else:
+                ax_multi_naug.set_ylim([-0.1, 0.2])
+            ax_multi_naug.grid(True, alpha=0.3, axis='y')
+            ax_multi_naug.legend()
+            # Show warning only when no valid MCC was found in cache at all
+            if not has_valid_mcc_multi:
+                ax_multi_naug.text(0.5, 0.5, 'Cache exists but no valid MCC scores found.\nCheck if optimization completed successfully.', 
+                           ha='center', va='center', fontsize=11, style='italic',
+                           transform=ax_multi_naug.transAxes, color='red', alpha=0.7, 
+                           bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.3))
+        else:
+            ax_multi_naug.text(0.5, 0.5, 'Raw Data Metrics\nNot Yet Computed\n\nSelect n_aug values and run computation', 
+                       ha='center', va='center', fontsize=14, fontweight='bold',
+                       transform=ax_multi_naug.transAxes, color='gray', alpha=0.5)
+            ax_multi_naug.set_xlim(0, 1)
+            ax_multi_naug.set_ylim(0, 1)
+            ax_multi_naug.axis('off')
+            ax_multi_naug.set_title('Model Comparison: Best MCC on Raw Data', fontsize=13, fontweight='bold', pad=20)
+        plt.tight_layout()
+        st.pyplot(fig_multi_naug, use_container_width=True)
+        plt.close(fig_multi_naug)
+        
+        # Additional visualization: Best Performance per Model Type (Raw Data) - similar to N_Aug version
+    
+    col_k_range, col_k_btn = st.columns([1, 1])
+    with col_k_range:
+        min_k = st.number_input("Min k", min_value=1, max_value=50, value=1, step=1, key="tab1_min_k")
+        max_k = st.number_input("Max k", min_value=2, max_value=200, value=20, step=1, key="tab1_max_k")
+        if max_k <= min_k:
+            st.warning("Max k must be greater than min k")
+    with col_k_btn:
+        if st.button("Optimize k on validation", key="tab1_optimize_k_button"):
+            if not n_aug_values:
+                st.error("No valid n_aug values specified")
+            else:
+                try:
+                    # Optimize for the first n_aug value in the list (for single optimization)
+                    n_aug_single = n_aug_values[0]
+                    args.n_aug = int(n_aug_single)
+                    
+                    # Ensure prototypes exist for this n_aug value
+                    with st.spinner(f"Ensuring prototypes exist for n_aug={n_aug_single}..."):
+                        _compute_and_save_prototypes_with_naug(args, int(n_aug_single), force_recompute=False)
+                    
+                    # Now run KNN optimization with the n_aug-specific prototypes
+                    best_k, best_mcc, mcc_curve, all_results = _optimize_k_for_args(args, int(min_k), int(max_k))
+                    # best_k is either an int (KNN k) or a string like "protot_kmeans_3"
+                    st.success(f"✅ Best approach = {best_k} (Validation MCC: {best_mcc:.3f})")
+                    
+                    # Save optimization result to cache with all classifier results
+                    _save_optimization_result(args, n_aug_single, best_k, best_mcc, all_results)
+                    st.info("💾 Result saved to optimization cache!")
+                    
+                    # Store result in a non-widget key and trigger rerun to apply it
+                    st.session_state['optimized_k_value'] = best_k  # Keep as original type (int or str)
+                    st.session_state['k_opt_best_mcc'] = float(best_mcc)
+                    st.session_state['k_opt_curve'] = mcc_curve
+                    st.session_state['k_opt_model_key'] = current_model_key
+                    st.session_state['k_opt_proto_results'] = all_results  # Store full results including batch_effects
+                    
+                    # Automatically apply the best result to sidebar
+                    if isinstance(best_k, int) or (isinstance(best_k, str) and best_k.isdigit()):
+                        # KNN is best
+                        st.session_state['k_opt_current_selection'] = {
+                            'type': 'knn',
+                            'k': int(best_k),
+                            'mcc': float(best_mcc)
+                        }
+                    else:
+                        # Prototype strategy is best (e.g., "protot_kmeans_3")
+                        parts = best_k.split('_')
+                        if len(parts) >= 3:
+                            strategy = parts[1]
+                            n_comp = int(parts[2])
+                            st.session_state['k_opt_current_selection'] = {
+                                'type': 'prototype',
+                                'strategy': strategy,
+                                'n_comp': n_comp,
+                                'mcc': float(best_mcc)
+                            }
+                    
+                    st.info("✅ Best result automatically applied! Check sidebar for details.")
+                except Exception as e:
+                    st.error(f"K optimization failed: {e}")
+    st.caption("Uses current sidebar model settings (dataset, size, normalize, etc.)")
+
+    if 'optimized_k_value' in st.session_state and 'k_opt_best_mcc' in st.session_state:
+        best_val = st.session_state['optimized_k_value']
+        mcc_val = st.session_state['k_opt_best_mcc']
+        msg = f"Last optimized: {best_val} (Validation MCC: {mcc_val:.3f})"
+        st.info(msg)
+        
+        # Display prototype strategy results
+        all_results = st.session_state.get('k_opt_proto_results', {})
+        proto_results = all_results.get('prototypes', {}) if isinstance(all_results, dict) else {}
+        baseline_results = all_results.get('baselines', {}) if isinstance(all_results, dict) else {}
+        
+        if proto_results or baseline_results:
+            st.markdown("**Classification Approaches Comparison:**")
+            
+            # Collect all results into one table
+            comparison_data = []
+            
+            # Add KNN result (from k optimization)
+            knn_mcc = st.session_state.get('k_opt_best_mcc')
+            best_k = st.session_state.get('optimized_k_value')
+            if knn_mcc is not None and best_k is not None:
+                comparison_data.append({
+                    'Approach': 'KNN',
+                    'Type': 'KNN',
+                    'MCC': float(knn_mcc),
+                    'Details': f'k={best_k}'
+                })
+            
+            # Add baseline results
+            for clf_name, result in baseline_results.items():
+                mcc_val = result.get('mcc')
+                if mcc_val is not None:
+                    comparison_data.append({
+                        'Approach': BASELINE_DISPLAY_NAMES.get(clf_name, clf_name.upper()),
+                        'Type': 'Baseline',
+                        'MCC': float(mcc_val),
+                        'Details': '-'
+                    })
+            
+            # Add prototype results
+            for strategy in ['mean', 'kmeans', 'gmm']:
+                result = proto_results.get(strategy, {})
+                mcc_val = result.get('best_mcc')
+                n_protos = result.get('n_prototypes', 0)
+                best_n_components = result.get('best_n_components')
+
+                # If best_mcc not computed yet, compute on-demand now
+                if mcc_val is None:
+                    try:
+                        best_info = _compute_best_proto_mcc_for_args(args, strategy, min_components=1, max_components=5)
+                        mcc_val = best_info.get('best_mcc')
+                        n_protos = best_info.get('n_prototypes', n_protos)
+                        best_n_components = best_info.get('best_n_components', best_n_components)
+                        # Persist the computed best into session to avoid recomputation
+                        proto_results[strategy] = best_info
+                        st.session_state['k_opt_proto_results'] = proto_results
+                    except Exception:
+                        mcc_val = None
+
+                if mcc_val is not None:
+                    comparison_data.append({
+                        'Approach': f'{strategy.upper()} Prototype',
+                        'Type': 'Prototype',
+                        'MCC': float(mcc_val),
+                        'Details': f'n_comp={best_n_components}, n_proto={n_protos}'
+                    })
+            
+            if comparison_data:
+                comparison_df = pd.DataFrame(comparison_data)
+                comparison_df = comparison_df.sort_values('MCC', ascending=False)
+                st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+                
+                # Create line plot comparing KNN curve with all strategies
+                mcc_curve = st.session_state.get('k_opt_curve', [])
+                if mcc_curve:
+                    fig_compare, ax_compare = plt.subplots(figsize=(6, 3.5))
+                    
+                    # Plot KNN curve
+                    curve_df = pd.DataFrame(mcc_curve)
+                    curve_df = curve_df.sort_values('k')
+                    ax_compare.plot(curve_df['k'], curve_df['mcc'], marker='o', linewidth=2.5, 
+                                   markersize=7, label='KNN', color='#e74c3c', zorder=3)
+                    
+                    # Plot prototype strategies
+                    colors = {'mean': '#3498db', 'kmeans': '#f39c12', 'gmm': '#2ecc71'}
+                    for strategy in ['mean', 'kmeans', 'gmm']:
+                        result = proto_results.get(strategy, {})
+                        per_components = result.get('per_components', [])
+                        if per_components:
+                            per_df = pd.DataFrame(per_components).sort_values('n_components')
+                            ax_compare.plot(per_df['n_components'], per_df['mcc'], marker='s', linewidth=2.5,
+                                          markersize=7, label=f'{strategy.capitalize()} Prototype', 
+                                          color=colors.get(strategy, '#95a5a6'), zorder=2)
+                    
+                    # Plot baseline classifiers as horizontal lines
+                    for clf_name, result in baseline_results.items():
+                        mcc_val = result.get('mcc')
+                        if mcc_val is not None:
+                            ax_compare.axhline(y=mcc_val, color=CLASSIFIER_COLORS.get(clf_name, '#95a5a6'),
+                                             linestyle=':', linewidth=2, alpha=0.7,
+                                             label=BASELINE_DISPLAY_SHORT.get(clf_name, clf_name), zorder=1)
+                    
+                    best_knn_mcc = st.session_state.get('k_opt_best_mcc', 0)
+                    ax_compare.axhline(y=best_knn_mcc, color='#e74c3c', linestyle='--', linewidth=1.5, 
+                                      alpha=0.6, zorder=1)
+                    
+                    ax_compare.set_xlabel('k (KNN) / n_components (Prototypes)', fontsize=12, fontweight='bold')
+                    ax_compare.set_ylabel('Validation MCC', fontsize=12, fontweight='bold')
+                    ax_compare.set_title('All Classification Approaches: MCC Comparison', fontsize=13, fontweight='bold')
+                    ax_compare.legend(loc='best', fontsize=10, framealpha=0.95, ncol=2)
+                    ax_compare.grid(True, alpha=0.3)
+                    ax_compare.set_ylim([min(curve_df['mcc'].min() - 0.05, min([r.get('best_mcc', 1) for r in proto_results.values() if r.get('best_mcc')]) - 0.05), 
+                                        min(1.0, max(curve_df['mcc'].max(), max([r.get('best_mcc', 0) for r in proto_results.values() if r.get('best_mcc')]) + 0.1))])
+                    
+                    plt.tight_layout()
+                    st.pyplot(fig_compare, use_container_width=True)
+                    plt.close(fig_compare)
+                
+                # Show detailed table
+                with st.expander("📊 Detailed Strategy Comparison"):
+                    st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+    if st.session_state.get('k_opt_curve') and st.session_state.get('k_opt_model_key') == current_model_key:
+        try:
+            opt_val = st.session_state.get('optimized_k_value')
+            curve_df = pd.DataFrame(st.session_state['k_opt_curve'])
+            curve_df = curve_df.sort_values('k')
+            
+            all_results = st.session_state.get('k_opt_proto_results', {})
+            proto_results = all_results.get('prototypes', {}) if isinstance(all_results, dict) else {}
+            baseline_results = all_results.get('baselines', {}) if isinstance(all_results, dict) else {}
+            best_overall_mcc = st.session_state.get('k_opt_best_mcc', -1)
+            
+            # Create unified plot: KNN curve + prototype curves + baselines
+            fig_unified, ax_unified = plt.subplots(figsize=(6, 3.5))
+            
+            # Plot KNN curve
+            ax_unified.plot(curve_df['k'], curve_df['mcc'], marker='o', linewidth=2.5, 
+                           markersize=7, label='KNN', color='#e74c3c', zorder=3, alpha=0.9)
+            
+            # Plot prototype strategy curves
+            colors = {'mean': '#3498db', 'kmeans': '#f39c12', 'gmm': '#2ecc71'}
+            for strategy in ['mean', 'kmeans', 'gmm']:
+                result = proto_results.get(strategy, {})
+                per_components = result.get('per_components', [])
+                if per_components:
+                    per_df = pd.DataFrame(per_components).sort_values('n_components')
+                    ax_unified.plot(per_df['n_components'], per_df['mcc'], marker='s', linewidth=2.5,
+                                  markersize=7, label=f'{strategy.capitalize()} Prototype', 
+                                  color=colors.get(strategy, '#95a5a6'), zorder=2, alpha=0.9)
+            
+            # Add markers for baseline classifiers at x=0 (no hyperparameter)
+            for clf_name, result in baseline_results.items():
+                mcc_val = result.get('mcc')
+                if mcc_val is not None:
+                    ax_unified.scatter([0], [mcc_val], s=200, marker='D',
+                                      label=f'{BASELINE_DISPLAY_SHORT.get(clf_name, clf_name)}: {mcc_val:.3f}',
+                                      color=CLASSIFIER_COLORS.get(clf_name, 'gray'), alpha=0.9, 
+                                      zorder=4, edgecolors='black', linewidths=1.5)
+            
+            # Highlight overall best with a star marker
+            if isinstance(opt_val, int) or (isinstance(opt_val, str) and opt_val.isdigit()):
+                best_k_int = int(opt_val)
+                best_row = curve_df[curve_df['k'] == best_k_int]
+                if not best_row.empty and abs(float(best_row.iloc[0]['mcc']) - best_overall_mcc) < 1e-4:
+                    ax_unified.scatter([best_k_int], [best_overall_mcc], color='gold', s=400, marker='*', 
+                                     zorder=5, edgecolors='darkred', linewidths=2, label=f'⭐ Best: k={best_k_int} (MCC={best_overall_mcc:.3f})')
+            elif isinstance(opt_val, str) and opt_val.startswith('protot_'):
+                # Mark best prototype configuration
+                parts = opt_val.split('_')
+                if len(parts) >= 3:
+                    strategy = parts[1]
+                    n_comp = int(parts[2])
+                    ax_unified.scatter([n_comp], [best_overall_mcc], color='gold', s=400, marker='*',
+                                     zorder=5, edgecolors='darkred', linewidths=2, 
+                                     label=f'⭐ Best: {strategy.capitalize()} n_comp={n_comp} (MCC={best_overall_mcc:.3f})')
+            elif isinstance(opt_val, str) and opt_val.startswith('baseline_'):
+                # Mark best baseline
+                baseline_name = opt_val.replace('baseline_', '')
+                ax_unified.scatter([0], [best_overall_mcc], color='gold', s=500, marker='*',
+                                 zorder=6, edgecolors='darkred', linewidths=2.5,
+                                 label=f'⭐ Best: {BASELINE_DISPLAY_SHORT.get(baseline_name, baseline_name)} (MCC={best_overall_mcc:.3f})')
+            
+            ax_unified.set_xlabel('k (KNN) / n_components (Prototypes) / 0 (Baselines)', fontsize=12, fontweight='bold')
+            ax_unified.set_ylabel('Validation MCC', fontsize=12, fontweight='bold')
+            ax_unified.set_title('All Classification Approaches: Performance Comparison', fontsize=14, fontweight='bold')
+            ax_unified.grid(True, alpha=0.3)
+            ax_unified.legend(loc='best', fontsize=9, framealpha=0.95, ncol=2)
+            
+            # Calculate ylim dynamically from all data
+            all_mccs = list(curve_df['mcc'])
+            for strategy in ['mean', 'kmeans', 'gmm']:
+                result = proto_results.get(strategy, {})
+                per_components = result.get('per_components', [])
+                if per_components:
+                    all_mccs.extend([x['mcc'] for x in per_components])
+            for result in baseline_results.values():
+                if result.get('mcc') is not None:
+                    all_mccs.append(result['mcc'])
+            
+            if all_mccs:
+                ax_unified.set_ylim([min(all_mccs) - 0.05, min(1.0, max(all_mccs) + 0.1)])
+            
+            plt.tight_layout()
+            st.pyplot(fig_unified, use_container_width=True)
+            plt.close(fig_unified)
+            
+            # Show results summary
+            st.markdown("**Optimization Results Summary:**")
+            summary_data = []
+            
+            # Add KNN data
+            best_knn_row = curve_df.loc[curve_df['mcc'].idxmax()]
+            summary_data.append({
+                'Approach': 'KNN',
+                'Type': 'Neighbor-based',
+                'Best Value': f"k={int(best_knn_row['k'])}",
+                'MCC': float(best_knn_row['mcc']),
+                'Is Overall Best': best_knn_row['mcc'] == best_overall_mcc
+            })
+            
+            # Add baseline classifiers
+            for clf_name, result in baseline_results.items():
+                mcc_val = result.get('mcc')
+                if mcc_val is not None:
+                    summary_data.append({
+                        'Approach': BASELINE_DISPLAY_NAMES.get(clf_name, clf_name.upper()),
+                        'Type': 'Baseline',
+                        'Best Value': '-',
+                        'MCC': float(mcc_val),
+                        'Is Overall Best': abs(mcc_val - best_overall_mcc) < 1e-4
+                    })
+            
+            # Add prototype data
+            for strategy in ['mean', 'kmeans', 'gmm']:
+                result = proto_results.get(strategy, {})
+                mcc_val = result.get('best_mcc')
+                if mcc_val is not None:
+                    n_comp = result.get('best_n_components', '?')
+                    summary_data.append({
+                        'Approach': f'{strategy.capitalize()} Prototype',
+                        'Type': 'Prototype',
+                        'Best Value': f'n_comp={n_comp}',
+                        'MCC': float(mcc_val),
+                        'Is Overall Best': abs(mcc_val - best_overall_mcc) < 1e-4
+                    })
+            
+            summary_df = pd.DataFrame(summary_data)
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+            
+            # Selection widget to choose which approach to use
+            st.markdown("---")
+            st.markdown("**🎯 Select Approach to Use:**")
+            
+            # Create options for selectbox
+            default_idx = 0
+            options_list = []
+            option_to_config = {}
+            
+            for idx, row in summary_df.iterrows():
+                approach = row['Approach']
+                approach_type = row['Type']
+                best_val = row['Best Value']
+                mcc = row['MCC']
+                is_best = row['Is Overall Best']
+                
+                # Create display label
+                best_marker = "✅ " if is_best else ""
+                if best_val == '-':
+                    label = f"{best_marker}{approach} (MCC: {mcc:.4f})"
+                else:
+                    label = f"{best_marker}{approach} - {best_val} (MCC: {mcc:.4f})"
+                options_list.append(label)
+                
+                # Store config for this option
+                if approach == 'KNN':
+                    k_val = int(best_val.split('=')[1])
+                    option_to_config[label] = {'type': 'knn', 'k': k_val}
+                elif approach_type == 'Baseline':
+                    # Baseline classifiers - store for reference but won't apply to sidebar
+                    baseline_key = approach.lower().replace(' ', '_').replace('logistic_regression', 'logreg').replace('naive_bayes', 'naive_bayes').replace('linear_svc', 'linear_svc')
+                    option_to_config[label] = {'type': 'baseline', 'name': baseline_key}
+                elif 'Prototype' in approach:
+                    strategy_name = approach.split()[0].lower()
+                    n_comp = int(best_val.split('=')[1])
+                    option_to_config[label] = {'type': 'prototype', 'strategy': strategy_name, 'n_comp': n_comp}
+                
+                if is_best:
+                    default_idx = idx
+            
+            selected_option = st.selectbox(
+                "Choose which optimization result to apply:",
+                options=options_list,
+                index=default_idx,
+                key='opt_result_selector'
+            )
+            
+            # Get the config for selected option
+            selected_config = option_to_config.get(selected_option, {})
+            
+            if selected_config:
+                # Display info about selected choice
+                col_info1, col_info2 = st.columns([2, 1])
+                with col_info1:
+                    if selected_config['type'] == 'knn':
+                        st.info(f"📊 **Selected:** KNN with k={selected_config['k']}")
+                        if st.button("✅ Apply KNN k to sidebar", key="apply_knn_btn"):
+                            st.session_state['n_neighbors_input'] = selected_config['k']
+                            st.session_state['k_opt_current_selection'] = {
+                                'type': 'knn',
+                                'k': selected_config['k'],
+                                'mcc': summary_df.iloc[summary_df.index[summary_df['Approach'] == 'KNN'].tolist()[0]]['MCC'] if 'KNN' in summary_df['Approach'].values else 0
+                            }
+                            st.session_state.selected_model_version = st.session_state.get('selected_model_version', 0) + 1
+                            st.success(f"✅ Applied: k={selected_config['k']} (now visible in sidebar)")
+                    else:
+                        st.info(f"📊 **Selected:** {selected_config['strategy'].upper()} Strategy with n_comp={selected_config['n_comp']}")
+                        if st.button("✅ Apply Prototype Strategy", key="apply_proto_btn"):
+                            st.session_state['proto_strategies_checkbox'] = [selected_config['strategy']]
+                            st.session_state['pca_proto_components'] = selected_config['n_comp']
+                            st.session_state['selected_prototype_approach'] = f"protot_{selected_config['strategy']}_{selected_config['n_comp']}"
+                            proto_mcc = next((row['MCC'] for _, row in summary_df.iterrows() 
+                                            if row['Approach'] == f"{selected_config['strategy'].capitalize()} Strategy"), 0)
+                            st.session_state['k_opt_current_selection'] = {
+                                'type': 'prototype',
+                                'strategy': selected_config['strategy'],
+                                'n_comp': selected_config['n_comp'],
+                                'mcc': proto_mcc
+                            }
+                            st.success(f"✅ Applied: {selected_config['strategy']} with n_comp={selected_config['n_comp']} (now visible in sidebar)")
+            
+            # Expandable table with all k values
+            with st.expander("📋 KNN All k Values"):
+                display_df = curve_df.copy()
+                display_df['Is Best'] = (display_df['mcc'] == curve_df['mcc'].max())
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+        except Exception:
+            pass
+    elif st.session_state.get('k_opt_curve'):
+        st.info("k optimization shown is from a previous model selection. Re-run 'Optimize k' to refresh.")
+
+
+    def _compute_best_proto_mcc_for_args(_args, strategy: str, min_components: int = 1, max_components: int = 5, random_state: int = 1):
+        """Compute the best validation MCC for a given prototype strategy over a range of components per class.
+
+        Returns a dict with keys: best_mcc, best_n_components, n_prototypes, per_components.
+        """
+        # Load model + datasets
+        model, _, prototypes, _, _, data, unique_labels, unique_batches, _ = load_model_and_prototypes(_args)
+
+        # Prepare a minimal TrainAE wrapper
+        train = TrainAE(_args, _args.path, load_tb=False, log_metrics=False, keep_models=True,
+                        log_inputs=False, log_plots=False, log_tb=False, log_tracking=False,
                         log_mlflow=False, groupkfold=_args.groupkfold)
         train.n_batches = len(unique_batches)
         train.n_cats = len(unique_labels)
@@ -2305,91 +3498,57 @@ with tab1:
         valid_encs = np.concatenate(lists['valid']['encoded_values'])
         valid_cats = np.concatenate(lists['valid']['cats'])
 
-        best_k, best_mcc = 1, -1.0
-        max_k = min(max_k + 1, train_encs.shape[0] + 1)
-        mcc_per_k = []
-        for k in range(min_k, max_k):
-            knn_temp = KNN(n_neighbors=k, metric='minkowski')
-            knn_temp.fit(train_encs, train_cats)
-            preds = knn_temp.predict(valid_encs)
-            mcc_val = MCC(valid_cats, preds)
-            mcc_per_k.append({'k': k, 'mcc': float(mcc_val)})
-            if mcc_val > best_mcc:
-                best_k, best_mcc = k, mcc_val
-        # Prototype proximity baseline (if available)
-        proto_mcc = None
-        try:
-            proto_train = prototypes.get('class', {}).get('train', {}) if isinstance(prototypes, dict) else {}
-            if proto_train and len(proto_train.keys()) > 0:
-                proto_vecs = []
-                proto_labels = []
-                for lbl, vec in proto_train.items():
-                    arr = np.asarray(vec)
-                    if arr.ndim > 1:
-                        arr = arr[0]
-                    proto_vecs.append(arr)
-                    proto_labels.append(lbl)
-                proto_vecs = np.stack(proto_vecs)
-                # compute nearest prototype per validation sample
-                dists = np.linalg.norm(valid_encs[:, None, :] - proto_vecs[None, :, :], axis=2)
-                proto_preds = np.take(proto_labels, np.argmin(dists, axis=1))
-                proto_mcc = float(MCC(valid_cats, proto_preds))
-        except Exception:
-            proto_mcc = None
+        best_mcc = None
+        best_n_components = None
+        best_n_prototypes = 0
+        per_components = []
 
-        return best_k, float(best_mcc), mcc_per_k, proto_mcc
+        for n_components in range(min_components, max_components + 1):
+            proto_dict = compute_prototypes_by_strategy(train_encs, train_cats, strategy, n_components, random_state)
 
-    col_k_range, col_k_btn = st.columns([1, 1])
-    with col_k_range:
-        min_k = st.number_input("Min k", min_value=1, max_value=50, value=1, step=1, key="tab1_min_k")
-        max_k = st.number_input("Max k", min_value=2, max_value=200, value=20, step=1, key="tab1_max_k")
-        if max_k <= min_k:
-            st.warning("Max k must be greater than min k")
-    with col_k_btn:
-        if st.button("Optimize k on validation", key="tab1_optimize_k_button"):
-            try:
-                best_k, best_mcc, mcc_curve, proto_mcc = _optimize_k_for_args(args, int(min_k), int(max_k))
-                st.success(f"✅ Best k = {best_k} (Validation MCC: {best_mcc:.3f})")
-                # Store result in a non-widget key and trigger rerun to apply it
-                st.session_state['optimized_k_value'] = int(best_k)
-                st.session_state['k_opt_best_mcc'] = float(best_mcc)
-                st.session_state['k_opt_curve'] = mcc_curve
-                st.session_state['k_opt_proto_mcc'] = proto_mcc
-                st.session_state['k_opt_model_key'] = current_model_key
-                st.rerun()
-            except Exception as e:
-                st.error(f"K optimization failed: {e}")
-    st.caption("Uses current sidebar model settings (dataset, size, normalize, etc.)")
+            proto_vecs, proto_labels = flatten_prototype_dict(proto_dict)
 
-    if 'optimized_k_value' in st.session_state and 'k_opt_best_mcc' in st.session_state:
-        msg = f"Last optimized k = {st.session_state['optimized_k_value']} (Validation MCC: {st.session_state['k_opt_best_mcc']:.3f})"
-        proto_mcc = st.session_state.get('k_opt_proto_mcc')
-        if proto_mcc is not None:
-            msg += f" | Prototype-only MCC: {proto_mcc:.3f}"
-        st.info(msg)
+            if len(proto_vecs) == 0:
+                continue
 
-    if st.session_state.get('k_opt_curve'):
-        try:
-            curve_df = pd.DataFrame(st.session_state['k_opt_curve'])
-            curve_df = curve_df.sort_values('k')
-            if 'optimized_k_value' in st.session_state:
-                best_row = curve_df[curve_df['k'] == st.session_state['optimized_k_value']]
-                if not best_row.empty:
-                    st.markdown(f"⭐ Best k = {int(best_row.iloc[0]['k'])} (MCC {best_row.iloc[0]['mcc']:.3f})")
-            st.line_chart(curve_df.set_index('k'))
-            st.dataframe(curve_df.assign(best=curve_df['k'] == st.session_state.get('optimized_k_value', -1)), use_container_width=True)
-        except Exception:
-            pass
+            dists = np.linalg.norm(valid_encs[:, None, :] - proto_vecs[None, :, :], axis=2)
+            proto_preds = proto_labels[np.argmin(dists, axis=1)]
+            proto_mcc = float(MCC(valid_cats, proto_preds))
+            per_components.append({'n_components': n_components, 'mcc': proto_mcc, 'n_prototypes': len(proto_vecs)})
 
+            if (best_mcc is None) or (proto_mcc > best_mcc):
+                best_mcc = proto_mcc
+                best_n_components = n_components
+                best_n_prototypes = len(proto_vecs)
 
-    # Define PCA computation function
-    def _compute_pca_for_args(_args):
+        return {
+            'best_mcc': best_mcc,
+            'best_n_components': best_n_components,
+            'n_prototypes': best_n_prototypes,
+            'per_components': per_components,
+        }
+
+    # Define PCA computation function - now handles multiple strategies
+    def _compute_pca_for_args(_args, proto_strategies=None, proto_components=1):
+        """Compute PCA with prototypes for one or multiple strategies.
+        
+        Args:
+            _args: Model configuration
+            proto_strategies: list of strategy names or single strategy string
+            proto_components: number of components per class
+        """
+        if proto_strategies is None:
+            proto_strategies = ['mean']
+        elif isinstance(proto_strategies, str):
+            proto_strategies = [proto_strategies]
+        
         # Load model + datasets
         model, _, prototypes, _, _, data, unique_labels, unique_batches, _ = load_model_and_prototypes(_args)
 
         # Minimal TrainAE to encode sets
+
         train = TrainAE(_args, _args.path, load_tb=False, log_metrics=False, keep_models=True,
-                        log_inputs=False, log_plots=False, log_tb=False, log_neptune=False,
+                        log_inputs=False, log_plots=False, log_tb=False, log_tracking=False,
                         log_mlflow=False, groupkfold=_args.groupkfold)
         train.n_batches = len(unique_batches)
         train.n_cats = len(unique_labels)
@@ -2447,41 +3606,74 @@ with tab1:
         all_cats = np.concatenate(cats)
         all_batches = np.concatenate(batches) if batches else np.zeros(len(all_cats))
 
-        # Prototypes array (optional)
-        proto_arr = None
-        if isinstance(prototypes, dict):
-            try:
-                class_train = prototypes.get('class', {}).get('train', {})
-                proto_list = []
-                for lbl, vec in class_train.items():
-                    arr = np.asarray(vec)
-                    if arr.ndim > 1:
-                        arr = arr[0]
-                    proto_list.append(arr)
-                if proto_list:
-                    proto_arr = np.stack(proto_list)
-            except Exception:
-                proto_arr = None
-
-        # PCA fit
+        # PCA fit (same for all strategies)
         n_comp = min(3, all_encs.shape[1])
         pca = PCA(n_components=n_comp)
         encs_pca = pca.fit_transform(all_encs)
         explained = pca.explained_variance_ratio_ * 100.0
-        proto_pca = pca.transform(proto_arr) if proto_arr is not None else None
 
-        # Plot and store in session_state
-        fig, ax = plt.subplots(figsize=(8, 6))
-        scatter = ax.scatter(encs_pca[:, 0], encs_pca[:, 1], c=all_cats, cmap='tab20', alpha=0.7, s=20)
-        if proto_pca is not None:
-            ax.scatter(proto_pca[:, 0], proto_pca[:, 1], marker='x', color='red', s=90, label='Prototypes')
-        ax.set_xlabel(f'PC1 ({explained[0]:.1f}%)')
-        if n_comp > 1:
-            ax.set_ylabel(f'PC2 ({explained[1]:.1f}%)')
-        ax.set_title('PCA of encodings (train/valid/test)')
-        ax.legend(loc='best')
-        cbar = plt.colorbar(scatter, ax=ax)
-        cbar.set_label('Class id')
+        # Create subplots for each strategy
+        n_strategies = len(proto_strategies)
+        fig, axes = plt.subplots(1, n_strategies, figsize=(6 * n_strategies, 5))
+        
+        # Handle single subplot case
+        if n_strategies == 1:
+            axes = [axes]
+        
+        # Different markers for each strategy to make differences visible
+        strategy_markers = {'mean': 'X', 'kmeans': '*', 'gmm': 'P'}
+        strategy_sizes = {'mean': 300, 'kmeans': 500, 'gmm': 400}
+        
+        for ax_idx, proto_strategy in enumerate(proto_strategies):
+            ax = axes[ax_idx]
+            
+            # Compute prototypes for this strategy
+            proto_dict = compute_prototypes_by_strategy(
+                all_encs, all_cats, proto_strategy, proto_components, random_state=1
+            )
+            
+            # Flatten prototypes for PCA
+            proto_arr = None
+            proto_colors = None
+            if proto_dict:
+                proto_list = []
+                proto_colors = []
+                for cls_id in sorted(proto_dict.keys()):
+                    for proto_vec, comp_idx in proto_dict[cls_id]:
+                        proto_list.append(proto_vec)
+                        proto_colors.append(cls_id)
+                if proto_list:
+                    proto_arr = np.stack(proto_list)
+                    proto_colors = np.array(proto_colors)
+            
+            proto_pca = pca.transform(proto_arr) if proto_arr is not None else None
+            
+            # Plot encodings
+            scatter = ax.scatter(encs_pca[:, 0], encs_pca[:, 1], c=all_cats, cmap='tab20', alpha=0.5, s=20)
+            
+            # Plot prototypes with strategy-specific markers and color by class
+            if proto_pca is not None:
+                marker = strategy_markers.get(proto_strategy, '*')
+                marker_size = strategy_sizes.get(proto_strategy, 500)
+                ax.scatter(proto_pca[:, 0], proto_pca[:, 1], marker=marker, c=proto_colors, 
+                          cmap='tab20', s=marker_size, edgecolors='black', linewidths=1.5, zorder=5)
+                # Add count info to title
+                n_protos = len(proto_pca)
+                ax.set_title(f'{proto_strategy.upper()}\n({n_protos} prototypes total, {proto_components} per class)')
+            else:
+                ax.set_title(f'{proto_strategy.upper()}\n({proto_components} per class)')
+            
+            ax.set_xlabel(f'PC1 ({explained[0]:.1f}%)')
+            if n_comp > 1:
+                ax.set_ylabel(f'PC2 ({explained[1]:.1f}%)')
+            ax.grid(True, alpha=0.3)
+        
+        # Add colorbar for the whole figure
+        cbar = plt.colorbar(scatter, ax=axes[-1], pad=0.02)
+        cbar.set_label('Class ID')
+        
+        fig.suptitle(f'PCA with Prototypes (train/valid/test)', fontsize=14, y=1.02)
+        plt.tight_layout()
         
         # Store figure bytes in session state for persistence
         import io
@@ -2497,8 +3689,37 @@ with tab1:
     with st.expander("🧭 PCA with Prototypes", expanded=False):
         st.caption("Compute PCA of encoded representations for the current sidebar model and overlay class prototypes.")
 
+        # Prototype strategy controls
+        pca_cols = st.columns([2, 2, 2])
+        with pca_cols[0]:
+            proto_strategies = st.multiselect(
+                "Prototype Aggregation",
+                options=["mean", "kmeans", "gmm"],
+                default=["mean"],
+                key="pca_proto_strategy",
+                help="Select one or more: mean (single average per class) | kmeans (k centers per class) | gmm (gaussian mixture components per class)"
+            )
+        with pca_cols[1]:
+            proto_components = st.slider(
+                "Components per Class",
+                min_value=1,
+                max_value=5,
+                value=3,
+                step=1,
+                key="pca_proto_components",
+                help="Number of prototypes (centroids/components) per class. Set > 1 to see differences between strategies"
+            )
+        with pca_cols[2]:
+            st.empty()  # Spacer
+
+        # Ensure at least one strategy is selected
+        if not proto_strategies:
+            st.warning("Please select at least one prototype aggregation strategy")
+            proto_strategies = ["mean"]
+
         # Check if we have PCA cached for the current model
-        current_model_key = f"{args.task}_{os.path.basename(args.path) if args.path else 'no_path'}_{args.new_size}_{args.n_neighbors}_{args.dist_fct}"
+        strategies_str = "_".join(sorted(proto_strategies))
+        current_model_key = f"{args.task}_{os.path.basename(args.path) if args.path else 'no_path'}_{args.new_size}_{args.n_neighbors}_{args.dist_fct}_{strategies_str}_{proto_components}"
         has_pca_cache = (st.session_state.get('tab1_pca_model_key') == current_model_key and 
                          st.session_state.get('tab1_pca_fig_bytes'))
         
@@ -2510,7 +3731,7 @@ with tab1:
                 st.session_state['tab1_pca_model_key'] = None
                 with st.spinner("Computing PCA on encodings..."):
                     try:
-                        _compute_pca_for_args(args)
+                        _compute_pca_for_args(args, proto_strategies=proto_strategies, proto_components=proto_components)
                         st.session_state['tab1_pca_model_key'] = current_model_key
                     except Exception as e:
                         st.error(f"PCA failed: {e}")
@@ -2534,7 +3755,7 @@ with tab1:
         with st.spinner("Loading model and data..."):
             model, _, prototypes, _, _, data, unique_labels, unique_batches, _ = load_model_and_prototypes(_args)
             train = TrainAE(_args, _args.path, load_tb=False, log_metrics=False, keep_models=True,
-                            log_inputs=False, log_plots=False, log_tb=False, log_neptune=False,
+                            log_inputs=False, log_plots=False, log_tb=False, log_tracking=False,
                             log_mlflow=False, groupkfold=_args.groupkfold)
             train.n_batches = len(unique_batches)
             train.n_cats = len(unique_labels)
@@ -2603,7 +3824,7 @@ with tab1:
             with col1:
                 st.write("**Class Distribution**")
                 class_counts = pd.Series(all_cats).value_counts().sort_index()
-                fig, ax = plt.subplots(figsize=(6, 4))
+                fig, ax = plt.subplots(figsize=(6, 3.5))
                 class_counts.plot(kind='bar', ax=ax, color='steelblue')
                 ax.set_title('Samples per Class')
                 ax.set_ylabel('Count')
@@ -2613,7 +3834,7 @@ with tab1:
             with col2:
                 st.write("**Group Distribution**")
                 grp_counts = pd.Series(all_grps).value_counts()
-                fig, ax = plt.subplots(figsize=(6, 4))
+                fig, ax = plt.subplots(figsize=(6, 3.5))
                 grp_counts.plot(kind='bar', ax=ax, color='coral')
                 ax.set_title('Samples per Split')
                 ax.set_ylabel('Count')
@@ -2628,7 +3849,7 @@ with tab1:
                     raw_cats_subset = all_cats[:max_samples]
                     pca_raw = PCA(n_components=2)
                     raw_pca_2d = pca_raw.fit_transform(raw_flat)
-                    fig, ax = plt.subplots(figsize=(8, 6))
+                    fig, ax = plt.subplots(figsize=(6, 3.5))
                     scatter = ax.scatter(raw_pca_2d[:, 0], raw_pca_2d[:, 1], c=raw_cats_subset, cmap='tab20', alpha=0.7, s=20)
                     ax.set_xlabel(f'PC1 ({pca_raw.explained_variance_ratio_[0]*100:.1f}%)')
                     ax.set_ylabel(f'PC2 ({pca_raw.explained_variance_ratio_[1]*100:.1f}%)')
@@ -2648,7 +3869,7 @@ with tab1:
                     cats_sample = all_cats[sample_idx]
                     tsne = TSNE(n_components=2, random_state=42, perplexity=30)
                     encs_tsne = tsne.fit_transform(encs_sample)
-                    fig, ax = plt.subplots(figsize=(8, 6))
+                    fig, ax = plt.subplots(figsize=(6, 3.5))
                     scatter = ax.scatter(encs_tsne[:, 0], encs_tsne[:, 1], c=cats_sample, cmap='tab20', alpha=0.7, s=20)
                     ax.set_title('t-SNE of Embeddings (sampled)')
                     plt.colorbar(scatter, ax=ax, label='Class')
@@ -2667,7 +3888,7 @@ with tab1:
                         cats_sample = all_cats[sample_idx]
                         umap = UMAP(n_components=2, random_state=42)
                         encs_umap = umap.fit_transform(encs_sample)
-                        fig, ax = plt.subplots(figsize=(8, 6))
+                        fig, ax = plt.subplots(figsize=(6, 3.5))
                         scatter = ax.scatter(encs_umap[:, 0], encs_umap[:, 1], c=cats_sample, cmap='tab20', alpha=0.7, s=20)
                         ax.set_title('UMAP of Embeddings (sampled)')
                         plt.colorbar(scatter, ax=ax, label='Class')
@@ -2696,7 +3917,7 @@ with tab1:
             st.dataframe(stats_df, use_container_width=True)
 
             # Embedding norm distribution
-            fig, ax = plt.subplots(figsize=(8, 5))
+            fig, ax = plt.subplots(figsize=(6, 3.5))
             for cls_id in sorted(np.unique(all_cats)):
                 mask = all_cats == cls_id
                 norms = np.linalg.norm(all_encs[mask], axis=1)
@@ -2712,7 +3933,7 @@ with tab1:
             st.write("**Embedding Dimension Correlations (first 20 dims)**")
             n_dims = min(20, all_encs.shape[1])
             corr_matrix = np.corrcoef(all_encs[:, :n_dims].T)
-            fig, ax = plt.subplots(figsize=(8, 7))
+            fig, ax = plt.subplots(figsize=(6, 3.5))
             sns.heatmap(corr_matrix, cmap='coolwarm', center=0, ax=ax, cbar_kws={'label': 'Correlation'})
             ax.set_title('Embedding Dimension Correlations')
             st.pyplot(fig, use_container_width=True)
@@ -2744,7 +3965,7 @@ with tab1:
                 proto_df = pd.DataFrame(proto_info)
                 st.dataframe(proto_df, use_container_width=True)
                 st.write("**Sample-to-Prototype Distances**")
-                fig, ax = plt.subplots(figsize=(8, 5))
+                fig, ax = plt.subplots(figsize=(6, 3.5))
                 for i, info in enumerate(proto_info):
                     cls_id = info['Class']
                     mask = all_cats == cls_id
@@ -2897,7 +4118,7 @@ with tab2:
                 status.write(f"Analyzing {filename} with model {row.get('Model ID', row.get('Model_ID'))} ({row.get('Model Name')})")
                 try:
                     local_args_bulk = _args_from_model_row(row.to_dict())
-                    run_analysis_on_file(filename, file_bytes, local_args_bulk, force_reanalyze=False, show_validation_metrics=show_val, fast_infer=fast_infer)
+                    run_analysis_on_file(filename, file_bytes, local_args_bulk, cursor, conn, force_reanalyze=False, show_validation_metrics=show_val, fast_infer=fast_infer)
                 except Exception as e:  # keep iterating on failure
                     failures.append(f"Model {row.get('Model ID', row.get('Model_ID'))}: {e}")
                 progress.progress((idx + 1) / total)
@@ -2945,7 +4166,7 @@ with tab2:
                             status_all.write(f"Analyzing {fname} with model {row.get('Model ID')}")
                             try:
                                 local_args_bulk = _args_from_model_row(row.to_dict())
-                                run_analysis_on_file(fname, file_bytes_all, local_args_bulk, force_reanalyze=False, show_validation_metrics=show_val_bulk, fast_infer=fast_infer_bulk)
+                                run_analysis_on_file(fname, file_bytes_all, local_args_bulk, cursor, conn, force_reanalyze=False, show_validation_metrics=show_val_bulk, fast_infer=fast_infer_bulk)
                             except Exception as e:
                                 failures_all.append(f"{fname} / model {row.get('Model ID')}: {e}")
                             task_idx += 1
@@ -2970,7 +4191,7 @@ with tab2:
                 if os.path.exists(file_path_sidebar):
                     with open(file_path_sidebar, 'rb') as f:
                         file_bytes_sidebar = f.read()
-                    run_analysis_on_file(selected_filename_tab2, file_bytes_sidebar, args, force_reanalyze=True, show_validation_metrics=True)
+                    run_analysis_on_file(selected_filename_tab2, file_bytes_sidebar, args, cursor, conn, force_reanalyze=True, show_validation_metrics=True)
                     st.success("Analysis queued with current sidebar model settings.")
                     ran_sidebar_analysis = True
                 else:
@@ -3109,6 +4330,20 @@ with tab2:
         local_args_tab2.n_neighbors = ensure_int(row_tab2['N_Neighbors'])
         local_args_tab2.model_id = selected_model_id_tab2
         
+        # Add missing attributes for compatibility
+        if not hasattr(local_args_tab2, 'auto_select_k'):
+            local_args_tab2.auto_select_k = 0
+        if not hasattr(local_args_tab2, 'random_recs'):
+            local_args_tab2.random_recs = 0
+        if not hasattr(local_args_tab2, 'seed'):
+            local_args_tab2.seed = 1
+        if not hasattr(local_args_tab2, 'groupkfold'):
+            local_args_tab2.groupkfold = 1
+        if not hasattr(local_args_tab2, 'valid_dataset'):
+            local_args_tab2.valid_dataset = 'Banque_Viscaino_Chili_2020'
+        if not hasattr(local_args_tab2, 'device'):
+            local_args_tab2.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
         # Extract the dataset name from log_path to set local_args_tab2.path correctly
         p_extra = extract_params_from_log_path(log_path)
         if 'Dataset' in p_extra:
@@ -3139,7 +4374,7 @@ with tab2:
                             on_change=on_shap_layer_change)
         
         # Add action buttons
-        cols = st.columns(4)
+        cols = st.columns(5)
         with cols[0]:
             if st.button("▶️ Run Analysis", key=f"run_analysis_tab2_{selected_filename_tab2}"):
                 file_path = f'data/queries/{selected_filename_tab2.split("/")[-1]}'
@@ -3147,12 +4382,117 @@ with tab2:
                     with open(file_path, 'rb') as f:
                         file_bytes = f.read()
                     run_analysis_on_file(
-                        selected_filename_tab2, file_bytes, local_args_tab2, force_reanalyze=True
+                        selected_filename_tab2, file_bytes, local_args_tab2, cursor, conn, force_reanalyze=True
                     )
                     st.rerun()
                 else:
                     st.error(f"❌ File not found: {file_path}")
         with cols[1]:
+            if st.button("📊 Recompute Valid MCC", key=f"recompute_mcc_tab2_{selected_filename_tab2}"):
+                with st.spinner("Recomputing validation MCC with training parameters..."):
+                    try:
+                        random.seed(1)
+                        torch.manual_seed(1)
+                        np.random.seed(1)
+                        if torch.cuda.is_available():
+                            torch.cuda.manual_seed_all(1)
+                        
+                        model, shap_model, prototypes, image_size, device_str, data, unique_labels, unique_batches, data_getter = \
+                            load_model_and_prototypes(local_args_tab2)
+                        
+                        # Load saved training parameters from model directory
+                        model_log_dir = f"logs/best_models/{local_args_tab2.task}/{local_args_tab2.model_name}/{get_model_params_path(local_args_tab2)}"
+                        saved_search = load_saved_search_params(model_log_dir)
+                        
+                        # Extract exact training parameters
+                        saved_nn = saved_search.get('n_neighbors') if isinstance(saved_search, dict) else None
+                        if saved_nn is not None:
+                            try:
+                                local_args_tab2.n_neighbors = int(saved_nn)
+                            except Exception:
+                                pass
+                        
+                        saved_normalize = saved_search.get('normalize') if isinstance(saved_search, dict) else None
+                        if saved_normalize is not None:
+                            local_args_tab2.normalize = saved_normalize
+                        
+                        saved_is_transform = saved_search.get('is_transform') if isinstance(saved_search, dict) else None
+                        if saved_is_transform is not None:
+                            try:
+                                local_is_transform = int(saved_is_transform)
+                            except Exception:
+                                local_is_transform = 1
+                        else:
+                            local_is_transform = 1
+                        
+                        train = TrainAE(local_args_tab2, local_args_tab2.path, load_tb=False, log_metrics=True, keep_models=True,
+                                      log_inputs=False, log_plots=False, log_tb=False, log_tracking=False,
+                                      log_mlflow=False, groupkfold=local_args_tab2.groupkfold)
+                        train.n_batches = len(unique_batches)
+                        train.n_cats = len(unique_labels)
+                        train.unique_batches = unique_batches
+                        train.unique_labels = unique_labels
+                        train.epoch = 1
+                        train.model = model
+                        train.complete_log_path = log_path
+                        train.params = {
+                            'n_neighbors': local_args_tab2.n_neighbors,
+                            'lr': 0,
+                            'wd': 0,
+                            'smoothing': 0,
+                            'is_transform': local_is_transform,
+                            'valid_dataset': local_args_tab2.valid_dataset
+                        }
+                        train.set_arcloss()
+                        
+                        lists, traces = get_empty_traces()
+                        loaders = get_images_loaders(
+                            data=data,
+                            random_recs=local_args_tab2.random_recs,
+                            weighted_sampler=0,
+                            is_transform=local_is_transform,
+                            samples_weights=None,
+                            epoch=1,
+                            unique_labels=unique_labels,
+                            triplet_dloss=local_args_tab2.dloss, bs=local_args_tab2.bs,
+                            prototypes_to_use=local_args_tab2.prototypes_to_use,
+                            prototypes=prototypes,
+                            size=local_args_tab2.new_size,
+                            normalize=local_args_tab2.normalize
+                        )
+                        
+                        with torch.no_grad():
+                            _, best_lists1, _ = train.loop('train', None, 0, loaders['train'], lists, traces)
+                            for group in ["valid"]:
+                                _, best_lists2, traces, knn = train.predict(group, loaders[group], lists, traces)
+                        
+                        # Compute MCC on validation set
+                        if 'valid' in lists and len(lists['valid'].get('cats', [])) > 0:
+                            valid_cats = np.concatenate(lists['valid']['cats'])
+                            valid_preds = np.concatenate(lists['valid']['preds']).argmax(1)
+                            valid_mcc = MCC(valid_cats, valid_preds)
+                            valid_acc = float(np.sum(valid_preds == valid_cats) / len(valid_cats))
+                            
+                            st.success(f"✅ Validation MCC (Recomputed): **{valid_mcc:.4f}**")
+                            st.info(f"Validation Accuracy: **{valid_acc:.4f}**")
+                            st.info(f"Model: {local_args_tab2.model_name} | Normalize: {local_args_tab2.normalize} | K: {local_args_tab2.n_neighbors} | Transform: {local_is_transform}")
+                        else:
+                            st.error("❌ Validation set is empty; could not compute MCC")
+                        
+                        # Cleanup
+                        del model, shap_model, train
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            
+                    except Exception as e:
+                        st.error(f"❌ Error recomputing MCC: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+        with cols[2]:
             if st.button("🔄 Force Re-analysis", key=f"force_reanalyze_tab2_{selected_filename_tab2}"):
                     # Load the file from data/queries directory
                     file_path = f'data/queries/{selected_filename_tab2.split("/")[-1]}'
@@ -3160,7 +4500,7 @@ with tab2:
                         with open(file_path, 'rb') as f:
                             file_bytes = f.read()
                             pred_label_new, pred_confidence_new, log_path_new, _ = run_analysis_on_file(
-                                selected_filename_tab2, file_bytes, local_args_tab2, force_reanalyze=True
+                                selected_filename_tab2, file_bytes, local_args_tab2, cursor, conn, force_reanalyze=True
                             )
                         st.rerun()
                     else:
@@ -3180,7 +4520,7 @@ with tab2:
                                 load_model_and_prototypes(local_args_tab2)
                             
                             train = TrainAE(local_args_tab2, local_args_tab2.path, load_tb=False, log_metrics=True, keep_models=True,
-                                          log_inputs=False, log_plots=True, log_tb=False, log_neptune=True,
+                                          log_inputs=False, log_plots=True, log_tb=False, log_tracking=True,
                                           log_mlflow=False, groupkfold=local_args_tab2.groupkfold)
                             train.n_batches = len(unique_batches)
                             train.n_cats = len(unique_labels)
@@ -3265,7 +4605,7 @@ with tab2:
                                 load_model_and_prototypes(local_args_tab2)
 
                             train = TrainAE(local_args_tab2, local_args_tab2.path, load_tb=False, log_metrics=True, keep_models=True,
-                                          log_inputs=False, log_plots=True, log_tb=False, log_neptune=True,
+                                          log_inputs=False, log_plots=True, log_tb=False, log_tracking=True,
                                           log_mlflow=False, groupkfold=local_args_tab2.groupkfold)
                             train.n_batches = len(unique_batches)
                             train.n_cats = len(unique_labels)
@@ -3395,6 +4735,21 @@ with tab2:
         base_name = strip_extension(selected_filename_tab2.split("/")[-1])
         grad_cam_dir = os.path.join(log_path, base_name)
         
+        # Auto-display cached Grad-CAM results if they exist
+        if os.path.isdir(grad_cam_dir):
+            cached_montage_files = [f for f in os.listdir(grad_cam_dir) if f.startswith(f"{base_name}_grad_cam_all_classes_layer") and f.endswith(".png")]
+            if cached_montage_files:
+                st.success("✅ Cached Grad-CAM Results Found")
+                # Display most recent (typically highest layer number)
+                cached_montage_files.sort(reverse=True)
+                for montage_file in cached_montage_files[:3]:  # Show last 3 computed layers
+                    montage_path = os.path.join(grad_cam_dir, montage_file)
+                    try:
+                        st.image(montage_path, caption=f"Grad-CAM {montage_file.replace(base_name + '_', '').replace('.png', '')}", use_container_width=True)
+                    except Exception:
+                        pass
+                st.divider()
+        
         def on_gc_params_change_t2():
             st.session_state['grad_cam_layer'] = st.session_state[f"gc_layer_t2_{selected_filename_tab2}"]
             st.session_state['grad_cam_alpha'] = st.session_state[f"gc_alpha_t2_{selected_filename_tab2}"]
@@ -3428,7 +4783,7 @@ with tab2:
                         current_alpha = st.session_state.get(f"gc_alpha_t2_{selected_filename_tab2}", args.grad_cam_alpha)
 
                         # CRITICAL: Clear model cache to ensure we load the correct model for this result
-                        _clear_cached_model()
+                        clear_cached_model()
                         
                         # Load model and data for THIS specific result's parameters
                         model, shap_model, prototypes, image_size, device_str, data, unique_labels, unique_batches, data_getter = \
@@ -3684,8 +5039,12 @@ with tab5:
             model_info_list.append({
                 "label": model_info,
                 "id": model_id,
-                "num": model_num
+                "num": model_num,
+                "mcc_value": float(mcc) if mcc != "?" else -1  # Store MCC as float for sorting
             })
+        
+        # Sort by MCC value in decreasing order (highest MCC first)
+        model_info_list.sort(key=lambda x: x["mcc_value"], reverse=True)
         
         # Allow limiting number of models displayed (slider needs min < max)
         if len(model_info_list) > 1:
@@ -3798,6 +5157,28 @@ with tab5:
                 return str(rows_for_image.iloc[0].get("Pred_Label", "?")), rows_for_image.iloc[0].get("Confidence")
             return None, None
 
+        def _get_model_meta(model_id: int):
+            """Lookup model rank/label/MCC for display."""
+            if best_models_table is None or best_models_table.empty:
+                return None
+            model_id_col = "Model ID" if "Model ID" in best_models_table.columns else None
+            if model_id_col is None:
+                return None
+            match = best_models_table[best_models_table[model_id_col] == model_id]
+            if match.empty:
+                return None
+            row = match.iloc[0]
+            mcc_val = row.get("MCC")
+            try:
+                mcc_val = float(mcc_val)
+            except Exception:
+                mcc_val = None
+            return {
+                "rank": row.get("#"),
+                "mcc": mcc_val,
+                "name": row.get("Model Name"),
+            }
+
         if max_images_to_show > 0:
             st.subheader("Gallery")
             cols = st.columns(num_cols)
@@ -3810,6 +5191,29 @@ with tab5:
 
                     st.markdown(f"**{fname}**")
                     st.caption(f"{status_icon} Grad-CAM {'ready' if has_gc else 'missing'}")
+
+                    # List which models have Grad-CAMs for this image
+                    rows_for_image = df_gallery_view[df_gallery_view["Filename"] == fname]
+                    model_summaries = []
+                    seen_models = set()
+                    for _, r_img in rows_for_image.iterrows():
+                        mid = r_img.get("Model_ID")
+                        if mid in seen_models:
+                            continue
+                        seen_models.add(mid)
+                        meta = _get_model_meta(mid) or {}
+                        mcc_val = meta.get("mcc")
+                        rank_val = meta.get("rank")
+                        label_name = r_img.get("Model Name", f"Model {mid}")
+                        summary = f"{label_name}"
+                        if rank_val is not None:
+                            summary = f"#{rank_val} {summary}"
+                        if mcc_val is not None:
+                            summary += f" (MCC {mcc_val:.3f})"
+                        model_summaries.append((mcc_val if mcc_val is not None else -np.inf, summary))
+                    if model_summaries:
+                        model_summaries.sort(key=lambda x: x[0], reverse=True)
+                        st.caption("Models available: " + " | ".join([s for _, s in model_summaries]))
 
                     # Show original image
                     if os.path.exists(img_path):
@@ -3933,7 +5337,7 @@ with tab5:
             """
             local_args = _build_args_from_row(row)
             # Clear cached model to avoid reusing a previous model/config for other rows
-            _clear_cached_model()
+            clear_cached_model()
             model, shap_model, prototypes, image_size, device_str, data, unique_labels, unique_batches, data_getter = load_model_and_prototypes(local_args)
             image_path = os.path.join("data/queries", str(row.get("Filename", "")).split("/")[-1])
             if not os.path.exists(image_path):
@@ -4412,7 +5816,7 @@ if uploaded_files and should_run_analysis:
         
         try:
             pred_label, pred_confidence, complete_log_path, _ = run_analysis_on_file(
-                file_obj.name, uploaded_bytes, args, force_reanalyze=force_analysis,
+                file_obj.name, uploaded_bytes, args, cursor, conn, force_reanalyze=force_analysis,
                 show_validation_metrics=not skip_validation_tab3, fast_infer=fast_infer_tab3
             )
             
@@ -4446,7 +5850,7 @@ if uploaded_files and should_run_analysis:
                 args.device = 'cpu'
                 
                 pred_label, pred_confidence, complete_log_path, _ = run_analysis_on_file(
-                    file_obj.name, uploaded_bytes, args, force_reanalyze=force_analysis,
+                    file_obj.name, uploaded_bytes, args, cursor, conn, force_reanalyze=force_analysis,
                     show_validation_metrics=not skip_validation_tab3, fast_infer=fast_infer_tab3
                 )
                 
@@ -4527,12 +5931,12 @@ if uploaded_file is not None and st.session_state.get('last_uploaded_name') == u
                         if torch.cuda.is_available():
                             torch.cuda.manual_seed_all(1)
 
-                        _clear_cached_model()
+                        clear_cached_model()
                         model, shap_model, prototypes, image_size, device_str, data, unique_labels, unique_batches, data_getter = \
                             load_model_and_prototypes(args)
 
                         train = TrainAE(args, args.path, load_tb=False, log_metrics=True, keep_models=True,
-                                      log_inputs=False, log_plots=True, log_tb=False, log_neptune=True,
+                                      log_inputs=False, log_plots=True, log_tb=False, log_tracking=True,
                                       log_mlflow=False, groupkfold=args.groupkfold)
                         train.n_batches = len(unique_batches)
                         train.n_cats = len(unique_labels)
@@ -4607,12 +6011,12 @@ if uploaded_file is not None and st.session_state.get('last_uploaded_name') == u
                         if torch.cuda.is_available():
                             torch.cuda.manual_seed_all(1)
 
-                        _clear_cached_model()
+                        clear_cached_model()
                         model, shap_model, prototypes, image_size, device_str, data, unique_labels, unique_batches, data_getter = \
                             load_model_and_prototypes(args)
 
                         train = TrainAE(args, args.path, load_tb=False, log_metrics=True, keep_models=True,
-                                      log_inputs=False, log_plots=True, log_tb=False, log_neptune=True,
+                                      log_inputs=False, log_plots=True, log_tb=False, log_tracking=True,
                                       log_mlflow=False, groupkfold=args.groupkfold)
                         train.n_batches = len(unique_batches)
                         train.n_cats = len(unique_labels)
@@ -4981,6 +6385,7 @@ with tab4:
                 # Upload image for ensemble prediction
                 uploaded_file_ens = st.file_uploader("Upload an ear image for ensemble", type=["jpg", "jpeg", "png"], key="upload_tab4")
                 run_ens = st.button("▶️ Run Ensemble", key="run_ensemble_btn")
+                compute_ens = st.button("📊 Compute Validation Ensemble", key="compute_ensemble_valid_tab4")
 
                 if uploaded_file_ens is not None and run_ens:
                     import io
@@ -5241,7 +6646,7 @@ with tab4:
                                     st.image(pth, caption=f"Layer {l}", use_container_width=True)
 
                 # On-demand: compute ensemble validation metrics over current valid_dataset
-                if st.button("📊 Compute Validation Ensemble", key="compute_ensemble_valid"):
+                if compute_ens:
                     try:
                         # Load validation set for current dataset selection
                         local_args = argparse.Namespace(**vars(args))
@@ -5268,7 +6673,13 @@ with tab4:
                                         im_size = int(p.get("new_size", r["NSize"])) if p.get("new_size") is not None else int(r["NSize"]) if r["NSize"] is not None else 224
                                     except Exception:
                                         im_size = 224
-                                    model, class_protos = load_model_for_log_path(lp, mn, ens_device)
+                                    try:
+                                        model = load_model_for_log_path(lp, mn, ens_device)
+                                        class_protos = None
+                                    except Exception as e:
+                                        model, class_protos = load_model_and_prototypes(lp, mn, ens_device)
+                                        st.warning(f"Model {mn} loaded without prototypes: {e}")
+        
                                     models_cfg.append({
                                         'model': model,
                                         'protos': class_protos,
@@ -5367,8 +6778,9 @@ with tab4:
                                     # Only compute calibration if: 2 binary classes AND probabilities are truly continuous (many unique values)
                                     if len(uniq_vals) == 2 and set(uniq_vals) == {0, 1} and len(uniq_probs) > 3 and len(y_true_filt) > 0:
                                         try:
-                                            prob_true, prob_pred = calibration_curve(y_true_filt, y_prob_filt, n_bins=10)
-                                            fig, ax = plt.subplots(figsize=(5, 4))
+                                            n_bins = st.number_input("Calibration Curve n_bins", min_value=2, max_value=50, value=10, step=1, key="calib_n_bins")
+                                            prob_true, prob_pred = calibration_curve(y_true_filt, y_prob_filt, n_bins=int(n_bins))
+                                            fig, ax = plt.subplots(figsize=(6, 3.5))
                                             ax.plot(prob_pred, prob_true, marker='o', linewidth=1, label=f"Ensemble (pos={pos_label})")
                                             ax.plot([0, 1], [0, 1], linestyle='--', color='gray', label="Perfect")
                                             ax.set_xlabel("Mean predicted probability")

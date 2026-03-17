@@ -122,7 +122,7 @@ def get_gradient_explaination(i, nets, images, group, log_path, name, layer=5):
     Gets the gradient explaination of the images
     Args:
         i: index of the image
-        run: Neptune run
+        run: Tracking run
         nets: models
         images: images
         group: group of the image
@@ -473,14 +473,14 @@ def log_shap_images_gradients(nets, i, inputs, group, log_path, name, device='cu
     """
     Logs SHAP values and gradients of the images
     Args:
-        run: Neptune run
+        run: Tracking run
         nets: models
         i: index of the image
         inputs: inputs
         group: group of the image
         log_path: path to save the images
         name: name of the image
-        mlops: 'neptune' or 'mlflow'
+        mlops: 'mlflow' or 'mlflow'
     """
 
     images = torch.concatenate([torch.Tensor(x) for x in inputs[group]['inputs']]).to(device)

@@ -38,3 +38,12 @@ testemb1.png
 your_file.jpeg
 otitenet/train/old/
 *__pycache__/*
+*/__pycache__/*
+__pycache__/*
+otitenet/ml/__pycache__/*
+otitenet/train/__pycache__/*
+otitenet/infer/__pycache__/*
+otitenet/logging/__pycache__/*
+otitenet/app/__pycache__/*
+otitenet/utils/__pycache__/*
+otitenet/__pycache__/*

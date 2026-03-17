@@ -19,6 +19,9 @@ class PerImageNormalize:
         std = img.std(dim=(1, 2), keepdim=True) + 1e-6
         return (img - mean) / std
 
+import streamlit as st
+
+@st.cache_data
 def get_data(path, args, seed=42):
     """
 
@@ -134,6 +137,7 @@ def get_best_values(values):
     return best_values
 
 
+@st.cache_data
 def get_images(path, normalize, size=224):
     pngs = []
     labels = []

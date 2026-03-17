@@ -1,13 +1,13 @@
 import os
-NEPTUNE_API_TOKEN = os.getenv("NEPTUNE_API_TOKEN")
-NEPTUNE_PROJECT_NAME = "ADLab/otitenet"
-NEPTUNE_MODEL_NAME = "OT"
+from comet_ml import Experiment
+TRACKING_API_TOKEN = os.getenv("TRACKING_API_TOKEN")
+TRACKING_PROJECT_NAME = "ADLab/otitenet"
+TRACKING_MODEL_NAME = "OT"
 # os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 # CUDA_VISIBLE_DEVICES = ""
 import shap
 import torch
 import mlflow
-import neptune
 
 import tensorflow as tf
 import numpy as np
@@ -75,62 +75,107 @@ def log_mlflow(args, params, foldername):
     mlflow.log_param('foldername', foldername)
 
 
-def create_neptune_run(args, params, complete_log_path, foldername):
-    # Create a Neptune run object
-    run = neptune.init_run(
-        project=NEPTUNE_PROJECT_NAME,
-        api_token=NEPTUNE_API_TOKEN,
-    )  # your credentials
-    # run["dataset"].track_files(f"{self.path}/{self.args.csv_file}")
-    # Track metadata and hyperparameters by assigning them to the run
-    run["params"] = params
-    run["n_neighbors"] = params['n_neighbors']
-    run["task"] = args.task
-    run["model_name"] = args.model_name
-    run["exp_id"] = args.exp_id
-    run["is_stn"] = args.is_stn
-    run["n_calibration"] = args.n_calibration
-    run["distance_fct"] = params['dist_fct']
-    run["groupkfold"] = args.groupkfold
-    run["dloss"] = args.dloss
-    run["is_transform"] = params['is_transform']
-    run["lr"] = params['lr']
-    run["wd"] = params['wd']
-    run["margin"] = params['margin']
-    run["dmargin"] = params['dmargin']
-    run["smooth"] = params['smoothing']
-    run["gamma"] = params['gamma']
-    run["dropout"] = params['dropout']
-    run["optimizer_type"] = params['optimizer_type']
-    run["seed"] = 42
-    run["n_negatives"] = args.n_negatives
-    run["n_positives"] = args.n_positives
-    run["n_epochs"] = args.n_epochs
-    run["bs"] = args.bs
-    run["weighted_sampler"] = args.weighted_sampler
-    run["random_recs"] = args.random_recs
-    run["prototypes_to_use"] = args.prototypes_to_use
-    run["classif_loss"] = args.classif_loss
-    run["epsilon"] = params['epsilon']
-    run["path"] = args.path
-    run["valid_dataset"] = args.valid_dataset
-    run["n_repeats"] = args.n_repeats
-    run['new_size'] = args.new_size
-    run["complete_log_path"] = complete_log_path
-    run["foldername"] = foldername
+def create_tracking_run(args, params, complete_log_path, foldername):
+    # External tracking backend removed.
+    return None
 
-    return run
+def make_comet_logger(args, params, complete_log_path, foldername):
+    experiment = Experiment(
+        api_key=os.environ.get("COMET_API_KEY"),  # or hardcode
+        project_name="otitenet",
+        workspace="simon-pelletier",
+        auto_param_logging=False,
+        auto_metric_logging=False
+    )
+    experiment.set_name(foldername)
+    experiment.log_parameters(params)
+    experiment.log_parameter('task', args.task)
+    experiment.log_parameter('model_name', args.model_name)
+    experiment.log_parameter('exp_id', args.exp_id)
+    run_tag = getattr(args, 'run_tag', 'prod')
+    is_test = int('test' in str(run_tag).lower())
+    experiment.log_parameter('run_tag', run_tag)
+    experiment.log_parameter('is_test', is_test)
+    try:
+        experiment.add_tag(str(run_tag))
+        if is_test:
+            experiment.add_tag('test')
+    except Exception:
+        pass
+    experiment.log_parameter('is_stn', args.is_stn)
+    experiment.log_parameter('n_calibration', args.n_calibration)
+    experiment.log_parameter('distance_fct', params['dist_fct'])
+    experiment.log_parameter('groupkfold', args.groupkfold)
+    experiment.log_parameter('dloss', args.dloss)
+    experiment.log_parameter('is_transform', params['is_transform'])
+    experiment.log_parameter('lr', params['lr'])
+    experiment.log_parameter('wd', params['wd'])
+    experiment.log_parameter('margin', params['margin'])
+    experiment.log_parameter('dmargin', params['dmargin'])
+    experiment.log_parameter('smooth', params['smoothing'])
+    experiment.log_parameter('gamma', params['gamma'])
+    experiment.log_parameter('dropout', params['dropout'])
+    experiment.log_parameter('optimizer_type', params['optimizer_type'])
+    experiment.log_parameter('seed', 42)
+    experiment.log_parameter('n_negatives', args.n_negatives)
+    experiment.log_parameter('n_positives', args.n_positives)
+    experiment.log_parameter('n_epochs', args.n_epochs)
+    experiment.log_parameter('bs', args.bs)
+    experiment.log_parameter('weighted_sampler', args.weighted_sampler)
+    experiment.log_parameter('random_recs', args.random_recs)
+    experiment.log_parameter('prototypes_to_use', args.prototypes_to_use)
+    experiment.log_parameter('classif_loss', args.classif_loss)
+    experiment.log_parameter('epsilon', params['epsilon'])
+    experiment.log_parameter('path', args.path)
+    experiment.log_parameter('valid_dataset', args.valid_dataset)
+    experiment.log_parameter('n_repeats', args.n_repeats)
+    experiment.log_parameter('new_size', args.new_size)
+    experiment.log_parameter('complete_log_path', complete_log_path)
+    experiment.log_parameter('foldername', foldername)
 
-
-def add_to_neptune(values, run):
+    return experiment
+    
+def add_to_comet(values, logger, epoch):
     """
-    Add values to the neptune run
+    Add values to the comet logger
+    Args:
+        values: Dict of values to be logged
+        logger: Logger for the current experiment
+        epoch: Epoch of the values getting logged
+
+    """
+    for group in list(values.keys()):
+        try:
+            if not np.isnan(values[group]['closs'][-1]):
+                logger.log_metric(f'closs/{group}', values[group]['closs'][-1], epoch)
+            if not np.isnan(values[group]['acc'][-1]):
+                logger.log_metric(f'acc/{group}', values[group]['acc'][-1], epoch)
+            if not np.isnan(values[group]['mcc'][-1]):
+                logger.log_metric(f'mcc/{group}', values[group]['mcc'][-1], epoch)
+            if not np.isnan(values[group]['tpr'][-1]):
+                logger.log_metric(f'tpr/{group}', values[group]['tpr'][-1], epoch)
+            if not np.isnan(values[group]['tnr'][-1]):
+                logger.log_metric(f'tnr/{group}', values[group]['tnr'][-1], epoch)
+            if not np.isnan(values[group]['ppv'][-1]):
+                logger.log_metric(f'ppv/{group}', values[group]['ppv'][-1], epoch)
+            if not np.isnan(values[group]['npv'][-1]):
+                logger.log_metric(f'npv/{group}', values[group]['npv'][-1], epoch)
+            if not np.isnan(values[group]['top3'][-1]):
+                logger.log_metric(f'top3/{group}', values[group]['top3'][-1], epoch)
+        except:
+            pass
+
+def add_to_tracking(values, run):
+    """
+    Add values to the mlflow run
     Args:
         values: Dict of values to be logged
         run: Logger for the current experiment
         epoch: Epoch of the values getting logged
 
     """
+    if run is None:
+        return
     run['all/dloss'].log(values['all']['dloss'][-1])
     for group in list(values.keys()):
         try:
@@ -297,7 +342,7 @@ class LogConfusionMatrix:
             figure = plot_confusion_matrix(cm, class_names=unique_real_classes, acc=acc, mcc=mcc)
             if mlops == "tensorboard":
                 logger.add_figure(f"CM_{group}_all", figure, epoch)
-            elif mlops == "neptune":
+            elif mlops == "mlflow":
                 logger[f"CM_{group}_all"].upload(figure)
             elif mlops == "mlflow":
                 mlflow.log_figure(figure, f"CM_{group}_all.png")
@@ -316,7 +361,7 @@ class LogConfusionMatrix:
             figure = plot_confusion_matrix(cm, class_names=unique_labels, acc=acc, mcc=mcc)
             if mlops == "tensorboard":
                 logger.add_figure(f"CM_{group}", figure, epoch)
-            elif mlops == "neptune":
+            elif mlops == "mlflow":
                 logger[f"CM_{group}"].upload(figure)
             elif mlops == "mlflow":
                 mlflow.log_figure(figure, f"CM_{group}.png")
@@ -339,10 +384,10 @@ class LogConfusionMatrix:
 
         train = Train("Reconstruction", RandomForestClassifier, rec_data, hparams_names,
                       self.complete_log_path,
-                      args, run, ovr=0, binary=False, mlops='neptune')
+                      args, run, ovr=0, binary=False, mlops='mlflow')
         _ = gp_minimize(train.train, rfc_space, n_calls=20, random_state=1)
         train = Train("Encoded", RandomForestClassifier, enc_data, hparams_names, self.complete_log_path,
-                      args, run, ovr=0, binary=False, mlops='neptune')
+                      args, run, ovr=0, binary=False, mlops='mlflow')
         _ = gp_minimize(train.train, rfc_space, n_calls=20, random_state=1)
 
     def reset(self):
@@ -531,7 +576,7 @@ def interactions_mean_matrix(shap_interactions, run, group):
 def make_summary_plot(df, values, group, run, log_path, category='explainer', mlops='mlflow'):
     shap.summary_plot(values, df, show=False)
     f = plt.gcf()
-    if mlops == 'neptune':
+    if mlops == 'mlflow':
         run[f'shap/summary_{category}/{group}_values'].upload(f)
     if mlops == 'mlflow':
         os.makedirs(f'{log_path}/shap/summary_{category}', exist_ok=True)
@@ -543,7 +588,7 @@ def make_summary_plot(df, values, group, run, log_path, category='explainer', ml
 def make_force_plot(df, values, features, group, run, log_path, category='explainer', mlops='mlflow'):
     shap.force_plot(df, values, features=features, show=False)
     f = plt.gcf()
-    if mlops == 'neptune':
+    if mlops == 'mlflow':
         run[f'shap/force_{category}/{group}_values'].upload(f)
     if mlops == 'mlflow':
         os.makedirs(f'{log_path}/shap/force_{category}', exist_ok=True)
@@ -555,7 +600,7 @@ def make_force_plot(df, values, features, group, run, log_path, category='explai
 def make_deep_beeswarm(df, values, group, run, log_path, category='explainer', mlops='mlflow'):
     shap.summary_plot(values, feature_names=df.columns, features=df, show=False)
     f = plt.gcf()
-    if mlops == 'neptune':
+    if mlops == 'mlflow':
         run[f'shap/beeswarm_{category}/{group}_values'].upload(f)
     if mlops == 'mlflow':
         os.makedirs(f'{log_path}/shap/beeswarm_{category}', exist_ok=True)
@@ -568,7 +613,7 @@ def make_deep_beeswarm(df, values, group, run, log_path, category='explainer', m
 def make_decision_plot(df, values, misclassified, feature_names, group, run, log_path, category='explainer', mlops='mlflow'):
     shap.decision_plot(df, values, feature_names=list(feature_names), show=False, link='logit', highlight=misclassified)
     f = plt.gcf()
-    if mlops == 'neptune':
+    if mlops == 'mlflow':
         run[f'shap/decision_{category}/{group}_values'].upload(f)
         run[f'shap/decision_{category}/{group}_values'].upload(f)
     if mlops == 'mlflow':
@@ -581,7 +626,7 @@ def make_decision_plot(df, values, misclassified, feature_names, group, run, log
 def make_decision_deep(df, values, misclassified, feature_names, group, run, log_path, category='explainer', mlops='mlflow'):
     shap.decision_plot(df, values, feature_names=list(feature_names), show=False, link='logit', highlight=misclassified)
     f = plt.gcf()
-    if mlops == 'neptune':
+    if mlops == 'mlflow':
         run[f'shap/decision_{category}/{group}_values'].upload(f)
         run[f'shap/decision_{category}/{group}_values'].upload(f)
     if mlops == 'mlflow':
@@ -594,7 +639,7 @@ def make_decision_deep(df, values, misclassified, feature_names, group, run, log
 def make_multioutput_decision_plot(df, values, group, run, log_path, category='explainer', mlops='mlflow'):
     shap.multioutput_decision_plot(values, df, show=False)
     f = plt.gcf()
-    if mlops == 'neptune':
+    if mlops == 'mlflow':
         run[f'shap/multioutput_decision_{category}/{group}_values'].upload(f)
     if mlops == 'mlflow':
         os.makedirs(f'{log_path}/shap/multioutput_decision_{category}', exist_ok=True)
@@ -606,7 +651,7 @@ def make_multioutput_decision_plot(df, values, group, run, log_path, category='e
 def make_group_difference_plot(values, mask, group, run, log_path, category='explainer', mlops='mlflow'):
     shap.group_difference_plot(values, mask, show=False)
     f = plt.gcf()
-    if mlops == 'neptune':
+    if mlops == 'mlflow':
         # run[f'shap/gdiff_{category}/{group}'].upload(f)
         run[f'shap/gdiff_{category}/{group}'].upload(f)
     if mlops == 'mlflow':
@@ -619,7 +664,7 @@ def make_group_difference_plot(values, mask, group, run, log_path, category='exp
 def make_beeswarm_plot(values, group, run, log_path, category='explainer', mlops='mlflow'):
     shap.plots.beeswarm(values, max_display=20, show=False)
     f = plt.gcf()
-    if mlops == 'neptune':
+    if mlops == 'mlflow':
         # run[f'shap/beeswarm_{category}/{group}'].upload(f)
         run[f'shap/beeswarm_{category}/{group}'].upload(f)
     if mlops == 'mlflow':
@@ -632,7 +677,7 @@ def make_beeswarm_plot(values, group, run, log_path, category='explainer', mlops
 def make_heatmap(values, group, run, log_path, category='explainer', mlops='mlflow'):
     shap.plots.heatmap(values, instance_order=values.values.sum(1).argsort(), max_display=20, show=False)
     f = plt.gcf()
-    if mlops == 'neptune':
+    if mlops == 'mlflow':
         # run[f'shap/heatmap_{category}/{group}'].upload(f)
         run[f'shap/heatmap_{category}/{group}'].upload(f)
     if mlops == 'mlflow':
@@ -645,7 +690,7 @@ def make_heatmap_deep(values, group, run, log_path, category='explainer', mlops=
 
     shap.plots.heatmap(pd.DataFrame(values), instance_order=values.sum(1).argsort(), max_display=20, show=False)
     f = plt.gcf()
-    if mlops == 'neptune':
+    if mlops == 'mlflow':
         # run[f'shap/heatmap_{category}/{group}'].upload(f)
         run[f'shap/heatmap_{category}/{group}'].upload(f)
     if mlops == 'mlflow':
@@ -660,7 +705,7 @@ def make_barplot(df, y, values, group, run, log_path, category='explainer', mlop
     # shap.plots.bar(values, max_display=20, show=False, clustering=clustering)
     shap.plots.bar(values, max_display=20, show=False, clustering=clustering, clustering_cutoff=0.5)
     f = plt.gcf()
-    if mlops == 'neptune':
+    if mlops == 'mlflow':
         run[f'shap/bar_{category}/{group}'].upload(f)
     if mlops == 'mlflow':
         os.makedirs(f'{log_path}/shap/bar_{category}', exist_ok=True)
@@ -672,7 +717,7 @@ def make_barplot(df, y, values, group, run, log_path, category='explainer', mlop
 def make_bar_plot(df, values, group, run, log_path, category='explainer', mlops='mlflow'):
     shap.bar_plot(values, max_display=40, feature_names=df.columns, show=False)
     f = plt.gcf()
-    if mlops == 'neptune':
+    if mlops == 'mlflow':
         # run[f'shap/barold_{category}/{group}'].upload(f)
         run[f'shap/barold_{category}/{group}'].upload(f)
     if mlops == 'mlflow':
@@ -685,7 +730,7 @@ def make_bar_plot(df, values, group, run, log_path, category='explainer', mlops=
 def make_dependence_plot(df, values, var, group, run, log_path, category='explainer', mlops='mlflow'):
     shap.dependence_plot(var, values[1], df, show=False)
     f = plt.gcf()
-    if mlops == 'neptune':
+    if mlops == 'mlflow':
         run[f'shap/dependence_{category}/{group}'].upload(f)
     if mlops == 'mlflow':
         os.makedirs(f'{log_path}/shap/dependence_{category}', exist_ok=True)
@@ -717,7 +762,7 @@ def log_shap_images(run, model, inputs, class_names, group, log_path, mlops):
     shap_values_fine = explainer_blur(inputs[1:3], max_evals=5000, batch_size=50, outputs=shap.Explanation.argsort.flip[:4])
     shap.image_plot(shap_values_fine)
     f = plt.gcf()
-    if mlops == 'neptune':
+    if mlops == 'mlflow':
         run[f'shap/images/{group}'].upload(f)
     if mlops == 'mlflow':
         os.makedirs(f'{log_path}/images/barold', exist_ok=True)
@@ -851,7 +896,7 @@ def log_shap(run, ae, best_lists, cols, n_meta, mlops, log_path, device, log_dee
                                  )
 
 
-def log_neptune(run, traces):
+def log_tracking(run, traces):
     if not np.isnan(traces['rec_loss']):
         run["rec_loss"].log(traces['rec_loss'])
     if not np.isnan(traces['dom_loss']):
@@ -1227,7 +1272,7 @@ def log_ORD(ordin, logger, data, uniques, mlops, epoch, transductive=False):
 
         if mlops == "tensorboard":
             logger.add_figure(f'{ordin["name"]}_{name}', fig, epoch)
-        elif mlops == "neptune":
+        elif mlops == "mlflow":
             logger[f'{ordin["name"]}/{name}'].upload(fig)
         elif mlops == "mlflow":
             mlflow.log_figure(fig, f'{ordin["name"]}/{name}.png')
@@ -1331,7 +1376,7 @@ def log_LDA(ordin, logger, data, uniques, mlops, epoch):
 
         if mlops == "tensorboard":
             logger.add_figure(f'{ordin["name"]}_{name}', fig, epoch)
-        elif mlops == "neptune":
+        elif mlops == "mlflow":
             logger[f'{ordin["name"]}/{name}'].upload(fig)
         elif mlops == "mlflow":
             mlflow.log_figure(fig, f'{ordin["name"]}/{name}.png')
@@ -1421,7 +1466,7 @@ def log_CCA(ordin, logger, data, uniques, mlops, epoch):
 
         if mlops == "tensorboard":
             logger.add_figure(f'{ordin["name"]}_{name}', fig, epoch)
-        elif mlops == "neptune":
+        elif mlops == "mlflow":
             logger[f'{ordin["name"]}/{name}'].upload(fig)
         elif mlops == "mlflow":
             mlflow.log_figure(fig, f'{ordin["name"]}/{name}.png')
@@ -1451,7 +1496,7 @@ def log_metrics(logger, lists, values, model, unique_labels, unique_batches, epo
                                 except:
                                     logger.add_scalar(f'{metric}/{group}/{repres}/{info}',
                                                       values[group][metric][repres][info][0], epoch)
-                            elif mlops == "neptune":
+                            elif mlops == "mlflow":
                                 try:
                                     logger[f'{metric}/{group}/{repres}/{info}'].log(
                                         values[group][metric][repres][info][0])
@@ -1475,7 +1520,7 @@ def log_metrics(logger, lists, values, model, unique_labels, unique_batches, epo
                                                       values[group][metric][repres][info][0], epoch)
                                 except:
                                     pass
-                            elif mlops == "neptune":
+                            elif mlops == "mlflow":
                                 try:
                                     logger[f'{metric}/{group}/{repres}/{info}'].log(
                                         values[group][metric][repres][info][0])
@@ -1495,7 +1540,7 @@ def log_metrics(logger, lists, values, model, unique_labels, unique_batches, epo
                                                       values[group][metric][repres][info][0], epoch)
                                 except:
                                     pass
-                            elif mlops == "neptune":
+                            elif mlops == "mlflow":
                                 try:
                                     logger[f'{metric}/{group}/{repres}/{info}'].log(
                                         values[group][metric][repres][info][0])
@@ -1538,7 +1583,7 @@ def log_metrics(logger, lists, values, model, unique_labels, unique_batches, epo
                         logger.add_scalar(f'F1_{metric}/{group}/{repres}/domains',
                                           values[group][f"F1_{metric}"][repres]['domains'],
                                           epoch)
-                    elif mlops == "neptune":
+                    elif mlops == "mlflow":
                         logger[f'F1_{metric}/{group}/{repres}/domains'].log(
                             values[group][f"F1_{metric}"][repres]['domains'],
                         )
@@ -1561,7 +1606,7 @@ def log_metrics(logger, lists, values, model, unique_labels, unique_batches, epo
                             logger.add_scalar(f'{metric}/{group}/{repres}/{info}',
                                               values[group][metric][repres][info][0],
                                               epoch)
-                        elif mlops == "neptune":
+                        elif mlops == "mlflow":
                             logger[f'{metric}/{group}/{repres}/{info}'].log(
                                 values[group][metric][repres][info][0])
                         elif mlops == "mlflow":
@@ -1577,7 +1622,7 @@ def log_metrics(logger, lists, values, model, unique_labels, unique_batches, epo
                             logger.add_scalar(f'F1_{metric}/{group}/{repres}/domains',
                                               values[group][f"F1_{metric}"][repres]['domains'],
                                               epoch)
-                        elif mlops == "neptune":
+                        elif mlops == "mlflow":
                             logger[f'F1_{metric}/{group}/{repres}/domains'].log(
                                 values[group][f"F1_{metric}"][repres]['domains'])
                         elif mlops == "mlflow":
@@ -1646,7 +1691,7 @@ def log_metrics(logger, lists, values, model, unique_labels, unique_batches, epo
             # logger.add_figure(f"LISI_train", figure, epoch)
             if mlops == "tensorboard":
                 logger.add_figure(f"LISI_train", figure, epoch)
-            elif mlops == "neptune":
+            elif mlops == "mlflow":
                 logger[f'LISI_train'].log(figure)
             elif mlops == "mlflow":
                 mlflow.log_figure(figure, f'LISI_train.png')
@@ -1660,7 +1705,7 @@ def log_metrics(logger, lists, values, model, unique_labels, unique_batches, epo
             ax = sns.boxplot(x="representation", y="lisi", data=lisi_df_valid)
             if mlops == "tensorboard":
                 logger.add_figure(f"LISI_valid", figure, epoch)
-            elif mlops == "neptune":
+            elif mlops == "mlflow":
                 logger[f'LISI_valid'].log(figure)
             elif mlops == "mlflow":
                 mlflow.log_figure(figure, f'LISI_valid.png')
@@ -1674,7 +1719,7 @@ def log_metrics(logger, lists, values, model, unique_labels, unique_batches, epo
             sns.set_theme(style="white")
             if mlops == "tensorboard":
                 logger.add_figure(f"LISI_test", figure, epoch)
-            elif mlops == "neptune":
+            elif mlops == "mlflow":
                 logger[f'LISI_test'].log(figure)
             elif mlops == "mlflow":
                 mlflow.log_figure(figure, f'LISI_test.png')
@@ -1938,7 +1983,7 @@ def save_roc_curve(y_pred_proba, y_test, unique_labels, name, binary, acc, mlops
         if logger is not None:
             if mlops == 'tensorboard':
                 logger.add_figure('ROC', fig, 0)
-            if mlops == 'neptune':
+            if mlops == 'mlflow':
                 logger['ROC'].log(fig)
         if mlops == 'mlflow':
             mlflow.log_figure(fig, name)
@@ -1999,7 +2044,7 @@ def log_pca(lists, path, logger=None, mlops=True):
     if logger is not None:
         if mlops == 'tensorboard':
             logger.add_figure('pca', fig, 0)
-        if mlops == 'neptune':
+        if mlops == 'mlflow':
             logger['pca'].log(fig)
     if mlops == 'mlflow':
         plt.savefig(f'{path}/pca.png')

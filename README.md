@@ -1,53 +1,75 @@
-# Otitenet
+# Otitenet - AI-Powered Otitis Classification
 
-Use python3.11
+## Project Overview
+Otitenet is a framework for domain-generalized otitis classification using Siamese networks (ResNet-18, VGG16, EfficientNet, ViT) with prototype representations, structural regularization, and advanced interpretability (SHAP/Grad-CAM).
 
+## 🚀 Quick Start
+
+### 1. Installation
+Ensure you are using **Python 3.11**.
+```bash
 python -m pip install -r requirements.txt
-
 python setup.py
+```
 
-make_dataset2.py
-
-train_triplet_new.py
-
-# MLFLOW
-
-ssh -L 8502:localhost:8502 simon@198.168.189.19
-
-streamlit run app.py --server.address 0.0.0.0 --server.port 8502
-
-# make new db
-python init_db.py
-
-sudo mysql -u root -p
--- Create the database
+### 2. Database Setup
+The system uses MySQL for result tracking. Ensure `results_db` is configured:
+```sql
 CREATE DATABASE results_db;
-
--- Grant privileges to the user
-GRANT ALL PRIVILEGES ON results_db.* TO 'y_user'@'%';
-
--- Set the user's password
-ALTER USER 'y_user'@'%' IDENTIFIED BY 'password';
-
--- Apply the changes
+GRANT ALL PRIVILEGES ON results_db.* TO 'y_user'@'%' IDENTIFIED BY 'password';
 FLUSH PRIVILEGES;
+```
+Initialize the schema:
+```bash
+python scripts/utils/init_db.py
+```
 
-## Dataset Preprocessing & Transformations (`make_dataset2.py`)
+### 3. Launching Experiments
+Use the root bash scripts to manage large-scale runs:
+- **`./launch.sh`**: Standard batch execution for the full model grid.
+  - `--test`: Run in smoke mode (1 epoch, 1 trial).
+  - `--jobs=N`: Limit concurrent jobs.
+  - `--force`: Ignore `.done` markers and rerun everything.
+- **`./launch_optimize.sh`**: Run hyperparameter optimization.
 
-This script processes raw image datasets and creates a unified dataset folder with resized images and a CSV metadata file.
+### 4. Running the Application
+```bash
+streamlit run app.py --server.address 0.0.0.0 --server.port 8502
+```
 
-**Transformations applied:**
-- **Resize:** All images are resized to a square of the specified size (e.g., 224×224 pixels) using `torchvision.transforms.Resize`.
-- **Format conversion:** Images are loaded and saved in their original format (JPG or PNG), but all are resized and copied to the new dataset folder.
-- **Filtering:** Only images with the correct extension (`.jpg` or `.png`) and not containing 'Off'/'off' in the filename are included.
-- **Stratified split:** The script uses `StratifiedKFold` to assign each image to either the train or test group, ensuring balanced label distribution.
+## 📂 Project Structure
 
-**Output:**
-- Resized images in `data/otite_ds_<size>/`
-- Metadata CSV: `data/otite_ds_<size>/infos.csv` with columns: `dataset`, `name`, `label`, `group`
+- **`scripts/`**: Core logic scripts.
+  - `analysis/`: SHAP, Grad-CAM, and final publication analysis scripts.
+  - `migrations/`: DB schema updates.
+  - `utils/`: DB init, model recovery, and common helpers.
+  - `debug/`: Tools for isolating Grad-CAM and heatmap issues.
+- **`otitenet/`**: Primary Python package containing training loops and model architectures.
+- **`docs/`**: Detailed documentation, implementation reports, and refactoring history.
+- **`output/`**: All generated artifacts.
+  - `analysis/`: Final CSV/MD reports (`PAPER_ANALYSIS.md`).
+  - `paper_figures/`: Publication-quality plots (`0_dataset_eda.png`, `1_architecture_mcc.png`, etc.).
+  - `images/`: General visualizations (PCA/UMAP).
+- **`data/storage/`**: persistent storage for `model.pth` and `results.db`.
+- **`logs/`**: Experiment logs and `.done` completion markers.
 
-## Streamlit App Logic (`app.py`)
+## 📊 Paper Analysis & Results Summary
+After training, generate the full publication suite:
+```bash
+python scripts/analysis/generate_paper_analysis.py
+```
+Results are consolidated in `output/analysis/`. Key figures in the analysis include:
 
+- **Dataset Characteristics (`0_dataset_eda.png`)**: Overview of class distributions and dataset biases.
+- **Architectural Benchmarking (`1_architecture_mcc.png`)**: Performance comparison (MCC) across ResNet, VGG, EfficientNet, and ViT.
+- **Structural Regularization (`2_loss_ablation.png` & `3_prototype_ablation.png`)**: Impact of ArcFace vs. Triplet loss and sub-center prototype strategies.
+- **Domain Invariance (`4_mcc_vs_entropy.png`)**: Evaluation of model robustness against batch effects.
+- **Interpretability Matrix (`6_interpretability.png`)**: Side-by-side comparison of Grad-CAM and SHAP activations for clinical validation.
+- **Performance Leaderboard (`7_top_models_table.png`)**: Summary table of the highest-performing configurations.
+
+## 🛠 Internal Workflows
+
+### Streamlit App Logic
 ```mermaid
 flowchart TD
     A[Start: User opens app.py] --> B{User logged in?}
@@ -74,8 +96,7 @@ flowchart TD
     T --> I
 ```
 
-## Training Logic (`train_triplet_new.py`)
-
+### Training Pipeline
 ```mermaid
 flowchart TD
     A[Start: Script/Module Entry]

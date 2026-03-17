@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import itertools
+import random
 
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler, Normalizer
@@ -22,6 +23,29 @@ from sklearn.metrics import roc_auc_score, PrecisionRecallDisplay
 from skopt import gp_minimize
 from sklearn.preprocessing import label_binarize, OneHotEncoder
 from PIL import Image
+
+
+def set_random_seeds(seed=1, deterministic=False):
+    """Set random seeds for reproducibility across all libraries.
+    
+    Args:
+        seed: Random seed value (default: 1)
+        deterministic: If True, enable deterministic mode for CUDA (slower but reproducible)
+    """
+    try:
+        seed_int = int(seed)
+    except Exception:
+        seed_int = 1
+    
+    random.seed(seed_int)
+    np.random.seed(seed_int)
+    torch.manual_seed(seed_int)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_int)
+    
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def scale_data(scale, data, device='cpu'):
@@ -659,7 +683,7 @@ def log_confusion_matrix(logger, epoch, lists, unique_labels, traces, mlops):
                                        acc=traces[values]['acc'])
         if mlops == "tensorboard":
             logger.add_figure(f"CM_{values}_all", figure, epoch)
-        elif mlops == "neptune":
+        elif mlops == "mlflow":
             logger[f"CM_{values}_all"].upload(figure)
         elif mlops == "mlflow":
             mlflow.log_figure(figure, f"CM_{values}_all")
@@ -757,7 +781,7 @@ def save_roc_curve(model, x_test, y_test, unique_labels, name, binary, acc, mlop
         if logger is not None:
             if mlops == 'tensorboard':
                 logger.add_figure(name, fig, epoch)
-            if mlops == 'neptune':
+            if mlops == 'mlflow':
                 logger[name].log(fig)
             if mlops == 'mlflow':
                 mlflow.log_figure(fig, name)
@@ -837,7 +861,7 @@ def save_precision_recall_curve(model, x_test, y_test, unique_labels, name, bina
         if logger is not None:
             if mlops == 'tensorboard':
                 logger.add_figure(name, fig, epoch)
-            if mlops == 'neptune':
+            if mlops == 'mlflow':
                 logger[name].log(fig)
             if mlops == 'mlops':
                 mlflow.log_figure(fig, name)
@@ -884,7 +908,7 @@ def save_precision_recall_curve(model, x_test, y_test, unique_labels, name, bina
         if logger is not None:
             if mlops == 'tensorboard':
                 logger.add_figure(f'{name}_multiclass', fig, epoch)
-            if mlops == 'neptune':
+            if mlops == 'mlflow':
                 logger[f'{name}_multiclass'].log(fig)
             if mlops == 'mlflow':
                 mlflow.log_figure(fig, f'{name}_multiclass')
@@ -1248,6 +1272,48 @@ def get_best_params(run, best_vals):
     best_params['classif_loss'] = run['classif_loss'].fetch()
     best_params['complete_log_path'] = run['complete_log_path'].fetch()
 
+    best_params['mcc/valid'] = best_vals['valid']['mcc'][-1]
+    best_params['acc/valid'] = best_vals['valid']['acc'][-1]
+    best_params['mcc/test'] = best_vals['test']['mcc'][-1]
+    best_params['acc/test'] = best_vals['test']['acc'][-1]
+
+    return best_params
+
+def get_best_params_comet(logger, best_vals):
+    """
+    Placeholder function to get the best parameters from comet logger.
+    Returns:
+        dict: Best parameters.
+    """
+    best_params = {}
+    best_params['model_name'] = logger.get_parameter('model_name')
+    best_params['exp_id'] = logger.get_parameter('exp_id')
+    best_params['is_stn'] = logger.get_parameter('is_stn')
+    best_params['n_calibration'] = logger.get_parameter('n_calibration')
+    best_params['distance_fct'] = logger.get_parameter('distance_fct')
+    best_params['groupkfold'] = logger.get_parameter('groupkfold')
+    best_params['dloss'] = logger.get_parameter('dloss')
+    best_params['is_transform'] = logger.get_parameter('is_transform')
+    best_params['lr'] = logger.get_parameter('lr')
+    best_params['wd'] = logger.get_parameter('wd')
+    best_params['margin'] = logger.get_parameter('margin')
+    best_params['dmargin'] = logger.get_parameter('dmargin')
+    best_params['smooth'] = logger.get_parameter('smooth')
+    best_params['gamma'] = logger.get_parameter('gamma')
+    best_params['dropout'] = logger.get_parameter('dropout')
+    best_params['optimizer_type'] = logger.get_parameter('optimizer_type')
+    best_params['foldername'] = logger.get_parameter('foldername')
+    best_params['seed'] = logger.get_parameter('seed')
+    best_params['n_negatives'] = logger.get_parameter('n_negatives')
+    best_params['n_positives'] = logger.get_parameter('n_positives')
+    best_params['n_epochs'] = logger.get_parameter('n_epochs')
+    best_params['bs'] = logger.get_parameter('bs')
+    best_params['weighted_sampler'] = logger.get_parameter('weighted_sampler')
+    best_params['random_recs'] = logger.get_parameter('random_recs')
+    best_params['prototypes_to_use'] = logger.get_parameter('prototypes_to_use')
+    best_params['classif_loss'] = logger.get_parameter('classif_loss')
+    best_params['complete_log_path'] = logger.get_parameter('complete_log_path')
+    
     best_params['mcc/valid'] = best_vals['valid']['mcc'][-1]
     best_params['acc/valid'] = best_vals['valid']['acc'][-1]
     best_params['mcc/test'] = best_vals['test']['mcc'][-1]

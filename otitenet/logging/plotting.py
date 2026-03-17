@@ -96,7 +96,7 @@ def save_roc_curve(y_pred_proba, y_test, unique_labels, name, binary, acc, mlops
         if logger is not None:
             if mlops == 'tensorboard':
                 logger.add_figure(name, fig, epoch)
-            if mlops == 'neptune':
+            if mlops == 'mlflow':
                 logger[name].log(fig)
         if mlops == 'mlflow':
             mlflow.log_figure(fig, name)

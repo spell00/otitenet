@@ -1,0 +1,181 @@
+"""Shared utilities for encoding data and computing prototypes with augmentation support."""
+
+import numpy as np
+import torch
+import torchvision.transforms as transforms
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
+
+
+def get_base_transform():
+    """Get base transform (no augmentation) for inference and validation/test encoding."""
+    return transforms.Compose([
+        transforms.ToTensor()
+    ])
+
+
+def get_knn_augmentation_transform(image_size: int):
+    """Get augmentation transform for KNN expansion (train set only).
+    
+    Args:
+        image_size: Target image size for RandomResizedCrop
+        
+    Returns:
+        Composed transform with random flips, rotations, and crops
+    """
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(degrees=(-180, 180)),
+        transforms.RandomApply(
+            [transforms.RandomResizedCrop(
+                size=image_size,
+                scale=(0.8, 1.0),
+                ratio=(0.8, 1.2)
+            )], p=0.5),
+    ])
+
+
+def encode_split_with_augmentation(
+    inputs, labels, batches,
+    model, device, batch_size,
+    split_name: str = 'train',
+    n_aug: int = 0,
+    image_size: int = 224
+):
+    """Encode a data split with optional augmentation for train only.
+    
+    Semantics:
+    - n_aug = 0: Only original images (1 sample per image)
+    - n_aug >= 1: Original + n_aug augmented copies (1+n_aug samples per image)
+    - Augmentation only applied to 'train' split; valid/test always use base transform
+    
+    Args:
+        inputs: List of PIL images
+        labels: Array of labels
+        batches: Array of batch/domain IDs
+        model: Trained neural network model
+        device: Device to run model on
+        batch_size: Batch size for encoding
+        split_name: 'train', 'valid', or 'test'
+        n_aug: Number of extra augmented copies per image (0 = originals only)
+        image_size: Image size for transforms
+        
+    Returns:
+        encodings: (N, D) array of encoded vectors
+        labels_out: (N,) array of labels (repeated per augmentation)
+    """
+    base_transform = get_base_transform()
+    knn_aug_transform = get_knn_augmentation_transform(image_size)
+    
+    encs = []
+    labs = []
+    
+    with torch.no_grad():
+        for i in range(0, len(inputs), batch_size):
+            batch_inputs = inputs[i:i + batch_size]
+            batch_labels = labels[i:i + batch_size]
+            batch_batches = batches[i:i + batch_size]
+            
+            transformed = []
+            labs_batch = []
+            
+            for j in range(len(batch_inputs)):
+                # Determine number of repeats (original + extras)
+                repeats = 1 + max(0, n_aug) if split_name == 'train' else 1
+                
+                for r in range(repeats):
+                    # r == 0 -> original; r > 0 -> augmented (when n_aug > 0)
+                    if split_name == 'train' and r > 0:
+                        sample = knn_aug_transform(batch_inputs[j])
+                    else:
+                        sample = base_transform(batch_inputs[j])
+                    
+                    transformed.append(sample)
+                    labs_batch.append(batch_labels[j])
+            
+            if not transformed:
+                continue
+            
+            tensor_batch = torch.stack(transformed).to(device)
+            encoded, _ = model(tensor_batch)
+            encs.append(encoded.detach().cpu().numpy())
+            labs.extend(labs_batch)
+    
+    return np.concatenate(encs), np.array(labs)
+
+
+def compute_prototypes_by_strategy(
+    encodings: np.ndarray,
+    class_ids: np.ndarray,
+    strategy: str = 'mean',
+    n_components: int = 1,
+    random_state: int = 1
+) -> dict:
+    """Compute prototypes per class using specified strategy.
+    
+    Args:
+        encodings: (N, D) array of encoded vectors
+        class_ids: (N,) array of class indices
+        strategy: 'mean', 'kmeans', or 'gmm'
+        n_components: Number of clusters/components per class
+        random_state: Random seed for clustering
+        
+    Returns:
+        dict {class_id: [(proto_vector, component_idx), ...]} with n_components entries per class
+    """
+    prototypes_by_class = {}
+    unique_classes = np.unique(class_ids)
+    
+    for cls_id in unique_classes:
+        cls_mask = class_ids == cls_id
+        cls_encs = encodings[cls_mask]
+        
+        if len(cls_encs) == 0:
+            continue
+        
+        protos_for_class = []
+        
+        if strategy == 'mean' or len(cls_encs) <= 1:
+            # Single mean prototype per class
+            protos_for_class.append((np.mean(cls_encs, axis=0), 0))
+        elif strategy == 'kmeans':
+            n_clust = min(n_components, len(cls_encs))
+            km = KMeans(n_clusters=n_clust, n_init=5, random_state=random_state)
+            km.fit(cls_encs)
+            for i in range(n_clust):
+                protos_for_class.append((km.cluster_centers_[i], i))
+        elif strategy in ['gmm', 'em', 'expectation_maximization']:
+            n_comp = min(n_components, len(cls_encs))
+            gm = GaussianMixture(n_components=n_comp, random_state=random_state)
+            gm.fit(cls_encs)
+            for i in range(n_comp):
+                protos_for_class.append((gm.means_[i], i))
+        
+        prototypes_by_class[cls_id] = protos_for_class
+    
+    return prototypes_by_class
+
+
+def flatten_prototype_dict(proto_dict: dict) -> tuple:
+    """Flatten prototype dict to arrays of vectors and labels.
+    
+    Args:
+        proto_dict: {class_id: [(proto_vec, comp_idx), ...], ...}
+        
+    Returns:
+        (proto_vecs, proto_labels): Arrays of prototype vectors and their class IDs
+    """
+    proto_vecs = []
+    proto_labels = []
+    
+    for cls_id in sorted(proto_dict.keys()):
+        for proto_vec, comp_idx in proto_dict[cls_id]:
+            proto_vecs.append(proto_vec)
+            proto_labels.append(cls_id)
+    
+    if not proto_vecs:
+        return np.array([]), np.array([])
+    
+    return np.stack(proto_vecs), np.array(proto_labels)

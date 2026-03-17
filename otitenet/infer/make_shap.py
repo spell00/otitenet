@@ -1,7 +1,6 @@
 import torch
 import pickle
-import neptune
-from ..train.train_triplet_new import TrainAE, set_run, NEPTUNE_PROJECT_NAME, NEPTUNE_API_TOKEN
+from ..train.train_triplet_new import TrainAE
 from ..utils.utils import get_empty_traces
 from ..data.data_getters import get_images_loaders
 from ..data.data_getters import GetData
@@ -38,7 +37,7 @@ if __name__ == '__main__':
     n_cats = len(unique_labels)
     n_batches = len(unique_batches)
     train = TrainAE(args, args.path, load_tb=False, log_metrics=True, keep_models=True,
-                    log_inputs=False, log_plots=True, log_tb=False, log_neptune=True,
+                    log_inputs=False, log_plots=True, log_tb=False, log_tracking=False,
                     log_mlflow=False, groupkfold=args.groupkfold)
     train.n_batches = n_batches
     train.n_cats = n_cats
@@ -104,15 +103,4 @@ if __name__ == '__main__':
         for group in ["train", "valid", "test"]:
             _, best_lists2, traces, knn = train.predict(group, loaders[group], lists, traces)
     best_lists = {**best_lists1, **best_lists2}
-    if train.log_neptune:
-        run = neptune.init_run(
-            project=NEPTUNE_PROJECT_NAME,
-            api_token=NEPTUNE_API_TOKEN,
-        )  # your credentials
-        run = set_run(run, train.best_params)
-        train.log_predictions(best_lists, run, 0)
-        train.save_wrong_classif_imgs(run, {'cnn': shap_model, 'knn': knn},
-                                      best_lists, best_lists['test']['preds'], 
-                                      best_lists['test']['names'], 'test')
-        
-        run.stop()
+    train.log_predictions(best_lists, None, None, 0)
