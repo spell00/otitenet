@@ -13,7 +13,20 @@ import streamlit as st
 import mysql.connector
 from mysql.connector import Error
 from otitenet.app.utils import extract_params_from_log_path, _unique_preserve_order
+import numpy as np
 
+def _mysql_value(x):
+    if isinstance(x, np.generic):
+        return x.item()
+    if isinstance(x, np.ndarray):
+        if x.ndim == 0:
+            return x.item()
+        return str(x.tolist())
+    return x
+
+
+def _mysql_values(values):
+    return tuple(_mysql_value(v) for v in values)
 
 @st.cache_resource
 def get_db_connection():
@@ -99,6 +112,27 @@ def ensure_results_model_id(conn, cursor):
     except Exception:
         # Soft-fail: do not crash app if schema check fails
         conn.rollback()
+
+
+def ensure_registry_metrics_columns(conn, cursor):
+    """Ensure `best_models_registry` has test_mcc, valid_auc, and test_auc columns."""
+    for col in ['test_mcc', 'valid_auc', 'test_auc']:
+        try:
+            cursor.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'best_models_registry'
+                  AND COLUMN_NAME = '{col}'
+                """
+            )
+            has_col = cursor.fetchone()[0] > 0
+            if not has_col:
+                cursor.execute(f"ALTER TABLE best_models_registry ADD COLUMN {col} FLOAT NULL")
+                conn.commit()
+        except Exception as e:
+            print(f"Migration error for {col}: {e}")
 
 
 def ensure_best_models_registry_nsize(conn, cursor):
@@ -303,6 +337,11 @@ def insert_score(cursor, conn, filename, args, pred_label, confidence, log_path)
         log_path: Model log path
     """
     model_id = resolve_model_id(cursor, args, log_path)
+    filename = str(filename)
+    pred_label = str(pred_label)
+    confidence = float(confidence)
+    log_path = str(log_path) if log_path is not None else None
+    model_id = int(model_id) if model_id is not None else None
     query = '''
         INSERT INTO results (
             filename, model_name, task, path, n_neighbors, nsize, fgsm, normalize, n_calibration, classif_loss,
@@ -323,7 +362,7 @@ def insert_score(cursor, conn, filename, args, pred_label, confidence, log_path)
         st.session_state.person_id, model_id
     )
     try:
-        cursor.execute(query, values)
+        cursor.execute(query, _mysql_values(values))
     except mysql.connector.errors.IntegrityError:
         # If the unique key blocks insertion, perform an explicit update to refresh timestamp and values
         update_q = '''
@@ -339,7 +378,7 @@ def insert_score(cursor, conn, filename, args, pred_label, confidence, log_path)
             args.normalize, str(args.n_calibration), args.classif_loss, args.dloss, args.dist_fct, args.prototypes_to_use,
             str(args.n_positives), str(args.n_negatives)
         )
-        cursor.execute(update_q, update_vals)
+        cursor.execute(update_q, _mysql_values(update_vals))
 
     summary_query = '''
         INSERT INTO model_usage_summary (
@@ -355,5 +394,124 @@ def insert_score(cursor, conn, filename, args, pred_label, confidence, log_path)
         args.normalize, str(args.n_calibration), args.classif_loss, args.dloss, args.dist_fct, args.prototypes_to_use,
         str(args.n_positives), str(args.n_negatives), str(args.n_neighbors), 1
     )
-    cursor.execute(summary_query, summary_values)
+    cursor.execute(summary_query, _mysql_values(summary_values))
     conn.commit()
+
+def ensure_production_model_table(conn, cursor):
+    """Ensure production_model table exists for storing the global production model."""
+    try:
+        # First check if table exists
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'production_model'
+            """
+        )
+        table_exists = cursor.fetchone()[0] > 0
+        
+        if not table_exists:
+            cursor.execute(
+                """
+                CREATE TABLE production_model (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    model_id INT NOT NULL,
+                    model_name VARCHAR(255) NOT NULL,
+                    model_number VARCHAR(50),
+                    log_path TEXT,
+                    set_by VARCHAR(255),
+                    set_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (model_id) REFERENCES best_models_registry(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.commit()
+            print("Created production_model table")
+        else:
+            print("production_model table already exists")
+    except Exception as e:
+        print(f"Error creating production_model table: {e}")
+        try:
+            conn.rollback()
+        except:
+            pass
+
+
+def get_production_model(cursor):
+    """Get the current production model from database."""
+    try:
+        cursor.execute(
+            """
+            SELECT pm.model_id, pm.model_name, pm.model_number, pm.log_path, pm.set_by, pm.set_at,
+                   bmr.model_name, bmr.nsize, bmr.fgsm, bmr.prototypes, bmr.npos, bmr.nneg,
+                   bmr.dloss, bmr.dist_fct, bmr.classif_loss, bmr.n_calibration, bmr.accuracy,
+                   bmr.mcc, bmr.normalize, bmr.n_neighbors, bmr.prototype_strategy, bmr.prototype_components
+            FROM production_model pm
+            LEFT JOIN best_models_registry bmr ON pm.model_id = bmr.id
+            ORDER BY pm.set_at DESC
+            LIMIT 1
+            """
+        )
+        row = cursor.fetchone()
+        if row:
+            return {
+                'model_id': row[0],
+                'model_name': row[1],
+                'model_number': row[2],
+                'log_path': row[3],
+                'set_by': row[4],
+                'set_at': row[5],
+                'Model Name': row[6],
+                'NSize': row[7],
+                'FGSM': row[8],
+                'Prototypes': row[9],
+                'NPos': row[10],
+                'NNeg': row[11],
+                'DLoss': row[12],
+                'Dist_Fct': row[13],
+                'Classif_Loss': row[14],
+                'N_Calibration': row[15],
+                'Accuracy': row[16],
+                'MCC': row[17],
+                'Normalize': row[18],
+                'N_Neighbors': row[19],
+                'prototype_strategy': row[20],
+                'prototype_components': row[21],
+            }
+        return None
+    except Exception as e:
+        print(f"Error getting production model: {e}")
+        return None
+
+
+def set_production_model(cursor, conn, model_dict, set_by_email):
+    """Set the production model in database."""
+    try:
+        # First, clear any existing production model
+        cursor.execute("DELETE FROM production_model")
+        
+        # Insert new production model
+        cursor.execute(
+            """
+            INSERT INTO production_model (model_id, model_name, model_number, log_path, set_by)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                model_dict.get('model_id'),
+                model_dict.get('Model Name'),
+                model_dict.get('model_number'),
+                model_dict.get('Log Path'),
+                set_by_email
+            )
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error setting production model: {e}")
+        try:
+            conn.rollback()
+        except:
+            pass
+        return False
+

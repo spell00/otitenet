@@ -32,6 +32,106 @@ Use the root bash scripts to manage large-scale runs:
   - `--force`: Ignore `.done` markers and rerun everything.
 - **`./launch_optimize.sh`**: Run hyperparameter optimization.
 
+### 3.1 Dataset Split Control
+For deterministic runs (`groupkfold=1`), dataset membership is controlled by batch name.
+
+- `--valid_dataset`: dataset reserved for validation.
+- `--test_dataset`: dataset reserved for test. If omitted, the code tries `GMFUNL_jan2023`.
+- `--train_datasets`: optional comma-separated list of datasets to use for training.
+
+Default behavior:
+- If `--train_datasets` is not provided, all datasets except `valid_dataset` and `test_dataset` are used for training.
+- If `--test_dataset` is not found, half of the validation dataset is reassigned to test, and the remaining half stays validation.
+
+Example:
+```bash
+python -m otitenet.train.train_triplet_new \
+  --path=./data/otite_ds_64 \
+  --groupkfold=1 \
+  --valid_dataset=Banque_Viscaino_Chili_2020 \
+  --test_dataset=GMFUNL_jan2023 \
+  --train_datasets=Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM
+```
+
+At runtime, the loader prints a split debug summary such as:
+```text
+[SplitDebug] mode=deterministic valid_dataset=Banque_Viscaino_Chili_2020 test_dataset=GMFUNL_jan2023 train_datasets=['Banque_Comert_Turquie_2020_jpg', 'Banque_Calaman_USA_2020_trie_CM'] fallback_used=False
+[SplitDebug] reason=using all samples from explicit test dataset 'GMFUNL_jan2023' counts(train=945, valid=880, test=15)
+```
+
+### 3.1.1 Score Semantics and Split Reuse
+There are two different validation scores in the project, and they should not be interpreted as the same measurement.
+
+- `best_models_registry.mcc`: the training-time best validation MCC saved by the training loop for the selected run.
+- `Learned Embedding Classification` in the Streamlit app: a post-hoc validation MCC computed after loading the saved backbone, encoding the train/valid sets again, and searching over downstream classifiers such as KNN, prototype strategies, and baseline ML models.
+
+Important consequences:
+
+- A discrepancy between these two values is expected even when they use the same validation split, because they are not the same classifier pipeline.
+- The embedding section may also use train-time augmentation for the encoded train embeddings via `n_aug`, which can further change the downstream validation MCC.
+- The app now reuses saved split manifests from the selected model directory when they exist, so train/valid/test membership matches the original training run instead of being rebuilt heuristically from the current dataset state.
+
+If you need an apples-to-apples check against the registry score, use the app action that recomputes validation MCC with the saved training parameters rather than comparing it to the best score from `Learned Embedding Classification`.
+
+### 3.2 Dataset Preprocessing (Config-Driven)
+Raw source datasets should be placed under:
+- `data/datasets/<dataset_name>/...`
+
+Preprocessing and dataset assembly are already implemented in `otitenet/data/make_dataset2.py` and now support a separate config file:
+- `configs/preprocessing_config.json`
+
+This config controls:
+- `source_root`: where raw datasets are read from.
+- `output_base`: processed dataset prefix (final folder becomes `output_base_<image_size>`).
+- `image_size`: resize target for all exported images.
+- `include_datasets`: explicit dataset names to consider.
+- `exclude_datasets`: dataset names to ignore even if included.
+
+Example use case:
+- include `Banque_Comert_Turquie_2020_jpg`
+- exclude `Banque_Comert_Turquie_2020`
+
+Build the processed dataset with:
+```bash
+python scripts/preprocessing/build_dataset.py --config configs/preprocessing_config.json
+```
+
+Output folder example:
+- `data/otite_ds_64/`
+  - images are resized as part of preprocessing
+  - `infos.csv` is generated with `dataset,name,label,group`
+
+To build another size, change `image_size` in the config (for example `224`) and rerun.
+
+### 3.3 Quick Recipe (Recommended)
+Use this sequence for the standard production path with `otite_ds_64` and `GMFUNL_jan2023` as test set.
+
+1. Build processed dataset from config:
+```bash
+python scripts/preprocessing/build_dataset.py --config configs/preprocessing_config.json
+```
+
+2. Run training with explicit split control:
+```bash
+python -m otitenet.train.train_triplet_new \
+  --path=./data/otite_ds_64 \
+  --groupkfold=1 \
+  --valid_dataset=Banque_Viscaino_Chili_2020 \
+  --test_dataset=GMFUNL_jan2023 \
+  --train_datasets=Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM \
+  --task=notNormal
+```
+
+3. Confirm split in logs:
+- Look for `[SplitDebug]` lines showing:
+  - `test_dataset=GMFUNL_jan2023`
+  - `fallback_used=False`
+
+4. Generate paper analysis outputs:
+```bash
+python scripts/analysis/generate_paper_analysis.py
+```
+
 ### 4. Running the Application
 ```bash
 streamlit run app.py --server.address 0.0.0.0 --server.port 8502

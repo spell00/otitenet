@@ -6,7 +6,7 @@ from torch.autograd import Function
 import pandas as pd
 from torchvision.models import resnet18, ResNet18_Weights, vgg16, VGG16_Weights, resnet50, ResNet50_Weights, \
       efficientnet_b0, EfficientNet_B0_Weights, vit_b_16, ViT_B_16_Weights, efficientnet_b7, EfficientNet_B7_Weights, \
-        vgg11, VGG11_Weights, densenet121, DenseNet121_Weights
+        vgg11, VGG11_Weights, densenet121, DenseNet121_Weights, densenet161, DenseNet161_Weights
 
 
 
@@ -39,6 +39,8 @@ class Net(nn.Module):
     def __init__(self, device, n_cats, n_batches, model_name='resnet18', is_stn=1, n_subcenters=3):
         super(Net, self).__init__()
         self.device = device
+        self.model_name = model_name
+        self.vit_image_size = None
         if model_name == 'resnet18':
             weights = ResNet18_Weights.DEFAULT
             self.model = resnet18(weights=weights).to(device)
@@ -67,9 +69,21 @@ class Net(nn.Module):
             self.model = densenet121(weights=weights).to(device)
             self.dann = nn.Linear(1000, n_batches).to(device)
             self.linear = nn.Linear(1000, n_cats).to(device)
-        elif model_name == 'vit':
+        elif model_name == 'densenet161':
+            weights = DenseNet161_Weights.DEFAULT
+            self.model = densenet161(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'vit_b_16':
             weights = ViT_B_16_Weights.DEFAULT
             self.model = vit_b_16(weights=weights).to(device)
+            self.vit_image_size = int(getattr(self.model, 'image_size', 224))
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'vit_b_16_384':
+            weights = ViT_B_16_Weights.IMAGENET1K_SWAG_E2E_V1
+            self.model = vit_b_16(weights=weights).to(device)
+            self.vit_image_size = 384
             self.dann = nn.Linear(1000, n_batches).to(device)
             self.linear = nn.Linear(1000, n_cats).to(device)
         elif model_name == 'efficientnet_b0':
@@ -96,7 +110,7 @@ class Net(nn.Module):
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 128).to(device))
         elif model_name == 'vgg16':
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
-        elif model_name == 'vit':
+        elif model_name == 'vit_b_16':
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
         elif model_name == 'efficientnet_b0':
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
@@ -104,8 +118,7 @@ class Net(nn.Module):
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
         elif model_name == 'densenet121':
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
-            
-        self.linear = nn.Linear(512, 2).to(device)
+
 
         # Spatial transformer localization-network (unchanged)
         self.localization = nn.Sequential(
@@ -152,6 +165,15 @@ class Net(nn.Module):
         if self.is_stn:
             inp = self.stn(inp)
 
+        if self.model_name == 'vit_b_16' and self.vit_image_size is not None:
+            if inp.shape[-2] != self.vit_image_size or inp.shape[-1] != self.vit_image_size:
+                inp = F.interpolate(
+                    inp,
+                    size=(self.vit_image_size, self.vit_image_size),
+                    mode='bilinear',
+                    align_corners=False,
+                )
+
         # Perform the usual forward pass
         enc = self.model(inp)
         enc = enc.squeeze(-1).squeeze(-1)
@@ -180,6 +202,8 @@ class Net(nn.Module):
 class Net_shap(nn.Module):
     def __init__(self, device, n_cats, n_batches, model_name='resnet18', is_stn=1, n_subcenters=3):
         super(Net_shap, self).__init__()
+        self.model_name = model_name
+        self.vit_image_size = None
         if model_name == 'resnet18':
             weights = ResNet18_Weights.DEFAULT
             self.model = resnet18_no_inplace(weights=weights).to(device)
@@ -203,9 +227,10 @@ class Net_shap(nn.Module):
             self.model = vgg16(weights=weights).to(device)
             self.dann = nn.Linear(1000, n_batches).to(device)
             self.linear = nn.Linear(1000, n_cats).to(device)
-        elif model_name == 'vit':
+        elif model_name == 'vit_b_16':
             weights = ViT_B_16_Weights.DEFAULT
             self.model = vit_b_16(weights=weights).to(device)
+            self.vit_image_size = int(getattr(self.model, 'image_size', 224))
             self.dann = nn.Linear(1000, n_batches).to(device)
             self.linear = nn.Linear(1000, n_cats).to(device)
         elif model_name == 'efficientnet_b0':
@@ -242,7 +267,7 @@ class Net_shap(nn.Module):
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 128).to(device))
         elif model_name == 'vgg16':
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
-        elif model_name == 'vit':
+        elif model_name == 'vit_b_16':
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
         elif model_name == 'efficientnet_b0':
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
@@ -250,8 +275,7 @@ class Net_shap(nn.Module):
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
         elif model_name == 'densenet121':
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
-            
-        self.linear = nn.Linear(512, 2).to(device)
+
 
         # Spatial transformer localization-network (unchanged)
         self.localization = nn.Sequential(
@@ -297,6 +321,15 @@ class Net_shap(nn.Module):
         # Transform the input
         if self.is_stn:
             inp = self.stn(inp)
+
+        if self.model_name == 'vit_b_16' and self.vit_image_size is not None:
+            if inp.shape[-2] != self.vit_image_size or inp.shape[-1] != self.vit_image_size:
+                inp = F.interpolate(
+                    inp,
+                    size=(self.vit_image_size, self.vit_image_size),
+                    mode='bilinear',
+                    align_corners=False,
+                )
 
         # Perform the usual forward pass
         enc = self.model(inp)
@@ -333,6 +366,8 @@ class Net_deep_shap(nn.Module):
     def __init__(self, device, n_cats, n_batches, model_name='resnet18', is_stn=1, n_subcenters=3, shape=(3, 224, 224)):
         super(Net_deep_shap, self).__init__()
         self.shape = shape
+        self.model_name = model_name
+        self.vit_image_size = None
         if model_name == 'resnet18':
             weights = ResNet18_Weights.DEFAULT
             self.model = resnet18_no_inplace(weights=weights).to(device)
@@ -356,9 +391,16 @@ class Net_deep_shap(nn.Module):
             self.model = vgg16(weights=weights).to(device)
             self.dann = nn.Linear(1000, n_batches).to(device)
             self.linear = nn.Linear(1000, n_cats).to(device)
-        elif model_name == 'vit':
+        elif model_name == 'vit_b_16':
             weights = ViT_B_16_Weights.DEFAULT
             self.model = vit_b_16(weights=weights).to(device)
+            self.vit_image_size = int(getattr(self.model, 'image_size', 224))
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'vit_b_16_384':
+            weights = ViT_B_16_Weights.DEFAULT
+            self.model = vit_b_16(weights=weights).to(device)
+            self.vit_image_size = int(getattr(self.model, 'image_size', 224))
             self.dann = nn.Linear(1000, n_batches).to(device)
             self.linear = nn.Linear(1000, n_cats).to(device)
         elif model_name == 'efficientnet_b0':
@@ -374,6 +416,11 @@ class Net_deep_shap(nn.Module):
         elif model_name == 'densenet121':
             weights = DenseNet121_Weights.DEFAULT
             self.model = densenet121(weights=weights).to(device)
+            self.dann = nn.Linear(1000, n_batches).to(device)
+            self.linear = nn.Linear(1000, n_cats).to(device)
+        elif model_name == 'densenet161':
+            weights = DenseNet161_Weights.DEFAULT
+            self.model = densenet161(weights=weights).to(device)
             self.dann = nn.Linear(1000, n_batches).to(device)
             self.linear = nn.Linear(1000, n_cats).to(device)
 
@@ -395,7 +442,7 @@ class Net_deep_shap(nn.Module):
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 128).to(device))
         elif model_name == 'vgg16':
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
-        elif model_name == 'vit':
+        elif model_name == 'vit_b_16':
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
         elif model_name == 'efficientnet_b0':
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
@@ -403,8 +450,9 @@ class Net_deep_shap(nn.Module):
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
         elif model_name == 'densenet121':
             self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
+        elif model_name == 'densenet161':
+            self.subcenters = nn.Parameter(torch.randn(n_cats, n_subcenters, 1000).to(device))
             
-        self.linear = nn.Linear(512, 2).to(device)
 
         # Spatial transformer localization-network (unchanged)
         self.localization = nn.Sequential(
@@ -450,6 +498,15 @@ class Net_deep_shap(nn.Module):
         # Transform the input
         if self.is_stn:
             inp = self.stn(inp)
+
+        if self.model_name == 'vit_b_16' and self.vit_image_size is not None:
+            if inp.shape[-2] != self.vit_image_size or inp.shape[-1] != self.vit_image_size:
+                inp = F.interpolate(
+                    inp,
+                    size=(self.vit_image_size, self.vit_image_size),
+                    mode='bilinear',
+                    align_corners=False,
+                )
 
         # Perform the usual forward pass
         enc = self.model(inp)

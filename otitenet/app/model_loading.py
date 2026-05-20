@@ -131,18 +131,21 @@ def load_model_parameters(model_dir: str) -> dict:
 
 
 @st.cache_resource
-def load_model_and_prototypes(_args):
-    """Load trained model, SHAP model, and prototypes with data setup.
-    
-    Ensures reproducible splits by setting seeds and handles GPU OOM gracefully.
-    
-    Args:
-        _args: Arguments namespace with model parameters
-        
-    Returns:
-        Tuple of (model, shap_model, prototypes, image_size, device, data, 
-                 unique_labels, unique_batches, data_getter)
-    """
+def _load_model_and_prototypes_cached(
+    model_name, task, new_size, fgsm, n_calibration, classif_loss, dloss,
+    prototypes_to_use, n_positives, n_negatives, n_neighbors, normalize,
+    dist_fct, device, path, valid_dataset
+):
+    # Reconstruct namespace locally
+    import argparse
+    _args = argparse.Namespace(
+        model_name=model_name, task=task, new_size=int(new_size), fgsm=str(fgsm),
+        n_calibration=str(n_calibration), classif_loss=str(classif_loss), dloss=str(dloss),
+        prototypes_to_use=str(prototypes_to_use), n_positives=str(n_positives),
+        n_negatives=str(n_negatives), n_neighbors=int(n_neighbors), normalize=str(normalize),
+        dist_fct=str(dist_fct), device=str(device), path=str(path), valid_dataset=str(valid_dataset)
+    )
+
     # Ensure seeds are set for reproducible split
     random.seed(1)
     torch.manual_seed(1)
@@ -150,11 +153,6 @@ def load_model_and_prototypes(_args):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(1)
     
-    data_getter = GetData(_args.path, _args.valid_dataset, _args)
-    data, unique_labels, unique_batches = data_getter.get_variables()
-    n_cats = len(unique_labels)
-    n_batches = len(unique_batches)
-
     params = get_model_params_path(_args)
     parts = params.split('/')
     # remove the last three components: norm..., dist_..., knn...
@@ -163,6 +161,13 @@ def load_model_and_prototypes(_args):
     model_path, proto_path, resolved_k = resolve_model_paths(
         base_dir, _args.normalize, _args.dist_fct, int(_args.n_neighbors)
     )
+
+    model_dir = os.path.dirname(model_path)
+
+    data_getter = GetData(_args.path, _args.valid_dataset, _args, manifest_dir=model_dir)
+    data, unique_labels, unique_batches = data_getter.get_variables()
+    n_cats = len(unique_labels)
+    n_batches = len(unique_batches)
 
     if not (os.path.exists(model_path) and os.path.exists(proto_path)):
         raise FileNotFoundError(f"Model file not found: {model_path}")
@@ -219,7 +224,37 @@ def load_model_and_prototypes(_args):
         'batch': proto_obj.batch_prototypes
     }
 
-    return model, shap_model, prototypes, _args.new_size, _args.device, data, unique_labels, unique_batches, data_getter
+    return model, shap_model, prototypes, _args.new_size, _args.device, data, unique_labels, unique_batches, data_getter, resolved_k
+
+
+def load_model_and_prototypes(_args):
+    """Load trained model, SHAP model, and prototypes with data setup."""
+    res = _load_model_and_prototypes_cached(
+        model_name=_args.model_name,
+        task=_args.task,
+        new_size=int(_args.new_size),
+        fgsm=str(_args.fgsm),
+        n_calibration=str(_args.n_calibration),
+        classif_loss=str(_args.classif_loss),
+        dloss=str(_args.dloss),
+        prototypes_to_use=str(_args.prototypes_to_use),
+        n_positives=str(_args.n_positives),
+        n_negatives=str(_args.n_negatives),
+        n_neighbors=int(_args.n_neighbors),
+        normalize=str(_args.normalize),
+        dist_fct=str(_args.dist_fct),
+        device=str(_args.device),
+        path=str(_args.path),
+        valid_dataset=str(_args.valid_dataset)
+    )
+    
+    # Sync resolved_k back to _args
+    try:
+        _args.n_neighbors = res[9]
+    except Exception:
+        pass
+        
+    return res[0], res[1], res[2], res[3], res[4], res[5], res[6], res[7], res[8]
 
 
 #@st.cache_resource
@@ -276,3 +311,20 @@ def clear_cached_model():
         load_model_for_log_path.clear()
     except Exception:
         pass
+
+def resolve_model_id(model_name=None, complete_log_path=None, model_id=None):
+    """
+    Resolve a stable model identifier from the available model fields.
+    Used by analysis.py to know which model/result entry is being used.
+    """
+    if model_id is not None and str(model_id).strip():
+        return str(model_id)
+
+    if model_name is not None and str(model_name).strip():
+        return str(model_name)
+
+    if complete_log_path is not None and str(complete_log_path).strip():
+        import os
+        return os.path.basename(str(complete_log_path).rstrip("/"))
+
+    return "unknown_model"

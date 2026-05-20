@@ -40,14 +40,21 @@ def evaluate_knn_with_k_search(train_encs: np.ndarray, train_cats: np.ndarray,
     
     for k in range(min_k, max_k):
         knn = fit_knn_classifier(train_encs, train_cats, n_neighbors=k, metric=metric)
-        preds = knn.predict(valid_encs)
-        mcc_val = MCC(valid_cats, preds)
-        mcc_train = MCC(train_cats, knn.predict(train_encs))
-        mcc_per_k.append({'k': k, 'valid_mcc': float(mcc_val), 'train_mcc': float(mcc_train)})
+        from otitenet.ml.classifiers import _get_clf_metrics
+        valid_mcc, valid_auc = _get_clf_metrics(knn, valid_encs, valid_cats)
+        train_mcc, train_auc = _get_clf_metrics(knn, train_encs, train_cats)
         
-        if mcc_val > best_mcc:
+        mcc_per_k.append({
+            'k': k, 
+            'valid_mcc': float(valid_mcc), 
+            'valid_auc': float(valid_auc),
+            'train_mcc': float(train_mcc),
+            'train_auc': float(train_auc)
+        })
+        
+        if valid_mcc > best_mcc:
             best_k = k
-            best_mcc = mcc_val
+            best_mcc = valid_mcc
     
     return best_k, float(best_mcc), mcc_per_k
 
@@ -77,6 +84,11 @@ def evaluate_baseline_classifiers(train_encs: np.ndarray, train_cats: np.ndarray
     """
     results = {}
     classifiers = fit_baseline_classifiers(train_encs, train_cats, valid_encs, valid_cats, progress_placeholder, classifier_params)
+    label_map = classifiers.pop('label_map', {})
+    label_encoder = classifiers.pop('label_encoder', None)
+    results['label_map'] = label_map
+    results['label_encoder'] = label_encoder
+    
     classifier_names = list(classifiers.keys())
     total = len(classifier_names)
     for idx, (name, clf) in enumerate(classifiers.items()):
@@ -88,10 +100,12 @@ def evaluate_baseline_classifiers(train_encs: np.ndarray, train_cats: np.ndarray
             results[name] = {'mcc': None, 'train_mcc': None, 'error': 'Failed to fit'}
             continue
         try:
-            mcc_val = classifiers[name]['valid_mcc']
-            train_mcc = classifiers[name]['train_mcc']
+            mcc_val = clf['valid_mcc']
+            train_mcc = clf['train_mcc']
             results[name] = {
-                'mcc': mcc_val, 'train_mcc': train_mcc, 'classifier': clf
+                'mcc': mcc_val, 'train_mcc': train_mcc, 'classifier': clf['classifier'],
+                'valid_auc': clf.get('valid_auc'), 'test_auc': clf.get('test_auc'),
+                'train_auc': clf.get('train_auc')
             }
         except Exception as e:
             results[name] = {'mcc': None, 'train_mcc': None, 'error': str(e)}
@@ -141,6 +155,7 @@ def evaluate_kde_classifiers(train_encs: np.ndarray, train_cats: np.ndarray,
                 
                 if mcc_val > best_result['mcc']:
                     best_result = {
+                        'mcc': mcc_val,
                         'valid_mcc': mcc_val,
                         'train_mcc': mcc_train,
                         'kernel': kernel,
@@ -158,7 +173,9 @@ def evaluate_all_classifiers(train_encs: np.ndarray, train_cats: np.ndarray,
                             valid_encs: np.ndarray, valid_cats: np.ndarray,
                             min_k: int = 1, max_k: int = 20,
                             include_kde: bool = True,
-                            include_baselines: bool = True) -> Dict:
+                            include_baselines: bool = True,
+                            test_encs: Optional[np.ndarray] = None,
+                            test_cats: Optional[np.ndarray] = None) -> Dict:
     """Evaluate all classifier types and return comprehensive results.
     
     Args:
@@ -183,14 +200,62 @@ def evaluate_all_classifiers(train_encs: np.ndarray, train_cats: np.ndarray,
     results['knn'] = {
         'best_k': best_k,
         'best_mcc': best_mcc_knn,
+        'valid_mcc': best_mcc_knn,
         'mcc_per_k': mcc_per_k
     }
+    # Add AUC and test metrics for best k
+    for item in mcc_per_k:
+        if item['k'] == best_k:
+            results['knn']['valid_auc'] = item.get('valid_auc')
+            break
+            
+    if test_encs is not None and test_cats is not None:
+        from otitenet.ml.classifiers import fit_knn_classifier, _get_clf_metrics
+        best_knn = fit_knn_classifier(train_encs, train_cats, n_neighbors=best_k)
+        test_mcc, test_auc = _get_clf_metrics(best_knn, test_encs, test_cats)
+        results['knn']['test_mcc'] = test_mcc
+        results['knn']['test_auc'] = test_auc
     
     # Baseline classifiers
     if include_baselines:
+        from otitenet.ml.classifiers import _get_clf_metrics
         baseline_results = evaluate_baseline_classifiers(
             train_encs, train_cats, valid_encs, valid_cats
         )
+        if test_encs is not None and test_cats is not None:
+            # Use LabelEncoder if present for consistent label mapping
+            label_encoder = baseline_results.get('label_encoder')
+            label_map = baseline_results.get('label_map', {})
+            test_cats_int = None
+            
+            if label_encoder:
+                try:
+                    test_cats_int = label_encoder.transform(test_cats)
+                except Exception:
+                    test_cats_int = None
+            
+            if test_cats_int is None and label_map:
+                try:
+                    # Fallback to manual string-safe lookup
+                    test_cats_int = np.array([label_map.get(str(x)) for x in test_cats])
+                    if None in test_cats_int:
+                        test_cats_int = None
+                except Exception:
+                    test_cats_int = None
+                    
+            for clf_name, clf_data in baseline_results.items():
+                if clf_name in ['label_map', 'label_encoder']:
+                    continue
+                clf_obj = clf_data.get('classifier')
+                if clf_obj:
+                    # Defensive check: if double-wrapped as dict, extract object
+                    if isinstance(clf_obj, dict) and 'classifier' in clf_obj:
+                        clf_obj = clf_obj['classifier']
+                        
+                    if clf_obj and hasattr(clf_obj, 'predict'):
+                        test_mcc, test_auc = _get_clf_metrics(clf_obj, test_encs, test_cats, y_int=test_cats_int)
+                        clf_data['test_mcc'] = test_mcc
+                        clf_data['test_auc'] = test_auc
         results['baselines'] = baseline_results
     
     # KDE classifiers
@@ -200,7 +265,26 @@ def evaluate_all_classifiers(train_encs: np.ndarray, train_cats: np.ndarray,
         )
         if kde_result.get('mcc', -1) > -1:
             results['kde'] = kde_result
+            
+    # Find overall best and populate top-level metrics
+    best_method, best_mcc, best_params = compare_classifiers(results)
+    results['best_valid_mcc'] = best_mcc
     
+    if best_method == 'knn':
+        results['best_valid_auc'] = results['knn'].get('valid_auc')
+        results['best_test_mcc'] = results['knn'].get('test_mcc')
+        results['best_test_auc'] = results['knn'].get('test_auc')
+    elif best_method.startswith('baseline_'):
+        bl_name = best_method.replace('baseline_', '')
+        bl_data = results.get('baselines', {}).get(bl_name, {})
+        results['best_valid_auc'] = bl_data.get('valid_auc')
+        results['best_test_mcc'] = bl_data.get('test_mcc')
+        results['best_test_auc'] = bl_data.get('test_auc')
+    elif best_method == 'kde':
+        results['best_valid_auc'] = results.get('kde', {}).get('valid_auc')
+        results['best_test_mcc'] = results.get('kde', {}).get('test_mcc')
+        results['best_test_auc'] = results.get('kde', {}).get('test_auc')
+        
     return results
 
 
@@ -218,7 +302,12 @@ def compare_classifiers(results: Dict) -> Tuple[str, float, Dict]:
     best_params = {'k': results.get('knn', {}).get('best_k', 1)}
     
     # Check baselines
-    for baseline_name, baseline_data in results.get('baselines', {}).items():
+    baselines_block = results.get('baselines', {})
+    if not isinstance(baselines_block, dict):
+        baselines_block = {}
+    for baseline_name, baseline_data in baselines_block.items():
+        if baseline_name in ('label_map', 'label_encoder') or not isinstance(baseline_data, dict):
+            continue
         baseline_mcc = baseline_data.get('mcc')
         if baseline_mcc is not None and baseline_mcc > best_mcc:
             best_method = f'baseline_{baseline_name}'

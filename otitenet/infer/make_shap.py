@@ -30,6 +30,8 @@ if __name__ == '__main__':
     parser.add_argument('--groupkfold', type=int, default=1)
     parser.add_argument('--random_recs', type=int, default=0)
     parser.add_argument('--valid_dataset', type=str, default='Banque_Viscaino_Chili_2020', help='Validation dataset')
+    parser.add_argument('--train_datasets', type=str, default='', help='Optional comma-separated training datasets. If empty, all datasets except valid/test are used.')
+    parser.add_argument('--test_dataset', type=str, default='', help='Optional dedicated test dataset. If omitted or unavailable, half of the validation set is used as test.')
 
     args = parser.parse_args()
     data_getter = GetData(args.path, args.valid_dataset, args)

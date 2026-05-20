@@ -36,6 +36,40 @@ from otitenet.ml import fit_knn_classifier
 from otitenet.app.utils import get_model_cache_key
 
 
+from contextlib import contextmanager, nullcontext
+
+@contextmanager
+def _quiet_streamlit_messages(enabled: bool = False):
+    """Temporarily silence Streamlit status calls during bulk/background inference."""
+    if not enabled:
+        yield
+        return
+
+    names = [
+        "info", "success", "warning", "error", "write", "caption",
+        "markdown", "toast", "metric", "dataframe", "table",
+    ]
+    originals = {name: getattr(st, name, None) for name in names}
+    original_spinner = getattr(st, "spinner", None)
+
+    def _noop(*args, **kwargs):
+        return None
+
+    try:
+        for name in names:
+            if hasattr(st, name):
+                setattr(st, name, _noop)
+        if original_spinner is not None:
+            setattr(st, "spinner", lambda *args, **kwargs: nullcontext())
+        yield
+    finally:
+        for name, value in originals.items():
+            if value is not None:
+                setattr(st, name, value)
+        if original_spinner is not None:
+            setattr(st, "spinner", original_spinner)
+
+
 def get_or_build_knn(_args, data, unique_labels, unique_batches, prototypes):
     """Return a cached KNN for the selected model; build once if missing.
 
@@ -64,62 +98,98 @@ def get_or_build_knn(_args, data, unique_labels, unique_batches, prototypes):
     cache = st.session_state.setdefault('knn_cache', {})
     key = get_model_cache_key(_args)
     if key in cache:
+        print("♻️  Using cached KNN")
         return cache[key]['knn'], cache[key]['unique_labels']
 
-    # ---- Build KNN by encoding training data ---- 
-    from otitenet.train.train_triplet_new import TrainAE
-    from otitenet.data.data_getters import get_images_loaders, get_empty_traces
-    from otitenet.app.model_loading import load_model_and_prototypes
+    # ---- Fast path: load saved train_encodings.npz if available ----
+    train_encs = None
+    train_cats = None
+    use_pretrained = getattr(_args, 'use_pretrained_encodings', True)
+    use_trained_encoder = getattr(_args, 'use_trained_encoder', use_pretrained)
     
-    # Initialize training wrapper for encoding
-    train = TrainAE(_args, _args.path, load_tb=False, log_metrics=False, keep_models=True,
-                    log_inputs=False, log_plots=False, log_tb=False, log_tracking=False,
-                    log_mlflow=False, groupkfold=_args.groupkfold)
-    train.n_batches = len(unique_batches)
-    train.n_cats = len(unique_labels)
-    train.unique_batches = unique_batches
-    train.unique_labels = unique_labels
-    train.epoch = 1
-    train.params = {
-        'n_neighbors': _args.n_neighbors,
-        'lr': 0,
-        'wd': 0,
-        'smoothing': 0,
-        'is_transform': 0,
-        'valid_dataset': _args.valid_dataset
-    }
-    train.set_arcloss()
+    if use_pretrained:
+        model_params = get_model_params_path(_args)
+        model_dir = f'logs/best_models/{_args.task}/{_args.model_name}/{model_params}'
+        npz_path = os.path.join(model_dir, 'train_encodings.npz')
+        
+        print(f"[Encodings] use_pretrained={use_pretrained}, checking path: {npz_path}")
+        
+        if os.path.exists(npz_path):
+            try:
+                print(f"[Encodings] Loading saved encodings from {npz_path}")
+                with st.spinner("⚡ Loading saved encodings…"):
+                    npz = np.load(npz_path)
+                    train_encs = npz['embeddings']
+                    train_cats = npz['cats']
+                    st.success(f"✅ Loaded {len(train_encs)} saved encodings ({train_encs.nbytes / 1024 / 1024:.1f} MB)")
+                    print(f"[Encodings] Successfully loaded {len(train_encs)} encodings")
+            except Exception as e:
+                print(f"[Encodings] Error loading {npz_path}: {e}")
+                st.warning(f"⚠️ Could not load saved encodings ({npz_path}), falling back to re-encoding: {e}")
+                train_encs = None
+        else:
+            print(f"[Encodings] File not found: {npz_path}")
+            st.info(f"ℹ️ No saved encodings found ({npz_path}). Re-encoding from model instead.")
+    else:
+        print(f"[Encodings] use_pretrained_encodings is False, re-encoding from model")
+        st.info("ℹ️ Using model re-encoding (not loading saved encodings)")
 
-    # Build data loaders
-    lists, traces = get_empty_traces()
-    loaders = get_images_loaders(
-        data=data,
-        random_recs=_args.random_recs,
-        weighted_sampler=0,
-        is_transform=0,
-        samples_weights=None,
-        epoch=1,
-        unique_labels=unique_labels,
-        triplet_dloss=_args.dloss, bs=_args.bs,
-        prototypes_to_use=_args.prototypes_to_use,
-        prototypes=prototypes,
-        size=_args.new_size,
-        normalize=_args.normalize,
-    )
+    if train_encs is None:
+        if use_trained_encoder:
+            st.info("ℹ️ Encoding with trained model weights from the selected checkpoint")
+        # ---- Slow path: encode training data with model ----
+        from otitenet.train.train_triplet_new import TrainAE
+        # from otitenet.data.data_getters import get_images_loaders, get_empty_traces
+        from otitenet.app.model_loading import load_model_and_prototypes
 
-    # Encode training data with model
-    with torch.no_grad():
-        try:
-            model, _, _, _, _, _, _, _, _ = load_model_and_prototypes(_args)
-            train.model = model
-            _, lists, _ = train.loop('train', None, 0, loaders['train'], lists, traces)
-        except Exception as e:
-            st.error(f"❌ Could not encode training set for KNN: {e}")
-            raise
+        # Initialize training wrapper for encoding
+        train = TrainAE(_args, _args.path, load_tb=False, log_metrics=False, keep_models=True,
+                        log_inputs=False, log_plots=False, log_tb=False, log_tracking=False,
+                        log_mlflow=False, groupkfold=_args.groupkfold)
+        train.n_batches = len(unique_batches)
+        train.n_cats = len(unique_labels)
+        train.unique_batches = unique_batches
+        train.unique_labels = unique_labels
+        train.epoch = 1
+        train.params = {
+            'n_neighbors': _args.n_neighbors,
+            'lr': 0,
+            'wd': 0,
+            'smoothing': 0,
+            'is_transform': 0,
+            'valid_dataset': _args.valid_dataset
+        }
+        train.set_arcloss()
 
-    # Extract encoded data and fit KNN
-    train_encs = np.concatenate(lists['train']['encoded_values'])
-    train_cats = np.concatenate(lists['train']['cats'])
+        # Build data loaders
+        lists, traces = get_empty_traces()
+        loaders = get_images_loaders(
+            data=data,
+            random_recs=_args.random_recs,
+            weighted_sampler=0,
+            is_transform=0,
+            samples_weights=None,
+            epoch=1,
+            unique_labels=unique_labels,
+            triplet_dloss=_args.dloss, bs=_args.bs,
+            prototypes_to_use=_args.prototypes_to_use,
+            prototypes=prototypes,
+            size=_args.new_size,
+            normalize=_args.normalize,
+        )
+
+        # Encode training data with model
+        with torch.no_grad():
+            try:
+                model, _, _, _, _, _, _, _, _ = load_model_and_prototypes(_args)
+                train.model = model
+                _, lists, _ = train.loop('train', None, 0, loaders['train'], lists, traces)
+            except Exception as e:
+                st.error(f"❌ Could not encode training set for KNN: {e}")
+                raise
+
+        train_encs = np.concatenate(lists['train']['encoded_values'])
+        train_cats = np.concatenate(lists['train']['cats'])
     
     # Fit KNN (n_neighbors is adjusted by classif_loss strategy)
     if _args.classif_loss not in ['ce', 'hinge']:
@@ -137,7 +207,75 @@ def get_or_build_knn(_args, data, unique_labels, unique_batches, prototypes):
     return knn, unique_labels
 
 
-def run_analysis_on_file(filename, file_bytes, _args, cursor, conn, force_reanalyze=False, show_validation_metrics=True, fast_infer=False):
+def _safe_generate_gradcam_for_prediction(filename, _args, model, image, prototypes, device_str, complete_log_path):
+    """Generate Grad-CAM montages during prediction, but never fail inference if Grad-CAM fails.
+
+    From now on fresh predictions compute the last four layers by default, so the
+    observer page can show four wide composite panels. The legacy one-layer buttons
+    elsewhere in the app are left unchanged.
+    """
+    try:
+        from otitenet.logging.grad_cam import log_grad_cam_all_classes
+        from otitenet.app.utils import strip_extension
+
+        current_layer = int(getattr(_args, "grad_cam_layer", 7))
+        current_alpha = float(getattr(_args, "grad_cam_alpha", 0.55))
+        first_layer = max(0, current_layer - 3)
+        layers_to_compute = list(range(first_layer, current_layer + 1))
+
+        base_name = strip_extension(os.path.basename(str(filename)))
+        image_output_dir = os.path.join(str(complete_log_path), base_name)
+        os.makedirs(image_output_dir, exist_ok=True)
+
+        class_prototypes = {}
+        if isinstance(prototypes, dict):
+            class_prototypes = prototypes.get("class", {}).get("train", {}) or {}
+
+        inputs = {"queries": {"inputs": [image]}}
+        generated_paths = []
+        for layer in layers_to_compute:
+            log_grad_cam_all_classes(
+                model,
+                0,
+                inputs,
+                "queries",
+                image_output_dir,
+                base_name,
+                class_prototypes,
+                device=device_str,
+                layer=int(layer),
+                alpha=current_alpha,
+            )
+            montage_path = os.path.join(image_output_dir, f"{base_name}_grad_cam_all_classes_layer{int(layer)}.png")
+            if os.path.exists(montage_path):
+                generated_paths.append(montage_path)
+
+        return generated_paths[-1] if generated_paths else image_output_dir
+    except Exception as gradcam_exc:
+        print(f"[Grad-CAM] skipped for {filename}: {gradcam_exc}")
+        return None
+
+
+def run_analysis_on_file(filename, file_bytes, _args, cursor, conn, force_reanalyze=False, show_validation_metrics=True, fast_infer=False, quiet=False):
+    """Run complete analysis on a file and return results.
+
+    Set quiet=True for bulk/background inference so per-image Streamlit
+    traces do not flood the UI.
+    """
+    with _quiet_streamlit_messages(quiet):
+        return _run_analysis_on_file_impl(
+            filename,
+            file_bytes,
+            _args,
+            cursor,
+            conn,
+            force_reanalyze=force_reanalyze,
+            show_validation_metrics=show_validation_metrics,
+            fast_infer=fast_infer,
+        )
+
+
+def _run_analysis_on_file_impl(filename, file_bytes, _args, cursor, conn, force_reanalyze=False, show_validation_metrics=True, fast_infer=False):
     """Run complete analysis on a file and return results."""
     # Make sure model numbering is available even if user didn't open Tab 1/2 first
     model_number_map, best_models_table = _ensure_model_number_map(cursor)
@@ -196,7 +334,11 @@ def run_analysis_on_file(filename, file_bytes, _args, cursor, conn, force_reanal
         # Prepare inference resources
         params = get_model_params_path(_args)
         train_complete_log_path = f'logs/best_models/{_args.task}/{_args.model_name}/{params}'
+        if not hasattr(_args, "n_epochs"):
+            _args.n_epochs = 1
 
+        if not hasattr(_args, "epoch"):
+            _args.epoch = 0
         if not fast_infer:
             loaders = get_images_loaders(data=data,
                                          random_recs=_args.random_recs,
@@ -389,5 +531,17 @@ def run_analysis_on_file(filename, file_bytes, _args, cursor, conn, force_reanal
             except Exception:
                 pass
         st.session_state['last_model_number'] = model_number
+
+        # New behavior: Grad-CAM is generated at the same time as prediction.
+        # This is intentionally best-effort so inference still succeeds if Grad-CAM fails.
+        _safe_generate_gradcam_for_prediction(
+            filename,
+            _args,
+            model,
+            image,
+            prototypes,
+            device_str,
+            complete_log_path,
+        )
     
     return pred_label, pred_confidence, complete_log_path, None

@@ -19,9 +19,6 @@ class PerImageNormalize:
         std = img.std(dim=(1, 2), keepdim=True) + 1e-6
         return (img - mean) / std
 
-import streamlit as st
-
-@st.cache_data
 def get_data(path, args, seed=42):
     """
 
@@ -137,7 +134,6 @@ def get_best_values(values):
     return best_values
 
 
-@st.cache_data
 def get_images(path, normalize, size=224):
     pngs = []
     labels = []
@@ -181,14 +177,15 @@ def get_images(path, normalize, size=224):
         datasets += [row['dataset']]
         groups += [row['group']]
 
-    return np.array(pngs), np.array(names), np.array(labels), np.array(datasets)
+    return np.array(pngs), np.array(names), np.array(labels), np.array(datasets), np.array(groups)
 
 
 def get_images_loaders(data, random_recs, weighted_sampler, 
                        is_transform, samples_weights, epoch, 
                        unique_labels, triplet_dloss, prototypes_to_use,
                        n_positives=1, n_negatives=1,
-                       prototypes=None, bs=64, size=224, normalize='no', n_aug=1):
+                       prototypes=None, bs=64, size=224, normalize='no', n_aug=1,
+                       num_workers=0):
     """
 
     Args:
@@ -209,12 +206,29 @@ def get_images_loaders(data, random_recs, weighted_sampler,
         import random
         random.seed(worker_seed)
     
+    # Resolve requested worker count (-1 means all available logical CPUs).
+    cpu_count = os.cpu_count() or 1
+    try:
+        requested_workers = int(num_workers)
+    except Exception:
+        requested_workers = 0
+    if requested_workers == -1:
+        resolved_workers = cpu_count
+    elif requested_workers < -1:
+        resolved_workers = 0
+    else:
+        resolved_workers = requested_workers
+    resolved_workers = max(0, min(int(resolved_workers), int(cpu_count)))
+    use_worker_processes = resolved_workers > 0
+    prefetch_factor = 2 if use_worker_processes else None
+
     # Ensure n_aug is at least 1
     n_aug = max(1, int(n_aug))
     
     # Build transforms; only normalize when requested
     train_ops = [
-        transforms.ToTensor(),
+        transforms.ToImage(),
+        transforms.ToDtype(torch.float32, scale=True),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
         transforms.RandomRotation(degrees=(-180, 180)),
@@ -228,7 +242,10 @@ def get_images_loaders(data, random_recs, weighted_sampler,
             ]), p=0.5),
     ]
         
-    eval_ops = [transforms.ToTensor()]
+    eval_ops = [
+        transforms.ToImage(),
+        transforms.ToDtype(torch.float32, scale=True),
+    ]
     # Normalization is handled in get_images if requested
 
     transform_train = transforms.Compose(train_ops)
@@ -306,22 +323,22 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                             sampler=WeightedRandomSampler(samples_weights['train'], len(samples_weights['train']),
                                                           replacement=True),
                             batch_size=bs,
-                            num_workers=0,
-                            # prefetch_factor=2,
+                            num_workers=resolved_workers,
                             pin_memory=True,
                             drop_last=True,
-                            # persistent_workers=True,
+                            persistent_workers=use_worker_processes,
+                            prefetch_factor=prefetch_factor,
                             worker_init_fn=worker_init_fn
                             )
     else:
         train_loader = DataLoader(train_set,
                             shuffle=True,
                             batch_size=bs,
-                            num_workers=0,
-                            # prefetch_factor=2,
+                            num_workers=resolved_workers,
                             pin_memory=True,
                             drop_last=True,
-                            # persistent_workers=True,
+                            persistent_workers=use_worker_processes,
+                            prefetch_factor=prefetch_factor,
                             worker_init_fn=worker_init_fn
                             )
     loaders = {
@@ -330,22 +347,22 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                            # sampler=WeightedRandomSampler(samples_weights['test'], sum(samples_weights['test']),
                            #                               replacement=False),
                            batch_size=bs,
-                            num_workers=0,
-                            # prefetch_factor=2,
+                            num_workers=resolved_workers,
                            pin_memory=True,
                            drop_last=False,
-                           # persistent_workers=True,
+                           persistent_workers=use_worker_processes,
+                           prefetch_factor=prefetch_factor,
                            worker_init_fn=worker_init_fn
                            ),
         'valid': DataLoader(valid_set,
                             # sampler=WeightedRandomSampler(samples_weights['valid'], sum(samples_weights['valid']),
                             #                               replacement=False),
                             batch_size=bs,
-                            num_workers=0,
-                            # prefetch_factor=2,
+                            num_workers=resolved_workers,
                             pin_memory=True,
                             drop_last=False,
-                            # persistent_workers=True,
+                            persistent_workers=use_worker_processes,
+                            prefetch_factor=prefetch_factor,
                             worker_init_fn=worker_init_fn
 
                             ),
@@ -387,11 +404,11 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                                     # num_workers=0,
                                     shuffle=True,
                                     batch_size=bs,
-                                    num_workers=0,
-                                    # prefetch_factor=8,
+                                    num_workers=resolved_workers,
                                     pin_memory=True,
                                     drop_last=True,
-                                    # persistent_workers=True,
+                                    persistent_workers=use_worker_processes,
+                                    prefetch_factor=prefetch_factor,
                                     worker_init_fn=worker_init_fn
                                     )
 
@@ -404,11 +421,11 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                                 # num_workers=0,
                                 shuffle=True,
                                 batch_size=bs,
-                                num_workers = 0,
-                                # prefetch_factor = 8,
+                                num_workers=resolved_workers,
                                 pin_memory=True,
                                 drop_last=True,
-                                # persistent_workers=True,
+                                persistent_workers=use_worker_processes,
+                                prefetch_factor=prefetch_factor,
                                 worker_init_fn=worker_init_fn
                                 )        
 
@@ -419,14 +436,16 @@ class GetData:
     def __init__(self, path, valid, args, manifest_dir=None) -> None:
         self.args = args
         self.manifest_dir = manifest_dir
+        self.split_debug = {}
         self.data = {}
         self.unique_labels = np.array([])
-        for info in ['inputs', 'names', 'old_labels', 'labels', 'cats', 'batches']:
+        for info in ['inputs', 'names', 'old_labels', 'labels', 'cats', 'batches', 'groups']:
             self.data[info] = {}
             for group in ['all', 'train', 'test', 'valid', 'calibration']:
                 self.data[info][group] = np.array([])
         self.data['inputs']['all'], self.data['names']['all'], \
-            self.data['labels']['all'], self.data['batches']['all'] = get_images(path, args.normalize, args.new_size)
+            self.data['labels']['all'], self.data['batches']['all'], self.data['groups']['all'] = \
+            get_images(path, args.normalize, args.new_size)
         self.data['old_labels']['all'] = self.data['labels']['all']
         new_labels = []
         for label in self.data['labels']['all']:
@@ -450,7 +469,14 @@ class GetData:
                 else:
                     new_labels += ['NotNormal']
             else:
-                exit('WRONG TASK NAME: Otitis or notNormal')
+                if str(args.task).startswith('SMOKE_TEST_'):
+                    # Default to notNormal logic for smoke tests
+                    if label == "Normal":
+                        new_labels += ['Normal']
+                    else:
+                        new_labels += ['NotNormal']
+                else:
+                    exit(f'WRONG TASK NAME: {args.task}. Expected: otitis, multi, or notNormal')
 
         self.data['labels']['all'] = np.array(new_labels)
         self.unique_labels = get_unique_labels(self.data['labels']['all'])
@@ -468,18 +494,43 @@ class GetData:
             self.data['labels']['all'].copy(), self.data['batches']['all'].copy()
         self.data['old_labels']['train'] = self.data['old_labels']['all'].copy()
 
-        # If a manifest of splits exists (saved during training), enforce it to keep exact same images.
-        manifest_applied = False
-        if manifest_dir is not None:
-            manifest_applied = self._apply_manifest_splits(manifest_dir)
+        # If infos.csv already carries precomputed groups, it is always the source of truth.
+        has_infos_splits = np.any(np.isin(self.data['groups']['all'], ['valid', 'test']))
+        split_applied = False
 
-        if not manifest_applied:
+        if has_infos_splits:
+            self.split_from_infos_groups()
+            split_applied = True
+
+        # If infos.csv does not define explicit splits, optionally fall back to a saved manifest.
+        if not split_applied and manifest_dir is not None:
+            split_applied = self._apply_manifest_splits(manifest_dir)
+            if split_applied:
+                self.split_debug = {
+                    'mode': 'manifest',
+                    'valid_dataset': valid,
+                    'test_dataset': getattr(args, 'test_dataset', None),
+                    'fallback_used': False,
+                    'reason': 'loaded saved split manifest',
+                }
+                self._log_split_debug()
+
+        if not split_applied:
             if not args.groupkfold:
                 self.data, self.unique_labels, self.unique_batches = self.split('test', args.groupkfold, args.seed)
+                self.split_debug = {
+                    'mode': 'kfold',
+                    'valid_dataset': valid,
+                    'test_dataset': getattr(args, 'test_dataset', None),
+                    'fallback_used': False,
+                    'reason': 'standard fold-based split',
+                }
+                self._log_split_debug()
             else:
                 self.split_deterministic(valid=valid)
-            if manifest_dir is not None:
-                self.save_split_manifests(manifest_dir)
+
+        if manifest_dir is not None:
+            self.save_split_manifests(manifest_dir)
         self.prototypes = {
             'combined': {'train': None, 'valid': None, 'test': None, 'calibration': None, 'all': None},
             'class': {'train': None, 'valid': None, 'test': None, 'calibration': None, 'all': None},
@@ -541,6 +592,32 @@ class GetData:
                 'batch': self.data['batches'][group],
             })
             df.to_csv(paths[group], index=False)
+
+    def _log_split_debug(self):
+        train_n = len(self.data['names']['train'])
+        valid_n = len(self.data['names']['valid'])
+        test_n = len(self.data['names']['test'])
+        debug = self.split_debug or {}
+        train_batches = np.unique(self.data['batches']['train']).tolist() if train_n else []
+        valid_batches = np.unique(self.data['batches']['valid']).tolist() if valid_n else []
+        test_batches = np.unique(self.data['batches']['test']).tolist() if test_n else []
+        print(
+            "[SplitDebug] "
+            f"mode={debug.get('mode', 'unknown')} "
+            f"valid_dataset={debug.get('valid_dataset')} "
+            f"test_dataset={debug.get('test_dataset')} "
+            f"train_datasets={debug.get('train_datasets')} "
+            f"fallback_used={debug.get('fallback_used', False)}"
+        )
+        print(
+            "[SplitDebug] "
+            f"reason={debug.get('reason', 'n/a')} "
+            f"counts(train={train_n}, valid={valid_n}, test={test_n})"
+        )
+        print(
+            "[SplitDebug] "
+            f"batches(train={train_batches}, valid={valid_batches}, test={test_batches})"
+        )
     
     def remove_noisy_samples(self, complete_log_path):
         # Load noisy samples if the file exists
@@ -600,17 +677,99 @@ class GetData:
 
         return self.data, self.unique_labels, self.unique_batches
 
+    def split_from_infos_groups(self):
+        """Assign train/valid/test splits using the 'group' column written by preprocessing."""
+        all_groups = self.data['groups']['all']
+        train_inds = np.where(all_groups == 'train')[0]
+        valid_inds = np.where(all_groups == 'valid')[0]
+        test_inds  = np.where(all_groups == 'test')[0]
+
+        for key in ['inputs', 'names', 'old_labels', 'labels', 'cats', 'batches', 'groups']:
+            arr = self.data[key]['all']
+            self.data[key]['train'] = arr[train_inds]
+            self.data[key]['valid'] = arr[valid_inds]
+            self.data[key]['test']  = arr[test_inds]
+
+        # keep cats consistent with mapped labels
+        for split in ['train', 'valid', 'test']:
+            self.data['cats'][split] = np.array([
+                np.argwhere(x == self.unique_labels).flatten() for x in self.data['labels'][split]
+            ]).flatten()
+
+        self.split_debug = {
+            'mode': 'infos_groups',
+            'valid_dataset': 'from_infos_csv',
+            'test_dataset': 'from_infos_csv',
+            'train_datasets': 'from_infos_csv',
+            'fallback_used': False,
+            'reason': 'using precomputed split groups from infos.csv',
+        }
+        self._log_split_debug()
+
     def split_deterministic(self, valid):
-        datasets = ['Banque_Comert_Turquie_2020_jpg', 
-                    'Banque_Calaman_USA_2020_trie_CM', 
-                    'Banque_Viscaino_Chili_2020']
-        train_inds = []
-        for dataset in datasets:
-            if valid != dataset:
-                train_inds += [np.argwhere(self.data['batches']['train'] == dataset).flatten()]
-        valid_inds = np.argwhere(self.data['batches']['train'] == valid).flatten()
-        train_inds = np.concatenate(train_inds)
-        test_inds = np.argwhere(self.data['batches']['train'] == 'GMFUNL_jan2023').flatten()
+        all_batches = self.data['batches']['train']
+        all_labels = self.data['labels']['train']
+        all_indices = np.arange(len(all_batches))
+
+        valid_inds = np.argwhere(all_batches == valid).flatten()
+        requested_train = str(getattr(self.args, 'train_datasets', '') or '').strip()
+        requested_test = str(getattr(self.args, 'test_dataset', '') or '').strip()
+        test_dataset = requested_test if requested_test else 'GMFUNL_jan2023'
+        available_batches = np.unique(all_batches).tolist()
+
+        if requested_train:
+            train_datasets = [x.strip() for x in requested_train.split(',') if x.strip()]
+        else:
+            train_datasets = [b for b in available_batches if b not in {valid, test_dataset}]
+
+        if test_dataset == valid:
+            test_inds = np.array([], dtype=int)
+        else:
+            test_inds = np.argwhere(all_batches == test_dataset).flatten()
+
+        fallback_used = False
+        debug_reason = f"using all samples from explicit test dataset '{test_dataset}'"
+
+        if len(valid_inds) == 0:
+            raise ValueError(f"Validation dataset '{valid}' has no samples in the loaded data.")
+
+        train_chunks = [
+            np.argwhere(all_batches == dataset).flatten()
+            for dataset in train_datasets
+            if dataset not in {valid, test_dataset} and np.any(all_batches == dataset)
+        ]
+        train_inds = np.concatenate(train_chunks) if train_chunks else np.array([], dtype=int)
+
+        if len(test_inds) == 0:
+            fallback_used = True
+            debug_reason = (
+                f"no dedicated test dataset found for '{test_dataset}'; "
+                "using half of the validation set as test fallback"
+            )
+            valid_rel = np.arange(len(valid_inds))
+            if len(valid_inds) >= 2:
+                try:
+                    splitter = StratifiedKFold(
+                        n_splits=2,
+                        shuffle=True,
+                        random_state=getattr(self.args, 'seed', 42),
+                    )
+                    keep_rel, test_rel = next(splitter.split(valid_rel, all_labels[valid_inds]))
+                except ValueError:
+                    keep_rel, test_rel = np.array_split(valid_rel, 2)
+            else:
+                keep_rel = valid_rel
+                test_rel = np.array([], dtype=int)
+            valid_inds = valid_inds[np.array(keep_rel, dtype=int)]
+            test_inds = valid_inds[np.array([], dtype=int)] if len(test_rel) == 0 else np.argwhere(all_batches == valid).flatten()[np.array(test_rel, dtype=int)]
+
+        if len(train_inds) == 0:
+            exclude_inds = np.concatenate((valid_inds, test_inds)) if len(test_inds) > 0 else valid_inds
+            train_mask = np.ones(len(all_indices), dtype=bool)
+            train_mask[exclude_inds] = False
+            train_inds = all_indices[train_mask]
+            if requested_train:
+                debug_reason += "; requested train datasets were empty/missing so remaining datasets were used for train"
 
         self.data['inputs']['train'], self.data['inputs']['valid'], self.data['inputs']['test'] = self.data['inputs']['train'][train_inds], \
             self.data['inputs']['train'][valid_inds], self.data['inputs']['train'][test_inds]
@@ -624,6 +783,16 @@ class GetData:
             self.data['cats']['train'][valid_inds], self.data['cats']['train'][test_inds]
         self.data['batches']['train'], self.data['batches']['valid'], self.data['batches']['test'] = self.data['batches']['train'][train_inds], \
             self.data['batches']['train'][valid_inds], self.data['batches']['train'][test_inds]
+
+        self.split_debug = {
+            'mode': 'deterministic',
+            'valid_dataset': valid,
+            'test_dataset': test_dataset if len(test_inds) > 0 and not fallback_used else None if fallback_used else test_dataset,
+            'train_datasets': train_datasets,
+            'fallback_used': fallback_used,
+            'reason': debug_reason,
+        }
+        self._log_split_debug()
 
         return self.data, self.unique_labels, self.unique_batches
 

@@ -49,40 +49,63 @@ def _compute_grad_cam_heatmap(
     model: torch.nn.Module,
     image: torch.Tensor,
     reference_embedding: torch.Tensor,
-    layer: Optional[int],
+    layer: Any,
 ) -> np.ndarray:
-    """Compute a Grad-CAM heatmap using a reference embedding as similarity target."""
+    """Compute a Grad-CAM heatmap using a reference embedding as similarity target.
+    If layer is a list, computes the average heatmap across those layers.
+    """
+    if isinstance(layer, int):
+        layers = [layer]
+    elif isinstance(layer, list):
+        layers = layer
+    else:
+        layers = [-1]
 
-    target_module = _resolve_layer(model, layer)
-    hook = _FeatureHook(target_module)
-    try:
-        output = model(image)
-        # Handle models that return tuples (e.g., with auxiliary outputs)
-        if isinstance(output, tuple):
-            embedding = output[0]
-        else:
-            embedding = output
-        
-        distance = F.pairwise_distance(embedding, reference_embedding.unsqueeze(0), p=2)
-        # Negative distance focuses the heatmap on similarity regions
-        score = -distance
-        score.backward()
+    total_heatmap = None
 
-        if hook.gradients is None or hook.activations is None:
-            raise RuntimeError("Failed to capture activations/gradients for Grad-CAM computation")
+    for l in layers:
+        target_module = _resolve_layer(model, l)
+        hook = _FeatureHook(target_module)
+        try:
+            output = model(image)
+            # Handle models that return tuples (e.g., with auxiliary outputs)
+            if isinstance(output, tuple):
+                embedding = output[0]
+            else:
+                embedding = output
+            
+            distance = F.pairwise_distance(embedding, reference_embedding.unsqueeze(0), p=2)
+            # Negative distance focuses the heatmap on similarity regions
+            score = -distance
+            score.backward(retain_graph=(len(layers) > 1))
 
-        gradients = hook.gradients
-        activations = hook.activations
-        weights = gradients.mean(dim=(2, 3), keepdim=True)
-        cam = torch.relu((weights * activations).sum(dim=1, keepdim=True))
-        cam = F.interpolate(cam, size=image.shape[-2:], mode="bilinear", align_corners=False)
+            if hook.gradients is None or hook.activations is None:
+                raise RuntimeError("Failed to capture activations/gradients for Grad-CAM computation")
 
-        cam = cam.squeeze().detach().cpu().numpy()
-        cam -= cam.min()
-        cam /= cam.max() + 1e-8
-        return cam
-    finally:
-        hook.close()
+            gradients = hook.gradients
+            activations = hook.activations
+            weights = gradients.mean(dim=(2, 3), keepdim=True)
+            cam = torch.relu((weights * activations).sum(dim=1, keepdim=True))
+            cam = F.interpolate(cam, size=image.shape[-2:], mode="bilinear", align_corners=False)
+
+            cam = cam.squeeze().detach().cpu().numpy()
+            cam -= cam.min()
+            cam /= cam.max() + 1e-8
+            
+            if total_heatmap is None:
+                total_heatmap = cam
+            else:
+                total_heatmap += cam
+                
+            model.zero_grad(set_to_none=True)
+        finally:
+            hook.close()
+            
+    if total_heatmap is not None and len(layers) > 1:
+        total_heatmap -= total_heatmap.min()
+        total_heatmap /= total_heatmap.max() + 1e-8
+
+    return total_heatmap
 
 
 def _save_overlay(image: torch.Tensor, heatmap: np.ndarray, output_path: str, alpha: float = 0.5) -> None:

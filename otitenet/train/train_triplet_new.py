@@ -1,8 +1,9 @@
 import comet_ml
 from otitenet.logging.metrics import compute_batch_effect_metrics
+import logging
 import os
+import sys
 import traceback
-
 import matplotlib
 
 matplotlib.use('Agg')
@@ -23,29 +24,48 @@ import random
 import json
 import torch
 from torch import nn
+from contextlib import nullcontext
 from PIL import Image
 from datetime import datetime
+import time
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from umap.umap_ import UMAP
 from sklearn.manifold import Isomap
 from sklearn.manifold import MDS
+from sklearn.neural_network import MLPClassifier
 from otitenet.ml import (
     find_best_classifier,
     evaluate_knn_with_k_search,
     fit_knn_classifier,
+    fit_linearsvc_classifier,
+    fit_logreg_classifier,
     evaluate_all_classifiers,
     fit_baseline_classifiers,
     fit_kde_classifier,
 )
 from sklearn import metrics
 from tensorboardX import SummaryWriter
-from ax.service.managed_loop import optimize
 from sklearn.metrics import matthews_corrcoef as MCC
+import optuna
+from optuna.samplers import TPESampler
+from optuna.pruners import MedianPruner
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 import mysql.connector
 
+# ...rest of user-supplied code (full content pasted by user)...
+import comet_ml
+from otitenet.logging.metrics import compute_batch_effect_metrics
+import logging
+import os
+import sys
+import traceback
+
+import matplotlib
+
+matplotlib.use('Agg')
+CUDA_VISIBLE_DEVICES = ""
 
 from ..logging.loggings import LogConfusionMatrix, add_to_tracking, add_to_mlflow, create_tracking_run, log_mlflow, \
     TRACKING_API_TOKEN, TRACKING_PROJECT_NAME, TRACKING_MODEL_NAME, add_to_logger, add_to_comet, make_comet_logger
@@ -53,14 +73,26 @@ from ..data.data_getters import GetData, get_distance_fct, get_images_loaders, g
 from ..utils.utils import get_optimizer, to_categorical, get_empty_dicts, get_empty_traces, \
     log_traces, save_tensor, get_best_params, get_best_params_comet
 from ..utils.encoding_utils import encode_split_with_augmentation, get_base_transform, get_knn_augmentation_transform
+from ..utils.memory_telemetry import (
+    emit_gpu_telemetry,
+    estimate_theoretical_gpu_required_mb,
+    gpu_memory_stats,
+    reset_gpu_peak,
+    record_gpu_peak,
+)
 from ..models.cnn import Net, Net_deep_shap, Net_shap
 from ..logging.losses import TupletLoss,ArcFaceLoss, ArcFaceLossWithHSM, \
         ArcFaceLossWithSubcenters, ArcFaceLossWithSubcentersHSM, SoftmaxContrastiveLoss
 from ..utils.kde import make_kde_classifier
 from ..logging.plotting import save_roc_curve, plot_pca
 from .batch_effects import get_batch_metrics
+from .completed_runs_metrics import append_completed_run_metrics
 
 warnings.filterwarnings("ignore")
+
+# Ax emits noisy kwargs type-check warnings in this environment even for valid runtime values.
+# Keep actual training errors visible while silencing that specific logger.
+logging.getLogger("ax.utils.common.kwargs").setLevel(logging.ERROR)
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
@@ -92,10 +124,16 @@ def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=No
             database="results_db"
         )
         cursor = conn.cursor()
+        
+        # New columns for prototype aggregation
+        proto_strat = params.get('prototype_strategy', 'mean')
+        proto_comp = params.get('prototype_components', 1)
+
         cursor.execute("""
-            SELECT accuracy FROM best_models_registry
+            SELECT mcc FROM best_models_registry
             WHERE model_name=%s AND nsize=%s AND fgsm=%s AND prototypes=%s AND npos=%s AND nneg=%s 
                   AND dloss=%s AND dist_fct=%s AND classif_loss=%s AND n_calibration=%s AND normalize=%s AND n_neighbors=%s
+                  AND prototype_strategy=%s AND prototype_components=%s
         """, (
             params['model_name'], 
             str(params.get('nsize', 224)), 
@@ -108,16 +146,18 @@ def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=No
             params.get('classif_loss', 'triplet'),
             params['n_calibration'], 
             params['normalize'],
-            str(params.get('n_neighbors', 1))
+            str(params.get('n_neighbors', 1)),
+            proto_strat,
+            proto_comp
         ))
         row = cursor.fetchone()
-        if row is None or accuracy > row[0]:
+        if row is None or row[0] is None or float(mcc) >= float(row[0]):
             # Extract batch metrics if provided
             batch_entropy = None
             batch_nmi = None
             batch_ari = None
             if batch_metrics:
-                batch_entropy = batch_metrics.get('batch_entropy_norm')
+                batch_entropy = batch_metrics.get('batch_entropy_norm', batch_metrics.get('batch_entropy'))
                 batch_nmi = batch_metrics.get('batch_nmi')
                 batch_ari = batch_metrics.get('batch_ari')
                 # Convert numpy types to Python floats if needed
@@ -137,31 +177,60 @@ def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=No
                     except (TypeError, ValueError):
                         batch_ari = None
             
-            cursor.execute("""
-                REPLACE INTO best_models_registry
-                (model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss, n_calibration, 
-                 accuracy, mcc, batch_entropy_norm, batch_nmi, batch_ari, normalize, n_neighbors, log_path)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                params['model_name'],
-                str(params.get('nsize', 224)),
-                params['fgsm'],
-                params['prototypes'],
-                params['npos'],
-                params['nneg'],
-                params['dloss'],
-                params.get('dist_fct', 'euclidean'),
-                params.get('classif_loss', 'triplet'),
-                params['n_calibration'],
-                float(accuracy),  # <-- cast to float
-                float(mcc),       # <-- cast to float
-                batch_entropy,    # <-- batch effect metrics
-                batch_nmi,
-                batch_ari,
-                params['normalize'],
-                str(params.get('n_neighbors', 1)),
-                log_path
-            ))
+            try:
+                cursor.execute("""
+                    REPLACE INTO best_models_registry
+                    (model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss, n_calibration, 
+                     accuracy, mcc, batch_entropy_norm, batch_nmi, batch_ari, normalize, n_neighbors, 
+                     prototype_strategy, prototype_components, log_path)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    params['model_name'],
+                    str(params.get('nsize', 224)),
+                    params['fgsm'],
+                    params['prototypes'],
+                    params['npos'],
+                    params['nneg'],
+                    params['dloss'],
+                    params.get('dist_fct', 'euclidean'),
+                    params.get('classif_loss', 'triplet'),
+                    params['n_calibration'],
+                    float(accuracy),
+                    float(mcc),
+                    batch_entropy,
+                    batch_nmi,
+                    batch_ari,
+                    params['normalize'],
+                    str(params.get('n_neighbors', 1)),
+                    proto_strat,
+                    proto_comp,
+                    log_path
+                ))
+            except mysql.connector.Error as e:
+                # Backward-compatibility for legacy DB schemas.
+                cursor.execute("""
+                    REPLACE INTO best_models_registry
+                    (model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss, n_calibration,
+                     accuracy, mcc, normalize, n_neighbors, log_path)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    params['model_name'],
+                    str(params.get('nsize', 224)),
+                    params['fgsm'],
+                    params['prototypes'],
+                    params['npos'],
+                    params['nneg'],
+                    params['dloss'],
+                    params.get('dist_fct', 'euclidean'),
+                    params.get('classif_loss', 'triplet'),
+                    params['n_calibration'],
+                    float(accuracy),
+                    float(mcc),
+                    params['normalize'],
+                    str(params.get('n_neighbors', 1)),
+                    log_path
+                ))
+                print(f"Registry DB schema mismatch ({e}); wrote legacy registry row.")
             conn.commit()
         cursor.close()
         conn.close()
@@ -209,6 +278,7 @@ def register_all_params_to_tracking(run, args, params):
     run['fixed/prototype_kind'] = getattr(args, 'prototype_kind', 'distance')
     run['fixed/kde_kernel'] = getattr(args, 'kde_kernel', 'gaussian')
     run['fixed/kde_bandwidth'] = getattr(args, 'kde_bandwidth', 'scott')
+    run['fixed/siamese_inference'] = getattr(args, 'siamese_inference', 'knn')
     
     # Register optimized parameters
     for key, value in params.items():
@@ -234,13 +304,200 @@ def register_all_params_to_comet(experiment, args, params):
     experiment.log_parameter('weighted_sampler', args.weighted_sampler)
     experiment.log_parameter('bs', args.bs)
     experiment.log_parameter('seed', args.seed)
+    experiment.log_parameter('siamese_inference', getattr(args, 'siamese_inference', 'knn'))
     run_tag = getattr(args, 'run_tag', 'prod')
     experiment.log_parameter('run_tag', run_tag)
     experiment.log_parameter('is_test', int('test' in str(run_tag).lower()))
     for key, value in params.items():
         experiment.log_parameter(f'optimized/{key}', value)
 
+
+def _tensor_to_numpy(tensor):
+    detached = tensor.detach()
+    if torch.is_floating_point(detached) and detached.dtype in (torch.float16, torch.bfloat16):
+        detached = detached.float()
+    return detached.cpu().numpy()
+
+
+def _update_confmat_gpu(confmat, y_true, y_pred, n_classes):
+    """Accumulate confusion-matrix counts directly on the active device."""
+    if confmat is None:
+        confmat = torch.zeros((n_classes, n_classes), device=y_true.device, dtype=torch.float32)
+    y_true = y_true.long().view(-1)
+    y_pred = y_pred.long().view(-1)
+    valid = (y_true >= 0) & (y_true < n_classes) & (y_pred >= 0) & (y_pred < n_classes)
+    if valid.any():
+        idx = y_true[valid] * n_classes + y_pred[valid]
+        hist = torch.bincount(idx, minlength=n_classes * n_classes).view(n_classes, n_classes).float()
+        confmat += hist
+    return confmat
+
+
+def _acc_mcc_from_confmat_gpu(confmat):
+    """Compute multiclass accuracy and MCC from a confusion matrix on-device."""
+    if confmat is None:
+        return 0.0, 0.0
+    s = confmat.sum()
+    if float(s.item()) <= 0.0:
+        return 0.0, 0.0
+    c = torch.trace(confmat)
+    acc = c / s
+
+    row_sum = confmat.sum(dim=1)
+    col_sum = confmat.sum(dim=0)
+    cov_ytyp = c * s - torch.dot(row_sum, col_sum)
+    cov_ypyp = s * s - torch.dot(col_sum, col_sum)
+    cov_ytyt = s * s - torch.dot(row_sum, row_sum)
+
+    denom = torch.sqrt(torch.clamp(cov_ypyp * cov_ytyt, min=0.0))
+    if float(denom.item()) <= 0.0:
+        mcc = torch.tensor(0.0, device=confmat.device)
+    else:
+        mcc = cov_ytyp / denom
+    return float(acc.item()), float(mcc.item())
+
+
+def _extract_best_values_as_scalars(best_vals):
+    """Convert the epoch-list values dict into per-split scalar metrics.
+
+    `best_vals` is a snapshot of the `values` dict taken at the epoch that
+    achieved the best validation MCC.  Each entry is structured as:
+        values[split][metric] = [epoch0_value, epoch1_value, ...]
+
+    We store the **last** value in each list, which corresponds to the epoch
+    that triggered the snapshot (i.e. the best-valid-MCC epoch).  This lets
+    the analysis script read ``best_values['valid']['mcc']`` as a plain float.
+    """
+    if not isinstance(best_vals, dict):
+        return {}
+
+    def _last_scalar(seq):
+        if isinstance(seq, (list, tuple)) and seq:
+            val = seq[-1]
+        else:
+            val = seq
+        try:
+            f = float(val)
+            return f if np.isfinite(f) else None
+        except (TypeError, ValueError):
+            return None
+
+    result = {}
+    for split in ('train', 'valid', 'test', 'all',
+                  'valid_calibration', 'test_calibration', 'train_calibration'):
+        split_dict = best_vals.get(split)
+        if not isinstance(split_dict, dict):
+            continue
+        result[split] = {
+            metric: _last_scalar(values)
+            for metric, values in split_dict.items()
+        }
+    return result
+
+
+def _resolve_strategy_label(classif_loss, knn):
+    loss_txt = str(classif_loss).strip()
+    if loss_txt and loss_txt.lower() not in {"nan", "none", "unknown"}:
+        return loss_txt
+
+    knn_txt = str(knn).strip()
+    if knn_txt and knn_txt.lower() not in {"nan", "none", "unknown"}:
+        try:
+            return f"knn={int(float(knn_txt))}"
+        except Exception:
+            return f"knn={knn_txt}"
+
+    return "unknown"
+
+
 class TrainAE:
+    def _append_completed_run_csv(self, params, best_vals, batch_metrics, run_uuid, final_status, final_error):
+        """
+        Append a row to the completed_runs CSV with all key metadata and metrics for this run.
+        Writes to both the per-task CSV and the global completed_runs_metrics.csv in the root logs directory.
+        Uses pandas for robust, consistent CSV writing.
+        """
+        from datetime import datetime
+
+        run_tag = getattr(self.args, 'run_tag', 'PROD')
+        task = getattr(self.args, 'task', 'notNormal')
+        dataset = os.path.basename(str(self.path).rstrip('/'))
+        # Per-task CSV (legacy behavior)
+        completed_csv = f'logs/progresses/{task}/{dataset}/{run_tag}_{task}_completed_runs_metrics.csv'
+        os.makedirs(os.path.dirname(completed_csv), exist_ok=True)
+        # Global CSV for all runs
+        global_csv = 'completed_runs_metrics.csv'
+        run_id = {
+            'model_name': getattr(self.args, 'model_name', ''),
+            'kind': getattr(self.args, 'kind', ''),
+            'variant': getattr(self.args, 'variant', ''),
+            'classif_loss': getattr(self.args, 'classif_loss', ''),
+            'prototypes': getattr(self.args, 'prototypes_to_use', ''),
+            'dloss': getattr(self.args, 'dloss', ''),
+            'BER': getattr(self.args, 'BER', ''),
+            'fgsm': getattr(self.args, 'fgsm', ''),
+            'normalize': getattr(self.args, 'normalize', ''),
+            'n_calibration': getattr(self.args, 'n_calibration', ''),
+            'dist_fct': getattr(self.args, 'dist_fct', ''),
+            'knn': params.get('n_neighbors', getattr(self.args, 'n_neighbors', '')),
+            'n_negatives': getattr(self.args, 'n_negatives', ''),
+        }
+        strategy_label = _resolve_strategy_label(run_id['classif_loss'], run_id['knn'])
+        # Resolve lists to scalars
+        best_vals_scalars = _extract_best_values_as_scalars(best_vals)
+        row = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'exp_id': getattr(self.args, 'exp_id', ''),
+            'trial_index': getattr(self.args, 'trial_index', ''),
+            'uuid': run_uuid,
+            'status': final_status,
+            'error': final_error,
+            'model': run_id['model_name'],
+            'model_name': run_id['model_name'],
+            'kind': run_id['kind'],
+            'variant': run_id['variant'],
+            'loss': strategy_label,
+            'classif_loss': strategy_label,
+            'prototype': run_id['prototypes'],
+            'prototypes': run_id['prototypes'],
+            'dloss': run_id['dloss'],
+            'BER': run_id['BER'],
+            'fgsm': run_id['fgsm'],
+            'normalize': run_id['normalize'],
+            'n_calibration': run_id['n_calibration'],
+            'dist_fct': run_id['dist_fct'],
+            'knn': run_id['knn'],
+            'n_negatives': run_id['n_negatives'],
+            'retry_count': getattr(self.args, 'retry_count', ''),
+            'train_mcc': best_vals_scalars.get('train', {}).get('mcc', best_vals.get('train_mcc', '')),
+            'valid_mcc': best_vals_scalars.get('valid', {}).get('mcc', best_vals.get('valid_mcc', '')),
+            'test_mcc': best_vals_scalars.get('test', {}).get('mcc', best_vals.get('test_mcc', '')),
+            'train_auc': best_vals_scalars.get('train', {}).get('auc', best_vals.get('train_auc', '')),
+            'valid_auc': best_vals_scalars.get('valid', {}).get('auc', best_vals.get('valid_auc', '')),
+            'test_auc': best_vals_scalars.get('test', {}).get('auc', best_vals.get('test_auc', '')),
+            'valid_accuracy': best_vals_scalars.get('valid', {}).get('acc', best_vals.get('valid_accuracy', '')),
+            'test_accuracy': best_vals_scalars.get('test', {}).get('acc', best_vals.get('test_accuracy', '')),
+            'launcher_retry_count': getattr(self.args, 'retry_count', ''),
+            'launcher_failed_final': getattr(self.args, 'failed_final', ''),
+            'source_datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'batch_entropy_norm': (
+                batch_metrics.get('batch_entropy_norm', batch_metrics.get('batch_entropy', ''))
+                if batch_metrics else ''
+            ),
+            'batch_nmi': batch_metrics.get('batch_nmi', '') if batch_metrics else '',
+            'batch_ari': batch_metrics.get('batch_ari', '') if batch_metrics else '',
+        }
+        # Write to per-task CSV (legacy)
+        try:
+            append_completed_run_metrics(completed_csv, row)
+        except Exception as e:
+            print(f"[Warning] Could not write to per-task completed_runs_metrics.csv: {e}")
+        # Write to global CSV (new, unified manifest)
+        try:
+            append_completed_run_metrics(global_csv, row)
+        except Exception as e:
+            print(f"[Warning] Could not write to global completed_runs_metrics.csv: {e}")
+
     def __init__(self, args, path, load_tb=False, log_metrics=False, keep_models=True, log_inputs=True,
                  log_plots=False, log_tb=False, log_tracking=False, log_comet=True, log_mlflow=True, groupkfold=True):
         """
@@ -255,6 +512,21 @@ class TrainAE:
         self.best_acc = 0
         self.best_best_mcc = -1
         self.best_closs_final = np.inf
+        self.complete_log_path = None
+        # Always assign a UUID for every run (including siamese)
+        if hasattr(args, 'uuid') and args.uuid:
+            self.foldername = str(args.uuid)
+        else:
+            self.foldername = str(uuid.uuid4())
+            args.uuid = self.foldername
+        # Always set kind for all runs (cnn, siamese, etc.)
+        if not hasattr(args, 'kind') or not args.kind:
+            # Heuristic: if "triplet" or "arcface" or "cosine" in classif_loss, it's siamese; else cnn_mlp
+            closs = getattr(args, 'classif_loss', '')
+            if any(x in str(closs).lower() for x in ['triplet', 'arcface', 'cosine']):
+                args.kind = 'siamese'
+            else:
+                args.kind = 'cnn_mlp'
         self.logged_inputs = False
         self.log_tb = log_tb
         self.log_tracking = log_tracking
@@ -263,8 +535,19 @@ class TrainAE:
         self.args = args
         self.path = path
 
+        self.amp_enabled = bool(int(getattr(self.args, 'amp', 1))) and str(getattr(self.args, 'device', '')).startswith('cuda')
+        amp_dtype_name = str(getattr(self.args, 'amp_dtype', 'bf16')).lower()
+        if amp_dtype_name not in ['bf16', 'fp16']:
+            amp_dtype_name = 'bf16'
+        self.amp_dtype = torch.bfloat16 if amp_dtype_name == 'bf16' else torch.float16
+        self.use_grad_scaler = self.amp_enabled and self.amp_dtype == torch.float16
+        self.grad_scaler = torch.cuda.amp.GradScaler(enabled=self.use_grad_scaler)
+
         # Toggle saving reproducibility artefacts (manifests + sanity samples)
         self.save_repro_artifacts = bool(int(getattr(self.args, 'save_repro_artifacts', 1)))
+        # Keep optimization runs lean by default: explainability is opt-in.
+        self.run_explainability = bool(int(getattr(self.args, 'run_explainability', 0)))
+        self.shap_model = None
 
         # Ensure reproducible data splits and training behavior
         _set_global_seeds(getattr(self.args, 'seed', 1), deterministic=True)
@@ -273,7 +556,8 @@ class TrainAE:
         self.log_inputs = log_inputs
         self.load_tb = load_tb
         self.groupkfold = groupkfold
-        self.foldername = None
+        # NOTE: self.foldername is intentionally NOT reset here; it was assigned
+        # the run UUID near the top of __init__ and must be preserved.
 
         self.verbose = 1
         self.epoch = 0
@@ -319,6 +603,243 @@ class TrainAE:
                              'train_calibration': None, 'valid_calibration': None, 'test_calibration': None, 'all': None}
         self.best_params = {}
         self._sanity_saved = False
+        self._file_events_csv = None
+        self._epoch_timing_csv = None
+        self._epoch_metrics_csv = None
+
+    def _autocast_context(self):
+        if self.amp_enabled:
+            return torch.autocast(device_type='cuda', dtype=self.amp_dtype)
+        return nullcontext()
+
+    def _batch_progress_enabled(self):
+        return bool(int(getattr(self.args, 'epoch_progress', 1))) and self.verbose > 0
+
+    def _print_batch_progress(self, group, batch_idx, total_batches):
+        if not self._batch_progress_enabled() or total_batches <= 0:
+            return
+        current = batch_idx + 1
+        progress = current / total_batches
+        remaining = max(total_batches - current, 0)
+        bar_len = 24
+        filled = int(bar_len * progress)
+        bar = "#" * filled + "-" * (bar_len - filled)
+        print(
+            f"\rEpoch {self.epoch + 1}/{getattr(self.args, 'n_epochs', 1)} [{group}] |{bar}| "
+            f"{current}/{total_batches} ({progress * 100:5.1f}%) remaining:{remaining}",
+            end="",
+            flush=True,
+        )
+
+    def _finish_batch_progress(self, total_batches):
+        if self._batch_progress_enabled() and total_batches > 0:
+            print("")
+
+    def _ensure_timing_files(self):
+        if not getattr(self, 'complete_log_path', None):
+            return
+        os.makedirs(self.complete_log_path, exist_ok=True)
+
+        if self._file_events_csv is None:
+            self._file_events_csv = os.path.join(self.complete_log_path, 'file_events.csv')
+            if not os.path.exists(self._file_events_csv):
+                with open(self._file_events_csv, 'w') as f:
+                    f.write('timestamp,label,path,size_bytes\n')
+
+        if self._epoch_timing_csv is None:
+            self._epoch_timing_csv = os.path.join(self.complete_log_path, 'epoch_timing.csv')
+            if not os.path.exists(self._epoch_timing_csv):
+                with open(self._epoch_timing_csv, 'w') as f:
+                    f.write('epoch,gap_prev_s,train_s,eval_s,prototypes_s,loader_refresh_s,logging_s,best_update_s,total_s\n')
+
+        if self._epoch_metrics_csv is None:
+            self._epoch_metrics_csv = os.path.join(self.complete_log_path, 'epoch_metrics.csv')
+            if not os.path.exists(self._epoch_metrics_csv):
+                with open(self._epoch_metrics_csv, 'w') as f:
+                    f.write('epoch,train_closs,train_dloss,valid_mcc,test_mcc,valid_acc,test_acc,lr,best_mcc\n')
+
+    def _json_safe(self, value):
+        import numpy as np
+        # Recursively convert all values to JSON-serializable types
+        if isinstance(value, dict):
+            return {self._json_safe(k): self._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe(v) for v in value]
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating, float)):
+            return float(value)
+        if isinstance(value, (np.ndarray,)):
+            return value.tolist()
+        if isinstance(value, (datetime,)):
+            return value.isoformat()
+        # Handle other numpy scalar types (e.g., np.float32, np.float64)
+        if hasattr(value, 'item') and callable(value.item):
+            try:
+                return value.item()
+            except Exception:
+                pass
+        return value
+
+    def _save_run_metadata(self, params):
+        self._ensure_timing_files()
+        if not getattr(self, 'complete_log_path', None):
+            return
+        metadata_path = os.path.join(self.complete_log_path, 'run_metadata.json')
+        try:
+            args_dict = {
+                k: self._json_safe(v)
+                for k, v in vars(self.args).items()
+            }
+            params_dict = {
+                k: self._json_safe(v)
+                for k, v in (params or {}).items()
+            }
+            payload = {
+                'created_at': datetime.now().isoformat(timespec='seconds'),
+                'finished_at': None,
+                'finished': 0,
+                'run_finished': 0,
+                'run_status': 'running',
+                'error_message': None,
+                'complete_log_path': self.complete_log_path,
+                'foldername': self.foldername,
+                'args': args_dict,
+                'optimized_params': params_dict,
+            }
+            with open(metadata_path, 'w') as f:
+                json.dump(payload, f, indent=2)
+            self._log_file_event('run_metadata_json', metadata_path)
+        except Exception as e:
+            print(f"Warning: could not save run metadata: {e}")
+
+    def _update_run_metadata_status(self, run_status, error_message=None):
+        if not getattr(self, 'complete_log_path', None):
+            return
+        metadata_path = os.path.join(self.complete_log_path, 'run_metadata.json')
+        try:
+            payload = {}
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r') as f:
+                    payload = json.load(f)
+            payload['run_status'] = str(run_status)
+            payload['finished'] = 0 if str(run_status) == 'running' else 1
+            payload['run_finished'] = 0 if str(run_status) == 'running' else 1
+            payload['finished_at'] = datetime.now().isoformat(timespec='seconds') if payload['run_finished'] == 1 else None
+            payload['error_message'] = str(error_message) if error_message not in [None, ''] else None
+            with open(metadata_path, 'w') as f:
+                json.dump(payload, f, indent=2)
+            self._log_file_event('run_metadata_json', metadata_path)
+        except Exception as e:
+            print(f"Warning: could not update run metadata status: {e}")
+
+    def _last_or_nan(self, values, group, key):
+        try:
+            seq = values.get(group, {}).get(key, [])
+            if len(seq) == 0:
+                return np.nan
+            return seq[-1]
+        except Exception:
+            return np.nan
+
+    def _log_epoch_metrics(self, epoch, values):
+        self._ensure_timing_files()
+        if self._epoch_metrics_csv is None:
+            return
+        train_closs = self._last_or_nan(values, 'train', 'closs')
+        train_dloss = self._last_or_nan(values, 'train', 'dloss')
+        valid_mcc = self._last_or_nan(values, 'valid', 'mcc')
+        test_mcc = self._last_or_nan(values, 'test', 'mcc')
+        valid_acc = self._last_or_nan(values, 'valid', 'acc')
+        test_acc = self._last_or_nan(values, 'test', 'acc')
+        try:
+            lr_val = self.scheduler.get_last_lr()[0]
+        except Exception:
+            lr_val = np.nan
+        with open(self._epoch_metrics_csv, 'a') as f:
+            f.write(
+                f"{epoch + 1},{train_closs},{train_dloss},{valid_mcc},{test_mcc},"
+                f"{valid_acc},{test_acc},{lr_val},{self.best_mcc}\n"
+            )
+
+    def _save_run_summary(self, params, best_vals, start_time, run_status='completed', error_message=None):
+        self._ensure_timing_files()
+        if not getattr(self, 'complete_log_path', None):
+            return
+        import tempfile, os
+        summary_path = os.path.join(self.complete_log_path, 'run_summary.json')
+        tmp_path = summary_path + '.tmp'
+        try:
+            payload = {
+                'start_time': self._json_safe(start_time),
+                'end_time': datetime.now().isoformat(timespec='seconds'),
+                'duration_seconds': float((datetime.now() - start_time).total_seconds()),
+                'run_status': str(run_status),
+                'finished': 0 if str(run_status) == 'running' else 1,
+                'run_finished': 0 if str(run_status) == 'running' else 1,
+                'error_message': self._json_safe(error_message) if error_message else None,
+                'best_mcc': self._json_safe(self.best_mcc),
+                'best_acc': self._json_safe(self.best_acc),
+                'best_closs': self._json_safe(self.best_closs),
+                # Store per-split scalar metrics so the analysis script can read
+                # best_values['valid']['mcc'] and best_values['test']['mcc'] as floats.
+                # best_vals is the values-dict snapshot at the best epoch, where each
+                # split['metric'] is a list of epoch values; we take the last entry (which
+                # corresponds to the epoch that triggered the best-valid-MCC update).
+                'best_values': self._json_safe(
+                    _extract_best_values_as_scalars(best_vals)
+                ),
+                'batch_metrics': self._json_safe(getattr(self, 'batch_metrics', {})),
+                'params': {k: self._json_safe(v) for k, v in (params or {}).items()},
+                'artifacts': {
+                    'valid_predictions_csv': os.path.join(self.complete_log_path, 'valid_predictions.csv'),
+                    'test_predictions_csv': os.path.join(self.complete_log_path, 'test_predictions.csv'),
+                    'epoch_timing_csv': os.path.join(self.complete_log_path, 'epoch_timing.csv'),
+                    'epoch_metrics_csv': os.path.join(self.complete_log_path, 'epoch_metrics.csv'),
+                    'file_events_csv': os.path.join(self.complete_log_path, 'file_events.csv'),
+                },
+            }
+            with open(tmp_path, 'w') as f:
+                json.dump(payload, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, summary_path)
+            self._log_file_event('run_summary_json', summary_path)
+        except Exception as e:
+            print(f"Warning: could not save run summary: {e}")
+
+    def _log_file_event(self, label, path):
+        self._ensure_timing_files()
+        if self._file_events_csv is None:
+            return
+        ts = datetime.now().isoformat(timespec='seconds')
+        size = -1
+        try:
+            size = os.path.getsize(path)
+        except Exception:
+            pass
+        with open(self._file_events_csv, 'a') as f:
+            f.write(f'{ts},{label},{path},{size}\n')
+        print(f'FileEvent|time={ts}|label={label}|path={path}|size={size}')
+
+    def _log_epoch_timing(self, epoch, timing):
+        self._ensure_timing_files()
+        if self._epoch_timing_csv is None:
+            return
+        with open(self._epoch_timing_csv, 'a') as f:
+            f.write(
+                f"{epoch + 1},{timing.get('gap_prev_s', 0.0):.3f},{timing.get('train_s', 0.0):.3f},"
+                f"{timing.get('eval_s', 0.0):.3f},{timing.get('prototypes_s', 0.0):.3f},"
+                f"{timing.get('loader_refresh_s', 0.0):.3f},{timing.get('logging_s', 0.0):.3f},"
+                f"{timing.get('best_update_s', 0.0):.3f},{timing.get('total_s', 0.0):.3f}\n"
+            )
+        print(
+            f"EpochTiming|epoch={epoch + 1}|gap_prev={timing.get('gap_prev_s', 0.0):.2f}s|"
+            f"train={timing.get('train_s', 0.0):.2f}s|eval={timing.get('eval_s', 0.0):.2f}s|"
+            f"prototypes={timing.get('prototypes_s', 0.0):.2f}s|loader={timing.get('loader_refresh_s', 0.0):.2f}s|"
+            f"logging={timing.get('logging_s', 0.0):.2f}s|best_update={timing.get('best_update_s', 0.0):.2f}s|"
+            f"total={timing.get('total_s', 0.0):.2f}s"
+        )
 
     def _save_raw_inputs_manifest(self, data_getter, path):
         """Persist raw input metadata (name, label, batch, full path) for all splits."""
@@ -566,6 +1087,28 @@ class TrainAE:
         elif self.args.dloss in ['none']:
             self.triplet_dloss = None
 
+    def _save_inference_classifier(self, model_dir=None):
+        """Persist siamese embedding classifier artifact when configured.
+
+        Currently only saves the MLP head classifier. KNN remains on-demand.
+        """
+        try:
+            mode = str(getattr(self.args, 'siamese_inference', 'knn')).strip().lower()
+            clf = getattr(self, 'inference_classifier', None)
+            clf_kind = str(getattr(self, 'inference_classifier_kind', '')).strip().lower()
+            if mode != 'mlp_head' or clf is None or clf_kind != 'mlp_head':
+                return
+            target_dir = model_dir if model_dir else self.complete_log_path
+            if not target_dir:
+                return
+            os.makedirs(target_dir, exist_ok=True)
+            mlp_path = os.path.join(target_dir, 'mlp_head.pkl')
+            with open(mlp_path, 'wb') as f:
+                pickle.dump(clf, f)
+            self._log_file_event('mlp_head_pkl', mlp_path)
+        except Exception as e:
+            print(f"Warning: failed to save inference classifier artifact: {e}")
+
 
     def train(self, params):
         """
@@ -578,283 +1121,119 @@ class TrainAE:
 
         """
         start_time = datetime.now()
-        # Fixing the hyperparameters that are not optimized
-
-        print(params)
-        
-        # Handle loop parameters from optimization
-        if 'dloss' in params:
-            self.args.dloss = params['dloss']
-        if 'classif_loss' in params:
-            self.args.classif_loss = params['classif_loss']
-        # Never allow n_calibration to be overridden - it stays at 0
-        if 'prototypes_to_use' in params:
-            self.args.prototypes_to_use = params['prototypes_to_use']
-        if 'n_positives' in params:
-            self.args.n_positives = int(params['n_positives'])
-        if 'n_negatives' in params:
-            self.args.n_negatives = int(params['n_negatives'])
-        if 'fgsm' in params:
-            self.args.fgsm = int(params['fgsm'])
-        if 'normalize' in params:
-            self.args.normalize = params['normalize']
-        # Handle prototype-specific parameters
-        if 'prototype_strategy' in params:
-            self.args.prototype_strategy = params['prototype_strategy']
-        if 'prototype_components' in params:
-            self.args.prototype_components = int(params['prototype_components'])
-        if 'prototype_kind' in params:
-            self.args.prototype_kind = params['prototype_kind']
-        if 'kde_kernel' in params:
-            self.args.kde_kernel = params['kde_kernel']
-        if 'kde_bandwidth' in params:
-            self.args.kde_bandwidth = params['kde_bandwidth']
-
-        # Assigns the hyperparameters getting optimized
+        train_exception = None
         self.params = params
-        if not self.args.fgsm:
-            params['epsilon'] = 0
-        if 'margin' not in params:
-            params['margin'] = 0
-        if 'dmargin' not in params:
-            params['dmargin'] = 0
-        if 'dist_fct' not in params:
-            params['dist_fct'] = 'none'
-        if 'gamma' not in params:
-            params['gamma'] = 0
-        if 'n_neighbors' not in params:
-            params['n_neighbors'] = 0
-        if 'is_transform' not in params:
-            params['is_transform'] = 1
-        if 'normalize' not in params:
-            params['normalize'] = 'no'
-        if not hasattr(self.args, 'normalize'):
-            self.args.normalize = params['normalize']
-        params['dropout'] = 0
-        params['optimizer_type'] = 'adam'
-        dist_fct = get_distance_fct(params['dist_fct'])
-
-        self.make_triplet_loss(dist_fct, params)
-
-        self.foldername = str(uuid.uuid4())
-
-        if self.log_mlflow:
-            log_mlflow(self.args, params, self.foldername)
-
-        self.complete_log_path = f'logs/{self.args.task}/{self.foldername}'
-        loggers = {'cm_logger': LogConfusionMatrix(self.complete_log_path)}
-        print(f'See results using: tensorboard --logdir={self.complete_log_path} --port=6006')
-
-        hparams_filepath = self.complete_log_path + '/hp'
-        os.makedirs(hparams_filepath, exist_ok=True)
-        epoch = 0
-        best_closses = []
-        self.best_loss = np.inf
+        self.best_mcc = -1.0
+        self.best_acc = 0.0
         self.best_closs = np.inf
-        self.best_acc = 0
-        data_getter = GetData(self.path, self.args.valid_dataset, self.args, manifest_dir=self.complete_log_path)
-        # Persist raw input manifest for reproducibility
-        self._save_raw_inputs_manifest(data_getter, self.complete_log_path)
-        self.unique_labels = data_getter.unique_labels
-        self.unique_batches = data_getter.unique_batches
-        proto_strategy = getattr(self.args, 'prototype_strategy', 'mean')
-        proto_components = getattr(self.args, 'prototype_components', 1)
-        proto_seed = getattr(self.args, 'seed', 1)
-        self.prototypes = Prototypes(
-            self.unique_labels,
-            self.unique_batches,
-            strategy=proto_strategy,
-            components=proto_components,
-            random_state=proto_seed,
-        )
-
-        # Store all samples before clustering
-        for group in ['train', 'valid', 'test', 'calibration']:
-            self.all_samples['inputs'][group] = data_getter.data['inputs'][group]
-            self.all_samples['labels'][group] = data_getter.data['labels'][group]
-            self.all_samples['old_labels'][group] = data_getter.data['old_labels'][group]
-            self.all_samples['names'][group] = data_getter.data['names'][group]
-            self.all_samples['cats'][group] = data_getter.data['cats'][group]
-            self.all_samples['batches'][group] = data_getter.data['batches'][group]
-            # Means per channel
-
-            # means = np.mean(data_getter.data['inputs'][group], axis=(0, 1, 2))
-            # stds = np.std(data_getter.data['inputs'][group], axis=(0, 2, 3))
-
-        self.initial_nsamples = len(data_getter.data['labels']['all'])
-        event_acc = EventAccumulator(hparams_filepath)
-        event_acc.Reload()
-        TRACKING_MODEL_NAME = 'resnet50'
-        if self.log_tracking:
-            run = create_tracking_run(self.args, self.params, self.complete_log_path, self.foldername)
-        else:
-            run = None
-        if self.log_comet:
-            comet_logger = make_comet_logger(self.args, self.params, self.complete_log_path, self.foldername)
-        else:
-            comet_logger = None
-
+        self.best_loss = np.inf
+        self.complete_log_path = None
+        self.foldername = None
         try:
-            for h in range(self.args.n_repeats):
-                print("Repeat:", h)
-                self.best_mcc = -1
-                if not self.args.groupkfold:
-                    self.data, self.unique_labels, self.unique_batches = data_getter.split('valid', self.args.groupkfold, seed=1+h)
-                else:
-                    self.data, self.unique_labels, self.unique_batches = data_getter.get_variables()
-                # self.unique_batches = np.unique(self.data['batches']['all'])
+            theoretical_gpu_required_mb = None
+            values, best_values, _, best_traces = get_empty_dicts()
+            best_vals = values
+            # Setup necessary objects for training (data, model, losses)
+            data_getter, loaders = self.setup_training_objects(params)
+            loggers = {'cm_logger': LogConfusionMatrix(self.complete_log_path)}
+            print(f'See results using: tensorboard --logdir={self.complete_log_path} --port=6006')
 
-                self.make_samples_weights()
-                self.set_arcloss()
+            # Persist run configuration and metadata early
+            self._save_run_metadata(params)
 
-                if self.args.n_calibration > 0:
-                    # take a few samples from train to be used for calibration. The indices
-                    self.data['inputs']['calibration'] = []
-                    self.data['labels']['calibration'] = []
-                    self.data['old_labels']['calibration'] = []
-                    self.data['names']['calibration'] = []
-                    self.data['cats']['calibration'] = []
-                    self.data['batches']['calibration'] = []
-
-                    for group in ['valid', 'test']:
-                        indices = {label: np.argwhere(self.data['labels'][group] == label).flatten() for label in self.unique_labels}
-                        calib_inds = np.concatenate([np.random.choice(indices[label], int(self.args.n_calibration/len(self.unique_labels)), replace=False) for label in self.unique_labels])
-
-                        try:
-                            self.data['inputs']['calibration'] += [np.stack(self.data['inputs'][group][calib_inds].tolist())]
-                        except Exception as e:
-                            print(f"Error stacking inputs for calibration: {e}")
-                            continue
-                        self.data['labels']['calibration'] += [self.data['labels'][group][calib_inds]]
-                        self.data['old_labels']['calibration'] += [self.data['old_labels'][group][calib_inds]]
-                        self.data['names']['calibration'] += [self.data['names'][group][calib_inds].tolist()]
-                        self.data['cats']['calibration'] += [self.data['cats'][group][calib_inds].tolist()]
-                        self.data['batches']['calibration'] += [self.data['batches'][group][calib_inds].tolist()]
-
-                        # add them to train
-                        self.data['inputs']['train'] = np.concatenate((self.data['inputs']['train'], self.data['inputs'][group][calib_inds]))
-                        self.data['labels']['train'] = np.concatenate((self.data['labels']['train'], self.data['labels'][group][calib_inds]))
-                        self.data['old_labels']['train'] = np.concatenate((self.data['old_labels']['train'], self.data['old_labels'][group][calib_inds]))
-                        self.data['names']['train'] = np.concatenate((self.data['names']['train'], self.data['names'][group][calib_inds]))
-                        self.data['cats']['train'] = np.concatenate((self.data['cats']['train'], self.data['cats'][group][calib_inds]))
-                        self.data['batches']['train'] = np.concatenate((self.data['batches']['train'], self.data['batches'][group][calib_inds]))
-                        # remove them from test
-                        self.data['inputs'][group] = np.delete(self.data['inputs'][group], calib_inds, axis=0)
-                        self.data['labels'][group] = np.delete(self.data['labels'][group], calib_inds, axis=0)
-                        self.data['old_labels'][group] = np.delete(self.data['old_labels'][group], calib_inds, axis=0)
-                        self.data['names'][group] = np.delete(self.data['names'][group], calib_inds, axis=0)
-                        self.data['cats'][group] = np.delete(self.data['cats'][group], calib_inds, axis=0)
-                        self.data['batches'][group] = np.delete(self.data['batches'][group], calib_inds, axis=0)
-                    self.data['inputs']['calibration'] = np.concatenate(self.data['inputs']['calibration'])
-                    self.data['labels']['calibration'] = np.concatenate(self.data['labels']['calibration'])
-                    self.data['old_labels']['calibration'] = np.concatenate(self.data['old_labels']['calibration'])
-                    self.data['names']['calibration'] = np.concatenate(self.data['names']['calibration'])
-                    self.data['cats']['calibration'] = np.concatenate(self.data['cats']['calibration'])
-                    self.data['batches']['calibration'] = np.concatenate(self.data['batches']['calibration'])
-
-                # Save representative samples right before loader/model creation (once per run)
-                if self.save_repro_artifacts:
-                    self._save_split_sanity_samples(self.complete_log_path)
-
-            print("Train Batches:", np.unique(self.data['batches']['train']))
-            print("Valid Batches:", np.unique(self.data['batches']['valid']))
-            print("Test Batches:", np.unique(self.data['batches']['test']))
-            # event_acc is used to verify if the hparams have already been tested. If they were,
-            # the best classification loss is retrieved and we go to the next trial
-            # If thres > 0, features that are 0 for a proportion of samples smaller than thres are removed
-            # data = self.keep_good_features(thres)
-
-            # Transform the data with the chosen scaler
-            # data = copy.deepcopy(self.data)
-            # data, self.scaler = scale_data(scale, data, self.args.device)
-            prototypes = {
-                'combined': self.combined_prototypes,
-                'class': self.class_prototypes,
-                'batch': self.batch_prototypes
-            }
-            loaders = get_images_loaders(data=self.data,
-                                         random_recs=self.args.random_recs,
-                                         weighted_sampler=self.args.weighted_sampler,
-                                         is_transform=params['is_transform'],
-                                         samples_weights=self.samples_weights,
-                                         epoch=0,
-                                         unique_labels=self.unique_labels,
-                                         triplet_dloss=self.args.dloss, bs=self.args.bs,
-                                         prototypes_to_use=self.args.prototypes_to_use,
-                                         prototypes=prototypes,
-                                         size=self.args.new_size,
-                                         normalize=self.args.normalize,
-                                         n_aug=params.get('n_aug', 1)
-                                         )
-            # Initialize model
-            self.model = Net(self.args.device, self.n_cats, self.n_batches,
-                        model_name=self.args.model_name, is_stn=self.args.is_stn,
-                        n_subcenters=self.n_batches)
-            if self.args.classif_loss in ['ce', 'hinge']:
-                self.shap_model = Net_deep_shap(self.args.device, self.n_cats, self.n_batches,
-                                    model_name=self.args.model_name, is_stn=self.args.is_stn,
-                                    n_subcenters=self.n_batches, shape=(3, self.args.new_size, self.args.new_size))
+            if self.log_tracking:
+                run = create_tracking_run(self.args, params, self.complete_log_path, self.foldername)
             else:
-                self.shap_model = Net_shap(self.args.device, self.n_cats, self.n_batches,
-                                    model_name=self.args.model_name, is_stn=self.args.is_stn,
-                                    n_subcenters=self.n_batches)
+                run = None
+            if self.log_comet:
+                comet_logger = make_comet_logger(self.args, self.params, self.complete_log_path, self.foldername)
+            else:
+                comet_logger = None
+
             loggers['logger_cm'] = SummaryWriter(f'{self.complete_log_path}/cm')
             loggers['logger'] = SummaryWriter(f'{self.complete_log_path}/traces')
             # sceloss = nn.CrossEntropyLoss(label_smoothing=params['smoothing'])
             optimizer_model = get_optimizer(self.model, params['lr'], params['wd'], params['optimizer_type'])
             self.scheduler = ReduceLROnPlateau(optimizer_model, mode='max', factor=0.1, patience=10)  # Reduce on plateau
+            if torch.cuda.is_available() and str(self.args.device).startswith('cuda'):
+                reset_gpu_peak(self.args.device)
+                theoretical_gpu_required_mb = estimate_theoretical_gpu_required_mb(
+                    self.model,
+                    int(getattr(self.args, 'bs', 32)),
+                    int(getattr(self.args, 'new_size', 64)),
+                )
+                emit_gpu_telemetry(
+                    'start',
+                    theoretical_gpu_required_mb=f'{theoretical_gpu_required_mb:.2f}',
+                )
 
-            values, best_values, _, best_traces = get_empty_dicts()
             early_stop_counter = 0
-            best_vals = values
             warmup = 0
+            prev_epoch_end = None
             for epoch in range(0, self.args.n_epochs):
                 self.epoch = epoch
+                epoch_start = time.perf_counter()
+                gap_prev = 0.0 if prev_epoch_end is None else max(0.0, epoch_start - prev_epoch_end)
+                best_update_s = 0.0
                 if early_stop_counter >= self.args.early_stop:
                     if self.verbose > 0:
                         print('EARLY STOPPING.', epoch)
                     break
                 lists, traces = get_empty_traces()
                 self.model.train()
-                if args.dloss == 'no':
+                if self.args.dloss == 'no':
                     train_groups = ['train']
                 else:
                     train_groups = ['all', 'train']
+                t_train_start = time.perf_counter()
                 for group in train_groups:
                     if group == 'train' and epoch < warmup:
                         continue
                     _, best_lists1, _ = self.loop(group, optimizer_model, params['gamma'], loaders[group], lists, traces)
+                train_s = time.perf_counter() - t_train_start
                 if epoch < warmup:
                     values['all']['dloss'] += [np.mean(traces['all']['dloss'])]
                     add_to_tracking(values, run)
+                    prev_epoch_end = time.perf_counter()
                     continue
-                # Save images in run
-                if self.log_tracking:
-                    run['example_data'].upload(f'{self.complete_log_path}/{group}_data.png')
-                    if self.args.fgsm:
-                        run['example_adv_data'].upload(f'{self.complete_log_path}/{group}_adv_data.png')
-                if self.log_comet:
-                    comet_logger.log_image(f'{self.complete_log_path}/{group}_data.png', name=f'{group}_data_epoch_{epoch}')
-                    if self.args.fgsm:
-                        comet_logger.log_image(f'{self.complete_log_path}/{group}_adv_data.png', name=f'{group}_adv_data_epoch_{epoch}')
+                t_log_start = time.perf_counter()
+                media_every = int(getattr(self.args, 'epoch_media_every', 0))
+                should_log_media = media_every > 0 and ((epoch + 1) % media_every == 0)
+                data_img = f'{self.complete_log_path}/{group}_data.png'
+                adv_img = f'{self.complete_log_path}/{group}_adv_data.png'
+                # Save images in run only on configured epochs to avoid expensive I/O/network.
+                if should_log_media and self.log_tracking and run is not None and os.path.exists(data_img):
+                    run['example_data'].upload(data_img)
+                    if self.args.fgsm and os.path.exists(adv_img):
+                        run['example_adv_data'].upload(adv_img)
+                if should_log_media and self.log_comet and comet_logger is not None and os.path.exists(data_img):
+                    comet_logger.log_image(data_img, name=f'{group}_data_epoch_{epoch}')
+                    if self.args.fgsm and os.path.exists(adv_img):
+                        comet_logger.log_image(adv_img, name=f'{group}_adv_data_epoch_{epoch}')
+                logging_s = time.perf_counter() - t_log_start
                 self.model.eval()
+                t_eval_start = time.perf_counter()
                 self.set_prototypes('train', best_lists1)
                 for group in ["valid", "test"]:
                     # Run predict to accumulate encodings first
                     _, best_lists2, _, knn = self.predict(group, loaders[group], lists, traces)
+                eval_s = time.perf_counter() - t_eval_start
                 # put the best lists together. keys are all only in one dict
                 best_lists = {**best_lists1, **best_lists2}
                 # After encodings exist, update prototypes
+                t_proto_start = time.perf_counter()
                 self.set_prototypes('valid', best_lists)
                 self.set_prototypes('test', best_lists)
                 if 'all' in train_groups:
                     self.set_prototypes('all', best_lists)
                 self.set_means_classes(best_lists)
+                prototypes_s = time.perf_counter() - t_proto_start
                 prototypes = {
                     'combined': self.combined_prototypes,
                     'class': self.class_prototypes,
                     'batch': self.batch_prototypes
                 }
+                t_loader_start = time.perf_counter()
                 loaders = get_images_loaders(data=self.data,
                                             random_recs=self.args.random_recs,
                                             weighted_sampler=self.args.weighted_sampler,
@@ -867,10 +1246,26 @@ class TrainAE:
                                             prototypes=prototypes,
                                             size=self.args.new_size,
                                             normalize=self.args.normalize,
-                                            n_aug=params.get('n_aug', 1)
+                                            n_aug=params.get('n_aug', 1),
+                                            num_workers=getattr(self.args, 'num_workers', 0),
                                             )
+                loader_refresh_s = time.perf_counter() - t_loader_start
                 values = log_traces(traces, values)
                 self.scheduler.step(values['valid']['mcc'][-1])
+                
+                # Report intermediate value to Optuna for pruning
+                if hasattr(self, 'trial') and self.trial is not None:
+                    try:
+                        valid_mcc = float(values['valid']['mcc'][-1])
+                        self.trial.report(valid_mcc, step=epoch)
+                        if self.trial.should_prune():
+                            print(f"Trial pruned at epoch {epoch} due to low validation MCC: {valid_mcc:.4f}")
+                            raise optuna.TrialPruned(f"Validation MCC {valid_mcc:.4f} fell below median at epoch {epoch}")
+                    except optuna.TrialPruned:
+                        raise
+                    except Exception:
+                        pass  # Don't fail training if trial.report() has issues
+                
                 print('Current LR:', self.scheduler.get_last_lr())
                 if self.log_tb:
                     try:
@@ -884,6 +1279,7 @@ class TrainAE:
                 if self.log_comet:
                     add_to_comet(values, comet_logger, epoch)
                 if values['valid']['mcc'][-1] > self.best_mcc:
+                    t_best_start = time.perf_counter()
                     print(f"Best Classification Mcc Epoch {epoch}, "
                             f"Acc: test: {values['test']['acc'][-1]}, valid: {values['valid']['acc'][-1]}"
                             f"Mcc: test: {values['test']['mcc'][-1]}, valid: {values['valid']['mcc'][-1]}"
@@ -891,7 +1287,9 @@ class TrainAE:
                             f" valid loss: {values['valid']['closs'][-1]},"
                             f" test loss: {values['test']['closs'][-1]}, dloss: {values['all']['dloss'][-1]}")
                     self.best_mcc = values['valid']['mcc'][-1]
-                    torch.save(self.model.state_dict(), f'{self.complete_log_path}/model.pth')
+                    model_path = f'{self.complete_log_path}/model.pth'
+                    torch.save(self.model.state_dict(), model_path)
+                    self._log_file_event('model_checkpoint', model_path)
                     self.save_prototypes(self.complete_log_path)
                     self.save_samples_weights(self.complete_log_path)
                     self.log_predictions(best_lists, run, comet_logger, 0)
@@ -903,16 +1301,35 @@ class TrainAE:
                     # best_vals['dom_acc'] = self.best_dom_acc
                     early_stop_counter = 0
                     print(values['valid']['mcc'][-1], self.best_mcc)
-                    self.make_encoded_values()
-                    self.cluster_and_visualize(run, best_lists, ['train', 'valid', 'test'],
-                                                n_clusters=self.n_cats * self.n_batches)
+                    if int(getattr(self.args, 'heavy_best_analysis', 0)):
+                        self.make_encoded_values()
+                        self.cluster_and_visualize(run, best_lists, ['train', 'valid', 'test'],
+                                                    n_clusters=self.n_cats * self.n_batches)
+                    # try:
+                    #     assert len(data_getter.data['labels']['all']) == self.initial_nsamples
+                    # except Exception as e:
+                    #     print("Problem with data integrity before removing noisy samples")
+                        # Write error to error file in run directory
+                    #     error_file = os.path.join(self.complete_log_path, 'data_integrity_error_before_removal.txt')
+                    #     with open(error_file, 'w') as ef:
+                    #         ef.write(f"Exception in data integrity check before removing noisy samples:\n{str(e)}\n")
+                    #         import traceback
+                    #         traceback.print_exc(file=ef)
+                    #     exit(1)
                     if self.args.remove_noisy_samples:
-                        data_getter.remove_noisy_samples(self.complete_log_path)
-                    try:
-                        assert len(data_getter.data['labels']['all']) == self.initial_nsamples
-                    except:
-                        print("Problem with removing noisy samples")
-                        exit()
+                        try:
+                            data_getter.remove_noisy_samples(self.complete_log_path)
+                            assert len(data_getter.data['labels']['all']) == self.initial_nsamples
+                        except Exception as e:
+                            print("Problem with removing noisy samples")
+                            # Write error to error file in run directory
+                            error_file = os.path.join(self.complete_log_path, 'remove_noisy_samples_error.txt')
+                            with open(error_file, 'w') as ef:
+                                ef.write(f"Exception in remove_noisy_samples:\n{str(e)}\n")
+                                import traceback
+                                traceback.print_exc(file=ef)
+                            exit(1)
+                    best_update_s = time.perf_counter() - t_best_start
                 else:
                     # if epoch > self.warmup:
                     early_stop_counter += 1
@@ -936,8 +1353,25 @@ class TrainAE:
                             f"test loss: {values['test']['closs'][-1]}, dloss: {values['all']['dloss'][-1]}")
                     self.best_closs = values['train']['closs'][-1]
 
+                self._log_epoch_metrics(epoch, values)
+
+                epoch_total = time.perf_counter() - epoch_start
+                self._log_epoch_timing(epoch, {
+                    'gap_prev_s': gap_prev,
+                    'train_s': train_s,
+                    'eval_s': eval_s,
+                    'prototypes_s': prototypes_s,
+                    'loader_refresh_s': loader_refresh_s,
+                    'logging_s': logging_s,
+                    'best_update_s': best_update_s,
+                    'total_s': epoch_total,
+                })
+                prev_epoch_end = time.perf_counter()
+
             early_stop_counter = 0
             if self.args.n_calibration > 0:
+                print("\n========== ENTERING CALIBRATION PHASE ==========")
+                print(f"Calibration epochs: {self.args.n_epochs} | n_calibration={self.args.n_calibration}")
                 for epoch in range(0, self.args.n_epochs):
                     values, _, _, _ = get_empty_dicts()  # Pas élégant
                     self.epoch = epoch
@@ -984,7 +1418,8 @@ class TrainAE:
                                                 prototypes=prototypes,
                                                 size=self.args.new_size,
                                                 normalize=self.args.normalize,
-                                                n_aug=params.get('n_aug', 1)
+                                                n_aug=params.get('n_aug', 1),
+                                                num_workers=getattr(self.args, 'num_workers', 0),
                                                 )
 
                     values = log_traces(traces, values)
@@ -1024,10 +1459,11 @@ class TrainAE:
                         best_vals['rec_loss'] = self.best_loss
                         # After training, perform clustering and visualize
                         # Store all samples before clustering
-                        self.make_encoded_values()
-                        self.cluster_and_visualize(run, best_lists, 
-                                                   ['train', 'valid', 'test'], 
-                                                   n_clusters=self.n_cats * self.n_batches, update_lists=False)
+                        if int(getattr(self.args, 'heavy_best_analysis', 0)):
+                            self.make_encoded_values()
+                            self.cluster_and_visualize(run, best_lists, 
+                                                       ['train', 'valid', 'test'], 
+                                                       n_clusters=self.n_cats * self.n_batches, update_lists=False)
                         early_stop_counter = 0
                     else:
                         print('missed', values['valid_calibration']['mcc'][-1], self.best_mcc)
@@ -1049,10 +1485,36 @@ class TrainAE:
                                 f"test loss: {values['test_calibration']['closs'][-1]}, dloss: {values['all']['dloss'][-1]}")
                         self.best_closs = values['valid_calibration']['closs'][-1]
 
+        except optuna.TrialPruned as e:
+            train_exception = e
+            print(f"Training pruned: {e}")
+            if self.log_tracking and run is not None:
+                try:
+                    run.stop()
+                except Exception as stop_exc:
+                    print(f"Warning: failed to stop Tracking run after pruning: {stop_exc}")
+            self._update_run_metadata_status('pruned', error_message=str(e))
+            raise
         except Exception as e:
             train_exception = e
             print(f"Training failed: {e}")
+            import traceback
             traceback.print_exc()
+            if torch.cuda.is_available() and str(self.args.device).startswith('cuda'):
+                stats = gpu_memory_stats(self.args.device)
+                missing_mb = None
+                if theoretical_gpu_required_mb is not None and stats.get('free_mb') is not None:
+                    missing_mb = max(0.0, float(theoretical_gpu_required_mb) - float(stats['free_mb']))
+                oom_error = 'out of memory' in str(e).lower()
+                emit_gpu_telemetry(
+                    'oom' if oom_error else 'failure',
+                    theoretical_gpu_required_mb=(f'{theoretical_gpu_required_mb:.2f}' if theoretical_gpu_required_mb is not None else None),
+                    actual_peak_gpu_mb=(f"{stats.get('actual_peak_gpu_mb', 0.0):.2f}" if stats else None),
+                    oom_missing_gpu_mb=(f'{missing_mb:.2f}' if missing_mb is not None else None),
+                    oom_gpu_free_at_failure_mb=(f"{stats.get('free_mb', 0.0):.2f}" if stats else None),
+                    oom_gpu_used_at_failure_mb=(f"{stats.get('used_mb', 0.0):.2f}" if stats else None),
+                )
+            self._update_run_metadata_status('failed', error_message=str(e))
 
         lists, traces = get_empty_traces()
         # values, _, _, _ = get_empty_dicts()  # Pas élégant
@@ -1060,15 +1522,22 @@ class TrainAE:
         model_path = f'{self.complete_log_path}/model.pth'
         if not os.path.exists(model_path):
             if train_exception is not None:
+                if isinstance(train_exception, optuna.TrialPruned):
+                    raise train_exception
+                self._update_run_metadata_status('failed', error_message=str(train_exception))
                 raise RuntimeError(
                     f"Training aborted before checkpoint creation: {model_path}"
                 ) from train_exception
+            self._update_run_metadata_status('failed', error_message=f"Checkpoint missing: {model_path}")
             raise FileNotFoundError(f"Checkpoint missing: {model_path}")
         self.model.load_state_dict(torch.load(model_path, map_location=self.args.device))
-        # Need another model because the other cant be use to get shap values
-        self.shap_model.load_state_dict(torch.load(model_path, map_location=self.args.device))
         self.model.eval()
-        self.shap_model.eval()
+        if self.run_explainability and self.shap_model is not None:
+            # Optional second model for explainability methods.
+            self.shap_model.load_state_dict(torch.load(model_path, map_location=self.args.device))
+            self.shap_model.eval()
+        print("\n========== FINAL EVALUATION PASS (BEST CHECKPOINT) ==========")
+        print("Running train loop snapshot + train/valid/test predictions...")
         with torch.no_grad():
             _, best_lists1, _ = self.loop('train', optimizer_model, params['gamma'], loaders['train'], lists, traces)
             for group in ["train", "valid", "test"]:
@@ -1078,6 +1547,19 @@ class TrainAE:
                 traces[key] = value
             # Store batch metrics for database saving
             self.batch_metrics = batch_metrics
+            
+            print("\n========== BATCH EFFECTS FINAL REPORT (train+valid+test) ==========")
+            print(f"Batch Entropy (mixing): {batch_metrics.get('batch_entropy', 0.0):.4f} (ideal: 1.0)")
+            print(f"Batch Entropy Loss: {batch_metrics.get('batch_entropy_loss', 0.0):.4f}")
+            print(f"Batch KNN Accuracy: {batch_metrics.get('batch_acc_loss', 0.0):.4f} (ideal: chance level)")
+            print(f"Batch KNN MCC: {batch_metrics.get('batch_mcc_loss', 0.0):.4f} (ideal: 0.0)")
+            print(f"Batch NMI: {batch_metrics.get('batch_nmi', 0.0):.4f}")
+            print(f"Batch ARI: {batch_metrics.get('batch_ari', 0.0):.4f}")
+            print(f"Batch Silhouette: {batch_metrics.get('batch_silhouette', 0.0):.4f}")
+            print("==================================================================\n")
+
+        # Persist fitted embedding classifier artifact (when using mlp_head)
+        self._save_inference_classifier(self.complete_log_path)
 
         best_lists = {**best_lists1, **best_lists2}
 
@@ -1093,6 +1575,21 @@ class TrainAE:
             except Exception as e:
                 print(f"Warning: failed to stop Tracking run: {e}")
 
+        final_status = 'completed' if train_exception is None else 'completed_with_recovered_error'
+        final_error = None if train_exception is None else str(train_exception)
+        self._update_run_metadata_status(final_status, error_message=final_error)
+        if torch.cuda.is_available() and str(self.args.device).startswith('cuda'):
+            stats = gpu_memory_stats(self.args.device)
+            emit_gpu_telemetry(
+                'end',
+                theoretical_gpu_required_mb=(f'{theoretical_gpu_required_mb:.2f}' if theoretical_gpu_required_mb is not None else None),
+                actual_peak_gpu_mb=(f"{stats.get('actual_peak_gpu_mb', 0.0):.2f}" if stats else None),
+            )
+        run_uuid = getattr(self.args, 'uuid', self.foldername)
+        print(f"uuid: {run_uuid} Final status: {final_status}")
+        self._save_run_summary(params, best_vals, start_time, run_status=final_status, error_message=final_error)
+        # Append to completed_runs CSV for robust manifest/metrics tracking
+        self._append_completed_run_csv(params, best_vals, getattr(self, 'batch_metrics', None), run_uuid, final_status, final_error)
         return self.best_mcc
 
     def save_best_run(self, run, comet_logger, params, best_vals, best_lists=None):
@@ -1125,6 +1622,7 @@ class TrainAE:
             proto_val = proto_val[len("prototypes_"):]
 
 
+        line_found = False
         if not os.path.exists(models_csv_path):
             os.makedirs(log_dir, exist_ok=True)
             with open(models_csv_path, 'w') as f:
@@ -1136,11 +1634,22 @@ class TrainAE:
         else:
             with open(models_csv_path, 'r') as f:
                 lines = f.readlines()
-
-            line_found = False
+            lines = pd.read_csv(models_csv_path).to_csv(index=False).splitlines(keepends=True)  # Reformat lines to ensure consistent formatting
             for i, line in enumerate(lines[1:]):  # skip header
                 line_parts = line.strip().split(',')
-                line_mcc = float(line_parts[0])
+                if len(line_parts) < 16:
+                    raise RuntimeError(
+                        f"Malformed row in {models_csv_path} at data row {i + 2}: "
+                        f"expected >=16 comma-separated fields, got {len(line_parts)}. "
+                        f"row={line!r}"
+                    )
+                try:
+                    line_mcc = float(line_parts[0])
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid valid_mcc in {models_csv_path} at data row {i + 2}: "
+                        f"value={line_parts[0]!r}. row={line!r}"
+                    ) from exc
                 if (line_parts[1:-1] == [self.args.model_name, f'{self.path.split("/")[-1]}', str(params["n_neighbors"]), f'nsize{self.args.new_size}', f'fsgm{self.args.fgsm}', f'ncal{self.args.n_calibration}', 
                                        str(self.args.classif_loss), str(self.args.dloss), dist_fct_val,
                                        f'prototypes_{proto_val}',
@@ -1182,17 +1691,6 @@ class TrainAE:
         if proto_val.startswith("prototypes_"):
             proto_val = proto_val[len("prototypes_"):]
         
-        # Use consistent CSV formatting (same as path)
-        if not line_found:
-            lines[-1] = f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},{params["n_neighbors"]},'\
-                         f'nsize{self.args.new_size},fgsm{self.args.fgsm},'\
-                         f'ncal{self.args.n_calibration},{self.args.classif_loss},' \
-                         f'{self.args.dloss},{dist_fct_val},prototypes_{proto_val},' \
-                         f'npos{self.args.n_positives},nneg{self.args.n_negatives},' \
-                         f'{self.args.normalize},{task_val},{self.complete_log_path}\n'
-
-            with open(models_csv_path, 'w') as f:
-                f.writelines(lines)
         # Ensure prototypes_to_use doesn't have "prototypes_" prefix already
         proto_val = str(self.args.prototypes_to_use)
         if proto_val.startswith("prototypes_"):
@@ -1211,7 +1709,10 @@ class TrainAE:
         try:
             if os.path.exists(model_dir):
                 shutil.rmtree(model_dir, ignore_errors=True)
+            copy_start = time.perf_counter()
             shutil.copytree(self.complete_log_path, model_dir)
+            copy_sec = time.perf_counter() - copy_start
+            print(f"BestModelSync|seconds={copy_sec:.2f}|src={self.complete_log_path}|dst={model_dir}")
         except Exception as e:
             print(f"Error copying model directory: {e}")
 
@@ -1222,6 +1723,7 @@ class TrainAE:
         self.keep_best_run(run, comet_logger, best_vals)
         self.save_prototypes(model_dir)
         self.save_samples_weights(model_dir)
+        self._save_inference_classifier(model_dir)
 
         # --- Update best model registry in MySQL ---
         registry_params = {
@@ -1251,7 +1753,7 @@ class TrainAE:
         
         update_best_model_registry(
             registry_params,
-            accuracy=best_vals.get('acc', self.best_mcc),
+            accuracy=best_vals.get('valid_acc', self.best_acc),
             mcc=self.best_mcc,
             log_path=model_dir,
             batch_metrics=batch_metrics_dict
@@ -1259,13 +1761,17 @@ class TrainAE:
 
     # TODO Decide if valuable class method
     def save_prototypes(self, model_dir):
-        with open(f'{model_dir}/prototypes.pkl', 'wb') as f:
+        path = f'{model_dir}/prototypes.pkl'
+        with open(path, 'wb') as f:
             pickle.dump(self.prototypes, f)
+        self._log_file_event('prototypes_pkl', path)
 
     # TODO Decide if valuable class method
     def save_samples_weights(self, model_dir):
-        with open(f'{model_dir}/sample_weights.pkl', 'wb') as f:
+        path = f'{model_dir}/sample_weights.pkl'
+        with open(path, 'wb') as f:
             pickle.dump(self.samples_weights, f)
+        self._log_file_event('sample_weights_pkl', path)
 
     def save_encoded_vectors(self, model_dir, best_lists):
         """Save encoded vectors (embeddings) for each group (train, valid, test) as .npz files.
@@ -1303,12 +1809,24 @@ class TrainAE:
                     cats=cats
                 )
                 print(f"Saved {group} encodings to {npz_path}")
+                self._log_file_event(f'{group}_encodings_npz', npz_path)
         except Exception as e:
             print(f"Error saving encoded vectors: {e}")
 
     def keep_best_run(self, run, comet_logger, best_vals):
-        self.best_params_tracking = get_best_params(run, best_vals)
-        self.best_params = get_best_params_comet(comet_logger, best_vals)
+        # Tracking/Comet can be disabled; do not fail an otherwise successful trial.
+        self.best_params_tracking = {}
+        self.best_params = {}
+        if self.log_tracking and run is not None:
+            try:
+                self.best_params_tracking = get_best_params(run, best_vals)
+            except Exception as e:
+                print(f"Warning: failed to fetch Tracking best params: {e}")
+        if self.log_comet and comet_logger is not None:
+            try:
+                self.best_params = get_best_params_comet(comet_logger, best_vals)
+            except Exception as e:
+                print(f"Warning: failed to fetch Comet best params: {e}")
 
     def set_arcloss(self):
         if self.args.classif_loss == 'arcface':
@@ -1412,9 +1930,9 @@ class TrainAE:
                         encoded,
                         torch.Tensor(cats_batch).long().to(self.args.device)
                     )
-                    all_subcenters.append(subcenters.detach().cpu().numpy())
+                    all_subcenters.append(_tensor_to_numpy(subcenters))
 
-                all_samples.append(encoded.detach().cpu().numpy())
+                all_samples.append(_tensor_to_numpy(encoded))
 
                 # Mirror metadata for each augmented sample
                 group_labels.extend(labels_batch)
@@ -1436,7 +1954,7 @@ class TrainAE:
             if 'arcfacewithsubcenters' in self.args.classif_loss:
                 self.all_samples['subcenters'][group] = np.concatenate(all_subcenters) if all_subcenters else np.array([])
 
-    def log_predictions(self, best_lists, run, comet_logger, step):
+    def log_predictions(self, best_lists, run=None, comet_logger=None, step=0):
         cats, labels, preds, scores, names = [{'train': [], 'valid': [], 'test': []} for _ in range(5)]
         for group in ['valid', 'test']:
             cats[group] = np.concatenate(best_lists[group]['cats'])
@@ -1455,7 +1973,7 @@ class TrainAE:
                 columns=colnames
             )
             df.to_csv(f'{self.complete_log_path}/{group}_predictions.csv', index=False)
-            if self.log_tracking:
+            if self.log_tracking and run is not None:
                 run[f"{group}_predictions"].track_files(f'{self.complete_log_path}/{group}_predictions.csv')
                 run[f'{group}_AUC'] = metrics.roc_auc_score(y_true=to_categorical(cats[group], len(self.unique_labels)), y_score=scores[group], multi_class='ovr')
                 save_roc_curve(
@@ -1548,13 +2066,24 @@ class TrainAE:
                 neg_enc = _ensure_embedding(not_to_rec)
             classif_loss = self.triplet_loss(enc, pos_enc, neg_enc)
         elif self.args.classif_loss in ['ce', 'hinge']:
+            if enc.dim() != 2:
+                raise RuntimeError(
+                    f"Expected 2D encoder output before classification head, got shape={tuple(enc.shape)}"
+                )
+            expected_in = int(self.model.linear.in_features)
+            got_in = int(enc.shape[1])
+            if got_in != expected_in:
+                raise RuntimeError(
+                    f"Classifier head input mismatch: model_name={getattr(self.args, 'model_name', 'unknown')} "
+                    f"enc_dim={got_in} linear_in={expected_in} linear_out={int(self.model.linear.out_features)}"
+                )
             preds = self.model.linear(enc)
             labels = labels.to(self.args.device).long()
             classif_loss = self.celoss(preds, labels)
 
         elif 'arcfacewithsubcenters' in self.args.classif_loss:
             classif_loss, subcenters = self.arcloss(enc, labels)
-            lists[group]['subcenters'] += [subcenters.detach().cpu().numpy()]
+            lists[group]['subcenters'] += [_tensor_to_numpy(subcenters)]
 
         elif 'arcface' in self.args.classif_loss:
             classif_loss = self.arcloss(enc, labels)
@@ -1601,8 +2130,11 @@ class TrainAE:
         # model, classifier, dann = models['model'], models['classifier'], models['dann']
         # triplet_loss = nn.TripletMarginLoss(margin, p=2)
         classif_loss = torch.tensor([0]).to(self.args.device)[0]
+        cls_confmat = None
+        total_batches = len(loader)
         # with tqdm(total=len(loader), position=0, leave=True) as pbar:
         for i, batch in enumerate(loader):
+            self._print_batch_progress(group, i, total_batches)
             # if group in ['train']:
             if self.model.training:
                 optimizer_model.zero_grad()
@@ -1620,44 +2152,58 @@ class TrainAE:
 
             domains = to_categorical(domain.long(), self.n_batches).squeeze().float().to(self.args.device)
 
-            enc, dpreds = self.model(data)
+            with self._autocast_context():
+                enc, dpreds = self.model(data)
 
-            lists[group]['domains'] += [np.array([self.unique_batches[np.argmax(d)] for d in domains.detach().cpu().numpy()])]
-            lists[group]['classes'] += [labels.detach().cpu().numpy()]
+            domain_np = _tensor_to_numpy(domains)
+            label_np = _tensor_to_numpy(labels)
+            dpreds_np = _tensor_to_numpy(dpreds)
+            enc_np = _tensor_to_numpy(enc.view(enc.shape[0], -1))
+
+            lists[group]['domains'] += [np.array([self.unique_batches[np.argmax(d)] for d in domain_np])]
+            lists[group]['classes'] += [label_np]
             if group == 'train':
-                lists[group]['preds'] += [dpreds.detach().cpu().numpy()]
-            lists[group]['encoded_values'] += [enc.view(enc.shape[0], -1).detach().cpu().numpy()]
+                lists[group]['preds'] += [dpreds_np]
+            lists[group]['encoded_values'] += [enc_np]
             lists[group]['names'] += [names]
             # lists[group]['inputs'] += [data.view(data.shape[0], -1).detach().cpu().numpy()]
             lists[group]['labels'] += [np.array(
-                [self.unique_labels[x] for x in labels.detach().cpu().numpy()])]
+                [self.unique_labels[x] for x in label_np])]
             lists[group]['old_labels'] += [np.array(old_labels)]
             traces[group]['dom_acc'] += [np.mean([0 if pred != dom else 1 for pred, dom in
-                                                zip(dpreds.detach().cpu().numpy().argmax(1),
-                                                    domains.argmax(1).detach().cpu().numpy())])]
-            lists[group]['cats'] += [labels.detach().cpu().numpy()]
+                                                zip(dpreds_np.argmax(1),
+                                                    _tensor_to_numpy(domains.argmax(1)))])]
+            lists[group]['cats'] += [label_np]
             if self.model.training:
-                classif_loss, dloss = self.get_losses(enc, to_rec, not_to_rec, pos_batch_sample,
-                                                    neg_batch_sample, dpreds, domains, labels, group)
+                with self._autocast_context():
+                    classif_loss, dloss = self.get_losses(enc, to_rec, not_to_rec, pos_batch_sample,
+                                                        neg_batch_sample, dpreds, domains, labels, group)
                 traces[group]['closs'] += [classif_loss.item()]
                 traces[group]['dloss'] += [dloss.item()]
                 if group in ['train']:
-                    if i == 0:
+                    if i == 0 and int(getattr(self.args, 'save_debug_images', 0)):
                         save_tensor(data[0], f'{self.complete_log_path}/{group}_data.png')
                     # total_loss = classif_loss + gamma * dloss
-                    classif_loss.backward()
+                    if self.use_grad_scaler:
+                        self.grad_scaler.scale(classif_loss).backward()
+                    else:
+                        classif_loss.backward()
                     # nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
                 elif group in ['all']:
                     if gamma > 0:
                         dloss = gamma * dloss
-                        dloss.backward()
+                        if self.use_grad_scaler:
+                            self.grad_scaler.scale(dloss).backward()
+                        else:
+                            dloss.backward()
                 if self.args.fgsm:
                     adv_data = data + self.params['epsilon'] * data.grad.sign()
                     adv_data = torch.clamp(adv_data, -1, 1)
-                    enc, dpreds = self.model(adv_data)
+                    with self._autocast_context():
+                        enc, dpreds = self.model(adv_data)
                     enc = enc.detach()
                     if group in ['train']:
-                        if i == 0:
+                        if i == 0 and int(getattr(self.args, 'save_debug_images', 0)):
                             save_tensor(adv_data[0], f'{self.complete_log_path}/{group}_adv_data.png')
                         if self.args.classif_loss not in ['ce', 'hinge', 'arcface', 'arcfacewithsubcenters']:
                             adv_to_rec = to_rec + self.params['epsilon'] * to_rec.grad.sign()
@@ -1669,8 +2215,12 @@ class TrainAE:
                         else:
                             adv_to_rec = to_rec
                             adv_not_to_rec = not_to_rec
-                        adv_classif_loss, _ = self.get_losses(enc, adv_to_rec, adv_not_to_rec, pos_batch_sample, neg_batch_sample, dpreds, domains, labels, group)
-                        (0.1 * adv_classif_loss).backward()
+                        with self._autocast_context():
+                            adv_classif_loss, _ = self.get_losses(enc, adv_to_rec, adv_not_to_rec, pos_batch_sample, neg_batch_sample, dpreds, domains, labels, group)
+                        if self.use_grad_scaler:
+                            self.grad_scaler.scale(0.1 * adv_classif_loss).backward()
+                        else:
+                            (0.1 * adv_classif_loss).backward()
                         del adv_data, adv_to_rec, adv_not_to_rec, adv_classif_loss
                     elif group in ['all']:
                         if self.args.classif_loss in ['inverseTriplet', 'inverse_softmax_contrastive']:
@@ -1683,13 +2233,23 @@ class TrainAE:
                         else:
                             adv_pos_batch_sample = pos_batch_sample
                             adv_neg_batch_sample = neg_batch_sample
-                        _, adv_dloss = self.get_losses(enc, to_rec, not_to_rec, adv_pos_batch_sample, adv_neg_batch_sample, dpreds, domains, labels, group)
-                        (0.1 * adv_dloss).backward()
+                        with self._autocast_context():
+                            _, adv_dloss = self.get_losses(enc, to_rec, not_to_rec, adv_pos_batch_sample, adv_neg_batch_sample, dpreds, domains, labels, group)
+                        if self.use_grad_scaler:
+                            self.grad_scaler.scale(0.1 * adv_dloss).backward()
+                        else:
+                            (0.1 * adv_dloss).backward()
                         del adv_data, adv_pos_batch_sample, adv_neg_batch_sample, adv_dloss
                 del dloss
 
-                optimizer_model.step()
+                if self.use_grad_scaler:
+                    self.grad_scaler.step(optimizer_model)
+                    self.grad_scaler.update()
+                else:
+                    optimizer_model.step()
+                    record_gpu_peak(self.args.device)
             del data, to_rec, not_to_rec, pos_batch_sample, neg_batch_sample, enc, dpreds, domains
+        self._finish_batch_progress(total_batches)
         return classif_loss.detach(), lists, traces
 
     def loop_calibration(self, group, optimizer_model, gamma, loader, lists, traces):
@@ -1713,8 +2273,10 @@ class TrainAE:
         # model, classifier, dann = models['model'], models['classifier'], models['dann']
         # triplet_loss = nn.TripletMarginLoss(margin, p=2)
         classif_loss = None
+        total_batches = len(loader)
         # with tqdm(total=len(loader), position=0, leave=True) as pbar:
         for i, batch in enumerate(loader):
+            self._print_batch_progress(group, i, total_batches)
             # if group in ['train']:
             if self.model.training:
                 optimizer_model.zero_grad()
@@ -1722,7 +2284,8 @@ class TrainAE:
             data = data.to(self.args.device).float()
             to_rec = to_rec.to(self.args.device).float()
             domains = to_categorical(domain.long(), self.n_batches).squeeze().float().to(self.args.device)
-            enc, dpreds = self.model(data)
+            with self._autocast_context():
+                enc, dpreds = self.model(data)
 
             # if self.args.classif_loss == 'cosine':
             #     classif_loss = 1 - torch.nn.functional.cosine_similarity(enc, self.model(to_rec)).mean()
@@ -1747,25 +2310,31 @@ class TrainAE:
             #     # domain = domain.argmax(1)
             # else:
             #     dloss = torch.Tensor([0]).to(self.args.device)[0]
-            classif_loss, dloss = self.get_losses(enc, to_rec, not_to_rec, pos_batch_sample,
-                                                  neg_batch_sample, dpreds, domains, labels, group)
+            with self._autocast_context():
+                classif_loss, dloss = self.get_losses(enc, to_rec, not_to_rec, pos_batch_sample,
+                                                      neg_batch_sample, dpreds, domains, labels, group)
 
-            lists[group]['domains'] += [np.array([self.unique_batches[np.argmax(d)] for d in domains.detach().cpu().numpy()])]
-            lists[group]['classes'] += [labels.detach().cpu().numpy()]
+            domain_np = _tensor_to_numpy(domains)
+            label_np = _tensor_to_numpy(labels)
+            dpreds_np = _tensor_to_numpy(dpreds)
+            enc_np = _tensor_to_numpy(enc.view(enc.shape[0], -1))
+
+            lists[group]['domains'] += [np.array([self.unique_batches[np.argmax(d)] for d in domain_np])]
+            lists[group]['classes'] += [label_np]
             if group == 'train':
-                lists[group]['preds'] += [dpreds.detach().cpu().numpy()]
-            lists[group]['encoded_values'] += [enc.view(enc.shape[0], -1).detach().cpu().numpy()]
+                lists[group]['preds'] += [dpreds_np]
+            lists[group]['encoded_values'] += [enc_np]
             lists[group]['names'] += [names]
             # lists[group]['inputs'] += [data.view(data.shape[0], -1).detach().cpu().numpy()]
             lists[group]['labels'] += [np.array(
-                [self.unique_labels[x] for x in labels.detach().cpu().numpy()])]
+                [self.unique_labels[x] for x in label_np])]
             lists[group]['old_labels'] += [np.array(old_labels)]
             traces[group]['dom_acc'] += [np.mean([0 if pred != dom else 1 for pred, dom in
-                                                zip(dpreds.detach().cpu().numpy().argmax(1),
-                                                    domains.argmax(1).detach().cpu().numpy())])]
+                                                zip(dpreds_np.argmax(1),
+                                                    _tensor_to_numpy(domains.argmax(1)))])]
             traces[group]['closs'] += [classif_loss.item()]
             traces[group]['dloss'] += [dloss.item()]
-            lists[group]['cats'] += [labels.detach().cpu().numpy()]
+            lists[group]['cats'] += [label_np]
             if self.model.training:
                 if group in ['calibration', 'train']:
                     # total_loss = classif_loss + gamma * dloss
@@ -1777,6 +2346,7 @@ class TrainAE:
                         dloss.backward()
                 optimizer_model.step()
             # pbar.update(1)
+        self._finish_batch_progress(total_batches)
         return classif_loss, lists, traces
 
 
@@ -1799,6 +2369,24 @@ class TrainAE:
         
         predictions = []
         probas_list = []
+
+        train_cats_raw = self.all_samples.get('cats', {}).get('train')
+        if isinstance(train_cats_raw, np.ndarray):
+            train_cats = np.asarray(train_cats_raw).reshape(-1)
+        elif train_cats_raw is not None:
+            train_cat_chunks = [
+                np.atleast_1d(chunk)
+                for chunk in train_cats_raw
+                if chunk is not None and np.size(chunk) > 0
+            ]
+            train_cats = np.concatenate(train_cat_chunks) if train_cat_chunks else np.array([])
+        else:
+            train_cats = np.array([])
+
+        class_counts = {}
+        if getattr(self.args, 'prototype_kind', 'distance').lower() == 'distance_weighted':
+            for clas in self.unique_labels:
+                class_counts[clas] = int(np.sum(train_cats == clas)) if train_cats.size else 0
         
         for emb in embeddings:
             emb = emb.reshape(1, -1)
@@ -1826,13 +2414,7 @@ class TrainAE:
             prototype_kind = getattr(self.args, 'prototype_kind', 'distance').lower()
             
             if prototype_kind == 'distance_weighted':
-                # Weight by number of prototypes per class (classes with more prototypes have more votes)
-                class_counts = {}
-                for clas in self.unique_labels:
-                    # Count number of training samples per class
-                    mask = np.concatenate(self.all_samples['cats']['train']) == clas
-                    class_counts[clas] = np.sum(mask)
-                
+                # Weight by number of training samples per class.
                 # Inverse distance weighted by class count
                 inv_distances = {}
                 for label, dist in distances.items():
@@ -2016,6 +2598,7 @@ class TrainAE:
         # model, classifier, dann = models['model'], models['classifier'], models['dann']
         # import nearest_neighbors from sklearn
         classif_loss = None
+        cls_confmat = None
 
         def _safe_concat(chunks):
             if chunks and len(chunks) > 0:
@@ -2034,11 +2617,16 @@ class TrainAE:
                          self.args.classif_loss not in ['ce', 'hinge'])
         use_kde = (use_prototypes and 
                   getattr(self.args, 'prototype_kind', 'distance').lower() == 'kde')
-        use_knn = (self.args.classif_loss not in ['ce', 'hinge'] and not use_prototypes and not use_kde)
+        use_embedding_classifier = (self.args.classif_loss not in ['ce', 'hinge'] and not use_prototypes and not use_kde)
+        siamese_inference = str(getattr(self.args, 'siamese_inference', 'linearsvc')).strip().lower()
+        if siamese_inference not in ['knn', 'mlp_head', 'linearsvc', 'logisticregression']:
+            siamese_inference = 'linearsvc'
         
         # Initialize classifiers
         KNeighborsClassifier = None
         kde_classifier = None
+        embedding_classifier = None
+        embedding_classifier_kind = None
         
         if use_kde and train_encs is not None and train_cats is not None:
             kde_classifier = self._fit_kde_classifier(train_encs, train_cats)
@@ -2047,57 +2635,99 @@ class TrainAE:
         elif use_prototypes and train_encs is not None and train_cats is not None:
             print(f"Using prototype-based classification ({getattr(self.args, 'prototype_kind', 'distance')})") 
         
-        elif use_knn:
+        elif use_embedding_classifier:
             if train_encs is None or train_cats is None or train_encs.size == 0 or train_cats.size == 0:
-                KNeighborsClassifier = None
+                embedding_classifier = None
             else:
-                requested_k = self.params.get('n_neighbors', 0)
-                if requested_k is None or requested_k <= 0:
-                    requested_k = min(25, max(1, train_encs.shape[0]))
-                    self.params['n_neighbors'] = requested_k
-                k_val = min(requested_k, max(1, train_encs.shape[0]))
-                
-                # Use ML module for KNN fitting
-                KNeighborsClassifier = fit_knn_classifier(
-                    train_encs, train_cats,
-                    n_neighbors=k_val,
-                    metric='minkowski'
-                )
-                print(f"Using KNN classifier with k={k_val}")
+                if siamese_inference == 'mlp_head':
+                    try:
+                        embedding_classifier = MLPClassifier(
+                            hidden_layer_sizes=(128,),
+                            activation='relu',
+                            solver='adam',
+                            alpha=1e-4,
+                            batch_size='auto',
+                            learning_rate_init=1e-3,
+                            max_iter=300,
+                            random_state=1,
+                            early_stopping=True,
+                            n_iter_no_change=15,
+                        )
+                        embedding_classifier.fit(train_encs, train_cats)
+                        embedding_classifier_kind = 'mlp_head'
+                        print(f"Using MLP head on embeddings (train_n={train_encs.shape[0]})")
+                    except Exception as e:
+                        print(f"MLP head fitting failed, falling back to KNN: {e}")
+                        siamese_inference = 'knn'
+
+                if siamese_inference == 'knn':
+                    requested_k = self.params.get('n_neighbors', 0)
+                    if requested_k is None or requested_k <= 0:
+                        requested_k = min(25, max(1, train_encs.shape[0]))
+                        self.params['n_neighbors'] = requested_k
+                    k_val = min(requested_k, max(1, train_encs.shape[0]))
+                    embedding_classifier = fit_knn_classifier(
+                        train_encs, train_cats,
+                        n_neighbors=k_val,
+                        metric='minkowski'
+                    )
+                    embedding_classifier_kind = 'knn'
+                    print(f"Using KNN classifier with k={k_val}")
+                elif siamese_inference == 'linearsvc':
+                    embedding_classifier = fit_linearsvc_classifier(train_encs, train_cats)
+                    embedding_classifier_kind = 'linearsvc'
+                    print(f"Using LinearSVC classifier on embeddings (train_n={train_encs.shape[0]})")
+                elif siamese_inference == 'logisticregression':
+                    embedding_classifier = fit_logreg_classifier(train_encs, train_cats)
+                    embedding_classifier_kind = 'logisticregression'
+                    print(f"Using LogisticRegression classifier on embeddings (train_n={train_encs.shape[0]})")
         else:
             KNeighborsClassifier = self.model
         # plot_decision_boundary(KNeighborsClassifier, train_encs, train_cats)
         # plt.savefig(f'{self.complete_log_path}/decision_boundary.png')
+        total_batches = len(loader)
         # with tqdm(total=len(loader), position=0, leave=True) as pbar:
         for i, batch in enumerate(loader):
+            self._print_batch_progress(group, i, total_batches)
             # if group in ['train']:
             data, names, labels, _, old_labels, domain, to_rec, not_to_rec, pos_batch_sample, neg_batch_sample = batch
             data = data.to(self.args.device).float()
             to_rec = to_rec.to(self.args.device).float()
             domains = to_categorical(domain.long(), self.n_batches).squeeze().float().to(self.args.device)
-            enc, dpreds = self.model(data)
-            enc_np = enc.view(enc.shape[0], -1).detach().cpu().numpy()
+            with self._autocast_context():
+                enc, dpreds = self.model(data)
+            enc_np = _tensor_to_numpy(enc.view(enc.shape[0], -1))
             
             # Predict based on chosen method
             if use_kde and kde_classifier is not None:
                 preds = kde_classifier.predict(enc_np)
                 proba = kde_classifier.predict_proba(enc_np)
             elif use_prototypes and self.class_prototypes.get('train'):
-                preds, proba = self._classify_with_prototypes(enc_np, dist_fct=self.args.dist_fct)
+                preds, proba = self._classify_with_prototypes(enc_np, dist_fct=getattr(self.args, 'dist_fct', 'euclidean'))
                 if preds is None:
                     preds = np.zeros(enc_np.shape[0], dtype=int)
                     proba = np.full((enc_np.shape[0], len(self.unique_labels)), 1.0 / max(len(self.unique_labels), 1))
             elif self.args.classif_loss not in ['ce', 'hinge']:
-                if KNeighborsClassifier is not None:
-                    preds = KNeighborsClassifier.predict(enc_np)
-                    proba = KNeighborsClassifier.predict_proba(enc_np)
+                if embedding_classifier is not None:
+                    preds = embedding_classifier.predict(enc_np)
+                    if hasattr(embedding_classifier, 'predict_proba'):
+                        proba = embedding_classifier.predict_proba(enc_np)
+                    else:
+                        pred_idx = np.asarray(preds, dtype=int)
+                        n_cls = max(len(self.unique_labels), 1)
+                        proba = np.zeros((pred_idx.shape[0], n_cls), dtype=np.float32)
+                        for row_i, cls_i in enumerate(pred_idx):
+                            cls_i_int = int(cls_i)
+                            if 0 <= cls_i_int < n_cls:
+                                proba[row_i, cls_i_int] = 1.0
                 else:
                     preds = np.zeros(enc_np.shape[0], dtype=int)
                     proba = np.full((enc_np.shape[0], len(self.unique_labels)), 1.0 / max(len(self.unique_labels), 1))
             else:
-                out = self.model.linear(enc)
-                preds = out.argmax(1).detach().cpu().numpy()
-                proba = torch.softmax(out, 1).detach().cpu().numpy()
+                with self._autocast_context():
+                    out = self.model.linear(enc)
+                preds = _tensor_to_numpy(out.argmax(1))
+                proba = _tensor_to_numpy(torch.softmax(out, 1))
             if self.args.dloss == 'DANN':
                 dloss = self.dceloss(dpreds, domains)
 
@@ -2111,32 +2741,42 @@ class TrainAE:
             else:
                 dloss = torch.Tensor([0]).to(self.args.device)[0]
 
-            lists[group]['domains'] += [np.array([self.unique_batches[np.argmax(d)] for d in domains.detach().cpu().numpy()])]
-            lists[group]['classes'] += [labels.detach().cpu().numpy()]
-            lists[group]['encoded_values'] += [enc.view(enc.shape[0], -1).detach().cpu().numpy()]
+            domain_np = _tensor_to_numpy(domains)
+            label_np = _tensor_to_numpy(labels)
+            dpreds_np = _tensor_to_numpy(dpreds)
+
+            lists[group]['domains'] += [np.array([self.unique_batches[np.argmax(d)] for d in domain_np])]
+            lists[group]['classes'] += [label_np]
+            lists[group]['encoded_values'] += [enc_np]
 
             lists[group]['names'] += [names]
-            lists[group]['cats'] += [labels.detach().cpu().numpy()]
+            lists[group]['cats'] += [label_np]
             # lists[group]['inputs'] += [data.view(data.shape[0], -1).detach().cpu().numpy()]
             lists[group]['labels'] += [np.array(
-                [self.unique_labels[x] for x in labels.detach().cpu().numpy()])]
+                [self.unique_labels[x] for x in label_np])]
             lists[group]['old_labels'] += [np.array(old_labels)]
-            traces[group]['acc'] += [np.mean([0 if pred != dom else 1 for pred, dom in
-                                                zip(preds,
-                                                    labels.detach().cpu().numpy())])]
-            traces[group]['dom_acc'] += [np.mean([0 if pred != dom else 1 for pred, dom in
-                                                zip(dpreds.detach().cpu().numpy().argmax(1),
-                                                    domains.argmax(1).detach().cpu().numpy())])]
+            labels_t = labels.to(self.args.device).long().view(-1)
+            preds_t = torch.as_tensor(preds, device=self.args.device).long().view(-1)
+            if preds_t.numel() != labels_t.numel():
+                min_n = min(preds_t.numel(), labels_t.numel())
+                preds_t = preds_t[:min_n]
+                labels_t = labels_t[:min_n]
+            cls_confmat = _update_confmat_gpu(cls_confmat, labels_t, preds_t, len(self.unique_labels))
+            batch_acc = (preds_t == labels_t).float().mean().item() if labels_t.numel() > 0 else 0.0
+            dom_pred_t = dpreds.argmax(1).long()
+            dom_true_t = domains.argmax(1).long()
+            dom_acc = (dom_pred_t == dom_true_t).float().mean().item() if dom_true_t.numel() > 0 else 0.0
+            traces[group]['acc'] += [batch_acc]
+            traces[group]['dom_acc'] += [dom_acc]
             traces[group]['closs'] += [0]
             traces[group]['dloss'] += [dloss.item()]
             lists[group]['preds'] += [proba]
             lists[group]['inputs'] += [data.detach().cpu()]
+        self._finish_batch_progress(total_batches)
 
         try:
-            traces[group]['mcc'] += [np.round(
-                MCC(np.concatenate(lists[group]['cats']), np.concatenate(lists[group]['preds']).argmax(1))
-                , 3)
-            ]
+            _, mcc_val = _acc_mcc_from_confmat_gpu(cls_confmat)
+            traces[group]['mcc'] += [np.round(mcc_val, 3)]
         except:
             pass
         # Add other metrics here
@@ -2161,7 +2801,23 @@ class TrainAE:
             except:
                 pass
 
-        if group == 'test':
+        # Add AUC calculation
+        try:
+            from sklearn.metrics import roc_auc_score
+            y_true = np.concatenate(lists[group]['cats'])
+            y_prob = np.concatenate(lists[group]['preds'])
+            if y_prob.shape[1] > 2:
+                auc_val = float(roc_auc_score(y_true, y_prob, multi_class='ovr'))
+            elif y_prob.shape[1] == 2:
+                auc_val = float(roc_auc_score(y_true, y_prob[:, 1]))
+            else:
+                auc_val = 0.0
+            traces[group]['auc'] += [np.round(auc_val, 3)]
+        except:
+            pass
+
+        pca_every = int(getattr(self.args, 'test_pca_every', 0))
+        if group == 'test' and pca_every > 0 and ((self.epoch + 1) % pca_every == 0):
             # plot the PCA of the encoded values
             from sklearn.decomposition import PCA
             pca = PCA(n_components=2)
@@ -2185,6 +2841,7 @@ class TrainAE:
             plt.colorbar()
             plt.title('PCA of encoded values')
             plt.savefig(f'{self.complete_log_path}/pca_batches.png')
+            self._log_file_event('pca_batches_png', f'{self.complete_log_path}/pca_batches.png')
 
         # Auto-select best k if enabled
         if self.args.auto_select_k and self.args.classif_loss not in ['ce', 'hinge'] and group == 'valid':
@@ -2234,7 +2891,7 @@ class TrainAE:
                 print("Auto-select k skipped due to lack of validation encodings or training encodings.")
 
 
-        return None, lists, traces, KNeighborsClassifier
+        return None, lists, traces, embedding_classifier if embedding_classifier is not None else KNeighborsClassifier
 
     def predict_prototypes(self, group, loader, lists, traces):
         """
@@ -2265,21 +2922,26 @@ class TrainAE:
         )
         # plot_decision_boundary(KNeighborsClassifier, train_encs, train_cats)
         # plt.savefig(f'{self.complete_log_path}/decision_boundary.png')
+        total_batches = len(loader)
         # with tqdm(total=len(loader), position=0, leave=True) as pbar:
         for i, batch in enumerate(loader):
+            self._print_batch_progress(group, i, total_batches)
             # if group in ['train']:
             data, names, labels, _, old_labels, domain, to_rec, not_to_rec, pos_batch_sample, neg_batch_sample = batch
             data = data.to(self.args.device).float()
             to_rec = to_rec.to(self.args.device).float()
             domains = to_categorical(domain.long(), self.n_batches).squeeze().float().to(self.args.device)
-            enc, dpreds = self.model(data)
+            with self._autocast_context():
+                enc, dpreds = self.model(data)
             if self.args.classif_loss not in ['ce', 'hinge']:
-                preds = KNeighborsClassifier.predict(enc.view(enc.shape[0], -1).detach().cpu().numpy())
-                proba = KNeighborsClassifier.predict_proba(enc.view(enc.shape[0], -1).detach().cpu().numpy())
+                enc_np = _tensor_to_numpy(enc.view(enc.shape[0], -1))
+                preds = KNeighborsClassifier.predict(enc_np)
+                proba = KNeighborsClassifier.predict_proba(enc_np)
             else:
-                out = self.model.linear(enc)
-                preds = out.argmax(1).detach().cpu().numpy()
-                proba = torch.softmax(out, 1).detach().cpu().numpy()
+                with self._autocast_context():
+                    out = self.model.linear(enc)
+                preds = _tensor_to_numpy(out.argmax(1))
+                proba = _tensor_to_numpy(torch.softmax(out, 1))
             if self.args.dloss == 'DANN':
                 dloss = self.dceloss(dpreds, domains)
 
@@ -2293,26 +2955,32 @@ class TrainAE:
             else:
                 dloss = torch.Tensor([0]).to(self.args.device)[0]
 
-            lists[group]['domains'] += [np.array([self.unique_batches[np.argmax(d)] for d in domains.detach().cpu().numpy()])]
-            lists[group]['classes'] += [labels.detach().cpu().numpy()]
-            lists[group]['encoded_values'] += [enc.view(enc.shape[0], -1).detach().cpu().numpy()]
+            domain_np = _tensor_to_numpy(domains)
+            label_np = _tensor_to_numpy(labels)
+            dpreds_np = _tensor_to_numpy(dpreds)
+            enc_np = _tensor_to_numpy(enc.view(enc.shape[0], -1))
+
+            lists[group]['domains'] += [np.array([self.unique_batches[np.argmax(d)] for d in domain_np])]
+            lists[group]['classes'] += [label_np]
+            lists[group]['encoded_values'] += [enc_np]
 
             lists[group]['names'] += [names]
-            lists[group]['cats'] += [labels.detach().cpu().numpy()]
+            lists[group]['cats'] += [label_np]
             # lists[group]['inputs'] += [data.view(data.shape[0], -1).detach().cpu().numpy()]
             lists[group]['labels'] += [np.array(
-                [self.unique_labels[x] for x in labels.detach().cpu().numpy()])]
+                [self.unique_labels[x] for x in label_np])]
             lists[group]['old_labels'] += [np.array(old_labels)]
             traces[group]['acc'] += [np.mean([0 if pred != dom else 1 for pred, dom in
                                                 zip(preds,
-                                                    labels.detach().cpu().numpy())])]
+                                                    label_np)])]
             traces[group]['dom_acc'] += [np.mean([0 if pred != dom else 1 for pred, dom in
-                                                zip(dpreds.detach().cpu().numpy().argmax(1),
-                                                    domains.argmax(1).detach().cpu().numpy())])]
+                                                zip(dpreds_np.argmax(1),
+                                                    _tensor_to_numpy(domains.argmax(1)))])]
             traces[group]['closs'] += [0]
             traces[group]['dloss'] += [dloss.item()]
             lists[group]['preds'] += [proba]
             lists[group]['inputs'] += [data.detach().cpu()]
+        self._finish_batch_progress(total_batches)
 
         try:
             traces[group]['mcc'] += [np.round(
@@ -2604,11 +3272,128 @@ class TrainAE:
             means[label] = np.mean(encodings[inds], axis=0)
         self.means = means
 
+    def setup_training_objects(self, params):
+        # Assign hyperparameters
+        self.params = params
+        if 'dloss' in params:
+            self.args.dloss = params['dloss']
+        if 'classif_loss' in params:
+            self.args.classif_loss = params['classif_loss']
+        if 'prototypes_to_use' in params:
+            self.args.prototypes_to_use = params['prototypes_to_use']
+        if 'n_positives' in params:
+            self.args.n_positives = int(params['n_positives'])
+        if 'n_negatives' in params:
+            self.args.n_negatives = int(params['n_negatives'])
+        if 'fgsm' in params:
+            self.args.fgsm = int(params['fgsm'])
+        if 'normalize' in params:
+            self.args.normalize = params['normalize']
+        if 'dist_fct' in params:
+            self.args.dist_fct = params['dist_fct']
+        if 'distance_fct' in params:
+            self.args.distance_fct = params['distance_fct']
+            
+        if not self.args.fgsm:
+            params['epsilon'] = 0
+        if 'margin' not in params:
+            params['margin'] = 0
+        if 'dmargin' not in params:
+            params['dmargin'] = 0
+        if 'dist_fct' not in params:
+            params['dist_fct'] = 'none'
+        if 'gamma' not in params:
+            params['gamma'] = 0
+        if 'n_neighbors' not in params:
+            params['n_neighbors'] = 0
+        if 'is_transform' not in params:
+            params['is_transform'] = 1
+        if 'normalize' not in params:
+            params['normalize'] = 'no'
+        if 'dropout' not in params:
+            params['dropout'] = 0.0
+        if 'optimizer_type' not in params:
+            params['optimizer_type'] = 'adam'
+        if 'smoothing' not in params:
+            params['smoothing'] = 0.0
+        if 'lr' not in params:
+            params['lr'] = 0.001
+        if 'wd' not in params:
+            params['wd'] = 0.0
+            
+        dist_fct = get_distance_fct(params['dist_fct'])
+        self.make_triplet_loss(dist_fct, params)
+
+        if not hasattr(self, 'complete_log_path') or not self.complete_log_path:
+            self.foldername = str(uuid.uuid4())
+            self.complete_log_path = f'logs/{self.args.task}/{self.foldername}'
+            os.makedirs(self.complete_log_path, exist_ok=True)
+
+        data_getter = GetData(self.path, self.args.valid_dataset, self.args, manifest_dir=self.complete_log_path)
+        self.unique_labels = data_getter.unique_labels
+        self.unique_batches = data_getter.unique_batches
+        
+        proto_strategy = getattr(self.args, 'prototype_strategy', 'mean')
+        proto_components = getattr(self.args, 'prototype_components', 1)
+        self.prototypes = Prototypes(
+            self.unique_labels,
+            self.unique_batches,
+            strategy=proto_strategy,
+            components=proto_components,
+            random_state=getattr(self.args, 'seed', 1),
+        )
+        
+        self.data, self.unique_labels, self.unique_batches = data_getter.get_variables()
+        self.make_samples_weights()
+        self.set_arcloss()
+
+        # Initialize model
+        self.model = Net(self.args.device, self.n_cats, self.n_batches,
+                    model_name=self.args.model_name, is_stn=self.args.is_stn,
+                    n_subcenters=self.n_batches)
+        if self.run_explainability:
+            if self.args.classif_loss in ['ce', 'hinge']:
+                self.shap_model = Net_deep_shap(self.args.device, self.n_cats, self.n_batches,
+                                    model_name=self.args.model_name, is_stn=self.args.is_stn,
+                                    n_subcenters=self.n_batches, shape=(3, self.args.new_size, self.args.new_size))
+            else:
+                self.shap_model = Net_shap(self.args.device, self.n_cats, self.n_batches,
+                                    model_name=self.args.model_name, is_stn=self.args.is_stn,
+                                    n_subcenters=self.n_batches)
+        prototypes = {
+            'combined': self.combined_prototypes,
+            'class': self.class_prototypes,
+            'batch': self.batch_prototypes
+        }
+        loaders = get_images_loaders(data=self.data,
+                                        random_recs=self.args.random_recs,
+                                        weighted_sampler=self.args.weighted_sampler,
+                                        is_transform=params['is_transform'],
+                                        samples_weights=self.samples_weights,
+                                        epoch=0,
+                                        unique_labels=self.unique_labels,
+                                        triplet_dloss=self.args.dloss, bs=self.args.bs,
+                                        prototypes_to_use=self.args.prototypes_to_use,
+                                        prototypes=prototypes,
+                                        size=self.args.new_size,
+                                        normalize=self.args.normalize,
+                                        n_aug=params.get('n_aug', 1),
+                                        num_workers=getattr(self.args, 'num_workers', 0),
+                                        )
+
+        return data_getter, loaders
+
 
 def set_run(run, params):
-    for k in params.keys():
-        run[k] = params[k]
-    run['SHAP'] = 1
+    for k, v in params.items():
+        if hasattr(run, 'log_parameter'):
+            run.log_parameter(k, v)
+        else:
+            run[k] = v
+    if hasattr(run, 'log_parameter'):
+        run.log_parameter('SHAP', 1)
+    else:
+        run['SHAP'] = 1
     return run
 
 
@@ -2620,6 +3405,8 @@ if __name__ == "__main__":
     parser.add_argument('--early_stop', type=int, default=20)
     parser.add_argument('--n_epochs', type=int, default=100)
     parser.add_argument('--n_trials', type=int, default=10)
+    parser.add_argument('--optuna_pruner', type=str, default='median', choices=['median', 'none'],
+                        help='Optuna pruner strategy: median (default) or none (disable pruning)')
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--n_repeats', type=int, default=1)
     parser.add_argument('--seed', type=int, default=42)
@@ -2629,6 +3416,7 @@ if __name__ == "__main__":
     parser.add_argument('--path_original', type=str, default='./data/otite_ds_-1')
     parser.add_argument('--exp_id', type=str, default='otite')
     parser.add_argument('--bs', type=int, default=32, help='Batch size')
+    parser.add_argument('--num_workers', type=int, default=0, help='DataLoader workers (-1 uses all CPU cores)')
     parser.add_argument('--dloss', type=str, default=None, help='domain loss - if None, will optimize')
     parser.add_argument('--classif_loss', type=str, default=None, help='triplet or cosine - if None, will optimize')
     parser.add_argument('--task', type=str, default='notNormal', help='Binary classification?')
@@ -2641,22 +3429,41 @@ if __name__ == "__main__":
     parser.add_argument('--prototype_strategy', type=str, default='mean', choices=['mean', 'kmeans', 'gmm'], help='TRAINING: How to aggregate/learn prototypes during training (mean/kmeans/gmm). Determines shape of prototype set.')
     parser.add_argument('--prototype_components', type=int, default=1, help='Components/centroids per class for prototype aggregation (used with kmeans/gmm during training)')
     parser.add_argument('--prototype_kind', type=str, default='distance', choices=['distance', 'kde', 'distance_weighted'], help='VALIDATION: How to classify using learned prototypes at test time (distance/kde/distance_weighted)')
+    parser.add_argument('--siamese_inference', type=str, default='linearsvc', choices=['knn', 'mlp_head', 'linearsvc', 'logisticregression'], help='Siamese inference classifier over embeddings: knn, mlp_head, linearsvc, or logisticregression')
     parser.add_argument('--kde_kernel', type=str, default='gaussian', choices=['gaussian', 'exponential', 'linear', 'tophat'], help='KDE kernel type')
     parser.add_argument('--kde_bandwidth', type=str, default='scott', help='KDE bandwidth: scott, silverman, or float value')
     parser.add_argument('--n_positives', type=int, default=None, help='Number of positive samples per anchor - if None, will optimize (only for triplet-based losses)')
     parser.add_argument('--n_negatives', type=int, default=None, help='Number of negative samples per anchor - if None, will optimize (only for triplet-based losses)')
     parser.add_argument('--fgsm', type=int, default=None, help='Use Fast Gradient Sign Method - if None, will optimize')
+    parser.add_argument('--dist_fct', type=str, default='euclidean', choices=['euclidean', 'cosine'], help='Distance function for prototypes/triplets')
+    parser.add_argument('--margin', type=float, default=1.0, help='Margin for triplet loss')
+    parser.add_argument('--dmargin', type=float, default=1.0, help='Margin for domain triplet loss')
+    parser.add_argument('--gamma', type=float, default=1.0, help='Gamma weight for domain loss')
+    parser.add_argument('--epsilon', type=float, default=0.1, help='Epsilon for FGSM')
+    parser.add_argument('--n_neighbors', type=int, default=1, help='Number of neighbors for KNN evaluation')
     parser.add_argument('--valid_dataset', type=str, default='Banque_Viscaino_Chili_2020', help='Validation dataset')
+    parser.add_argument('--train_datasets', type=str, default='', help='Optional comma-separated training datasets. If empty, all datasets except valid/test are used.')
+    parser.add_argument('--test_dataset', type=str, default='', help='Optional dedicated test dataset. If omitted or unavailable, half of the validation set is used as test.')
     parser.add_argument('--new_size', type=int, default=64, help='New size for images')
     parser.add_argument('--normalize', type=str, default=None, help='Normalize images - if None, will optimize')
     parser.add_argument('--n_aug', type=int, default=1, help='Number of augmentations per image (1=original only)')
     parser.add_argument('--auto_select_k', type=int, default=1, help='Automatically select best k (1-10) each epoch based on validation MCC')
     parser.add_argument('--save_repro_artifacts', type=int, default=1, help='Save manifests + sanity samples for reproducibility')
     parser.add_argument('--run_tag', type=str, default='prod', help='Tag to identify run type in logs/MLOps (e.g., TEST_SMOKE)')
+    parser.add_argument('--trial_index', type=int, default=0, help='Current trial index when launched by an external scheduler')
+    parser.add_argument('--reset_opt_state', type=int, default=0, help='Reset Bayesian optimization state and start from scratch (0/1)')
     parser.add_argument('--log_tracking', type=int, default=0, help='Enable Tracking logging (0/1)')
     parser.add_argument('--log_comet', type=int, default=1, help='Enable Comet logging (0/1)')
     parser.add_argument('--log_mlflow', type=int, default=0, help='Enable MLflow logging (0/1)')
     parser.add_argument('--verbose', type=int, default=1, help='Verbosity level')
+    parser.add_argument('--epoch_progress', type=int, default=1, help='Show per-epoch batch progress bar (0/1)')
+    parser.add_argument('--test_pca_every', type=int, default=0, help='Generate test PCA plot every N epochs (0 disables)')
+    parser.add_argument('--save_debug_images', type=int, default=0, help='Save sample train/adv images per epoch (0/1)')
+    parser.add_argument('--epoch_media_every', type=int, default=0, help='Upload sample images to trackers every N epochs (0 disables)')
+    parser.add_argument('--heavy_best_analysis', type=int, default=0, help='Run expensive encoded-values clustering on each new best (0/1)')
+    parser.add_argument('--run_explainability', type=int, default=0, help='Run SHAP/Grad-CAM artifact generation (0/1). Default 0 keeps only optimization + eval outputs.')
+    parser.add_argument('--amp', type=int, default=1, help='Enable CUDA automatic mixed precision (0/1)')
+    parser.add_argument('--amp_dtype', type=str, default='bf16', choices=['bf16', 'fp16'], help='AMP dtype to use on CUDA')
 
     args = parser.parse_args()
     _set_global_seeds(getattr(args, 'seed', 1), deterministic=True)
@@ -2724,94 +3531,363 @@ if __name__ == "__main__":
                     groupkfold=args.groupkfold)
     train.verbose = int(getattr(args, 'verbose', 1))
 
-    def safe_eval(params):
+    trial_counter = {'counter': 0}
+    total_trials = int(getattr(args, 'n_trials', 0) or 0)
+
+    def _csv_escape(value):
+        s = "" if value is None else str(value)
+        return '"' + s.replace('"', '""') + '"'
+
+    def _append_trial_runtime_event(trial_idx, event, status, score=None, error_message=None):
+        progress_root = os.path.join('logs', 'progresses', str(getattr(args, 'task', 'unknown')))
+        csv_dir = os.path.join(progress_root, "csv")
+        os.makedirs(csv_dir, exist_ok=True)
+        trial_runtime_path = os.path.join(
+            csv_dir,
+            f"{getattr(args, 'run_tag', 'RUN')}_{getattr(args, 'task', 'unknown')}_trial_runtime.csv"
+        )
+        if not os.path.exists(trial_runtime_path):
+            with open(trial_runtime_path, 'w') as f:
+                f.write(
+                    'timestamp,exp_id,run_tag,task,trial_index,total_trials,event,status,score,error_message,run_dir\\n'
+                )
+
+        run_dir = getattr(train, 'complete_log_path', '')
+        ts = datetime.now().isoformat(timespec='seconds')
+        row = [
+            ts,
+            getattr(args, 'exp_id', ''),
+            getattr(args, 'run_tag', ''),
+            getattr(args, 'task', ''),
+            int(trial_idx),
+            int(total_trials),
+            event,
+            status,
+            '' if score is None else score,
+            '' if error_message in [None, ''] else error_message,
+            run_dir,
+        ]
+        with open(trial_runtime_path, 'a') as f:
+            f.write(','.join(_csv_escape(x) for x in row) + '\\n')
+
+    def _finalize_trial_metadata(train_obj, trial_idx, status, error_message=None):
+        """Force terminal metadata for each Ax trial, even if training flow exits unexpectedly."""
+        trial_dir = getattr(train_obj, 'complete_log_path', None)
+        if not trial_dir:
+            return
+        metadata_path = os.path.join(trial_dir, 'run_metadata.json')
+        payload = {}
         try:
-            return train.train(params)
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r') as f:
+                    payload = json.load(f)
+        except Exception:
+            payload = {}
+
+        payload['trial_index'] = int(trial_idx)
+        payload['run_status'] = str(status)
+        payload['finished'] = 1
+        payload['run_finished'] = 1
+        payload['finished_at'] = datetime.now().isoformat(timespec='seconds')
+        payload['error_message'] = str(error_message) if error_message not in [None, ''] else None
+
+        try:
+            with open(metadata_path, 'w') as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            print(f"Warning: could not finalize trial metadata for trial {trial_idx}: {e}")
+
+    def _params_cache_key(params):
+        normalized = {}
+        for k in sorted(params.keys()):
+            v = params[k]
+            if isinstance(v, float):
+                normalized[k] = f"{v:.12g}"
+            else:
+                normalized[k] = str(v)
+        return json.dumps(normalized, sort_keys=True)
+
+    trial_cache_by_key = {}
+    trial_cache_rows = []
+    
+    progress_root = os.path.join('logs', 'progresses', str(getattr(args, 'task', 'unknown')))
+    cache_dir = os.path.join(progress_root, "tmp", "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    trial_cache_path = os.path.join(
+        cache_dir,
+        f"{getattr(args, 'run_tag', 'RUN')}_{getattr(args, 'task', 'unknown')}_{getattr(args, 'exp_id', 'exp')}_optuna_trial_cache.json"
+    )
+
+    def _persist_trial_cache():
+        payload = {
+            "schema_version": 2,
+            "exp_id": getattr(args, 'exp_id', ''),
+            "run_tag": getattr(args, 'run_tag', ''),
+            "task": getattr(args, 'task', ''),
+            "seed": int(getattr(args, 'seed', 41)),
+            "trials": trial_cache_rows,
+            "updated_at": datetime.now().isoformat(timespec='seconds'),
+        }
+        with open(trial_cache_path, 'w') as f:
+            json.dump(payload, f, indent=2)
+
+    def safe_eval(trial):
+        trial_counter['counter'] += 1
+        trial_idx = trial_counter['counter']
+        start_time = datetime.now().isoformat(timespec='seconds')
+        print(f"[{start_time}] Optuna Trial {trial_idx}/{getattr(args, 'n_trials', 0)} | start")
+        _append_trial_runtime_event(trial_idx, event='started', status='running')
+        
+        # Build params dictionary using Optuna suggestions
+        params = {}
+        params['lr'] = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
+        params['wd'] = trial.suggest_float("wd", 1e-8, 1e-2, log=True)
+        params['smoothing'] = trial.suggest_float("smoothing", 0.0, 0.2)
+        
+        if optimize_params.get('dloss'):
+            params['dloss'] = trial.suggest_categorical("dloss", ['no', 'inverseTriplet'])
+        if optimize_params.get('classif_loss'):
+            params['classif_loss'] = trial.suggest_categorical("classif_loss", ['arcface', 'triplet', 'softmax_contrastive', 'ce', 'hinge'])
+        if optimize_params.get('prototypes_to_use'):
+            params['prototypes_to_use'] = trial.suggest_categorical("prototypes_to_use", ['batch', 'no', 'class'])
+            
+        triplet_losses = ['triplet', 'softmax_contrastive']
+        dloss_val = params.get('dloss', getattr(args, 'dloss', ''))
+        classif_loss_val = params.get('classif_loss', getattr(args, 'classif_loss', ''))
+        
+        if optimize_params.get('n_positives') and classif_loss_val in triplet_losses:
+            params['n_positives'] = trial.suggest_categorical("n_positives", [1])
+        if optimize_params.get('n_negatives') and classif_loss_val in triplet_losses:
+            params['n_negatives'] = trial.suggest_categorical("n_negatives", [1, 5])
+        if optimize_params.get('fgsm'):
+            params['fgsm'] = trial.suggest_categorical("fgsm", [0, 1])
+        if optimize_params.get('normalize'):
+            params['normalize'] = trial.suggest_categorical("normalize", ['yes', 'no'])
+            
+        proto_to_use = params.get('prototypes_to_use', getattr(args, 'prototypes_to_use', ''))
+        if proto_to_use != 'no':
+            params['prototype_strategy'] = trial.suggest_categorical("prototype_strategy", ['mean', 'kmeans'])
+            params['prototype_components'] = trial.suggest_int("prototype_components", 1, 5)
+            params['prototype_kind'] = trial.suggest_categorical("prototype_kind", ['distance', 'kde', 'distance_weighted'])
+            params['kde_kernel'] = trial.suggest_categorical("kde_kernel", ['gaussian', 'exponential'])
+            params['kde_bandwidth'] = trial.suggest_categorical("kde_bandwidth", ['scott', 'silverman'])
+            
+        if classif_loss_val in ['triplet', 'softmax_contrastive'] or dloss_val in ['revTriplet', 'inverseTriplet', 'normae', 'inverse_softmax_contrastive']:
+            params['dist_fct'] = trial.suggest_categorical("dist_fct", ['cosine', 'euclidean'])
+            params['dmargin'] = trial.suggest_float("dmargin", 0.0, 1.0)
+            
+        if dloss_val in ['revTriplet', 'revDANN', 'DANN', 'inverseTriplet', 'normae', 'inverse_softmax_contrastive']:
+            params['gamma'] = trial.suggest_float("gamma", 1e-2, 1e2, log=True)
+            
+        if classif_loss_val in ['triplet', 'softmax_contrastive']:
+            params['margin'] = trial.suggest_float("margin", 0.0, 10.0)
+            
+        fgsm_val = params.get('fgsm', getattr(args, 'fgsm', 0))
+        if fgsm_val:
+            params['epsilon'] = trial.suggest_float("epsilon", 1e-4, 5e-1, log=True)
+            
+        if not args.auto_select_k and (classif_loss_val not in ['ce', 'hinge'] or dloss_val in ['inverse_softmax_contrastive', 'inverseTriplet']):
+            params['n_neighbors'] = trial.suggest_int("n_neighbors", 1, 10, log=True)
+            
+        params['n_aug'] = trial.suggest_int("n_aug", 1, 5)
+        # Check if the param combination is in the cache first to skip retraining
+        cache_key = _params_cache_key(params)
+        if cache_key in trial_cache_by_key:
+            cached = trial_cache_by_key[cache_key]
+            if cached.get('status') == 'completed':
+                cached_score = float(cached.get('score', -1e9))
+                cached_acc = float(cached.get('acc', 0.0))
+                # Persist path to Optuna even if reused from cache
+                log_path = cached.get('complete_log_path') or f"logs/{getattr(args, 'task', 'notNormal')}/{cached.get('foldername', 'unknown')}"
+                trial.set_user_attr("complete_log_path", log_path)
+                print(f"[{start_time}] Optuna Trial {trial_idx}/{getattr(args, 'n_trials', 0)} | reused | mcc={cached_score} acc={cached_acc}")
+                _append_trial_runtime_event(trial_idx, event='reused', status='completed', score=cached_score)
+                return cached_score
+            elif cached.get('status') == 'failed':
+                print(f"[{start_time}] Optuna Trial {trial_idx}/{getattr(args, 'n_trials', 0)} | requeue | previous attempt failed")
+                _append_trial_runtime_event(trial_idx, event='requeue', status='running')
+        
+        try:
+            import traceback
+            train.args.trial_index = int(trial_idx)
+            train.trial = trial  # Pass trial to train so it can report intermediate values for pruning
+            score = train.train(params)
+            end_time = datetime.now().isoformat(timespec='seconds')
+            _finalize_trial_metadata(train, trial_idx, status='completed', error_message=None)
+            trial.set_user_attr("complete_log_path", train.complete_log_path)
+            _append_trial_runtime_event(trial_idx, event='completed', status='completed', score=score)
+            
+            row = {
+                'trial_index': int(trial_idx),
+                'status': 'completed',
+                'score': float(score),
+                'mcc': float(getattr(train, 'best_mcc', score)),
+                'acc': float(getattr(train, 'best_acc', 0.0)),
+            }
+            # Spread all batch metrics into the row for easy CSV/Optuna analysis
+            batch_metrics = getattr(train, 'batch_metrics', {})
+            if isinstance(batch_metrics, dict):
+                for k, v in batch_metrics.items():
+                    try:
+                        row[k] = float(v)
+                    except (ValueError, TypeError):
+                        row[k] = v
+            row.update({
+                'params': params,
+                'cache_key': _params_cache_key(params),
+                'complete_log_path': train.complete_log_path,
+                'foldername': train.foldername,
+                'start_time': start_time,
+                'end_time': end_time
+            })
+            trial_cache_by_key[row['cache_key']] = row
+            trial_cache_rows.append(row)
+            _persist_trial_cache()
+            
+            print(f"[{end_time}] Optuna Trial {trial_idx}/{getattr(args, 'n_trials', 0)} | done | mcc={score} acc={row['acc']}")
+            return score
+        except optuna.TrialPruned as pruned_exc:
+            # Trial was pruned due to low intermediate performance - this is expected and not a failure
+            end_time = datetime.now().isoformat(timespec='seconds')
+            _append_trial_runtime_event(trial_idx, event='pruned', status='pruned', score=-1.0)
+            print(f"[{end_time}] Optuna Trial {trial_idx}/{getattr(args, 'n_trials', 0)} | pruned: {pruned_exc}")
+            raise  # Re-raise so Optuna knows this was a pruned trial
         except Exception as exc:
-            # Keep Ax running even when a trial crashes so we always record a value.
-            print(f"Ax trial failed: {exc}")
+            end_time = datetime.now().isoformat(timespec='seconds')
+            _finalize_trial_metadata(train, trial_idx, status='failed', error_message=str(exc))
+            _append_trial_runtime_event(trial_idx, event='failed', status='failed', score=-1e9, error_message=str(exc))
+            
+            # Per user request: let's not keep failures in cache, they stay in error logs
+            print(f"[{end_time}] Optuna Trial {trial_idx}/{getattr(args, 'n_trials', 0)} | failed (not cached): {exc}")
             traceback.print_exc()
-            return float("-inf")
+            return -1e9
 
-    # train.train()
-    # List of hyperparameters getting optimized
-    parameters = [
-        {"name": "lr", "type": "range", "bounds": [1e-6, 1e-3], "log_scale": True},
-        {"name": "wd", "type": "range", "bounds": [1e-8, 1e-2], "log_scale": True},
-        {"name": "smoothing", "type": "range", "bounds": [0., 0.2]},
-        # {"name": "is_transform", "type": "choice", "values": [0, 1]},
-    ]
-    
-    # Add loop parameters to optimization if they were originally None
-    if optimize_params.get('dloss'):
-        parameters += [{"name": "dloss", "type": "choice", "values": ['no', 'inverseTriplet']}]
-    if optimize_params.get('classif_loss'):
-        parameters += [{"name": "classif_loss", "type": "choice", "values": ['arcface', 'triplet', 'softmax_contrastive', 'ce', 'hinge']}]
-    # NEVER optimize n_calibration - it's always 0
-    if optimize_params.get('prototypes_to_use'):
-        parameters += [{"name": "prototypes_to_use", "type": "choice", "values": ['batch', 'no', 'class']}]
-    
-    # Only optimize n_positives and n_negatives if classif_loss is triplet-based
-    # These are only relevant for triplet and softmax_contrastive losses
-    triplet_losses = ['triplet', 'softmax_contrastive']
-    if optimize_params.get('n_positives') and args.classif_loss in triplet_losses:
-        parameters += [{"name": "n_positives", "type": "choice", "values": [1]}]
-    if optimize_params.get('n_negatives') and args.classif_loss in triplet_losses:
-        parameters += [{"name": "n_negatives", "type": "choice", "values": [1, 5]}]
-    
-    if optimize_params.get('fgsm'):
-        parameters += [{"name": "fgsm", "type": "choice", "values": [0, 1]}]
-    if optimize_params.get('normalize'):
-        parameters += [{"name": "normalize", "type": "choice", "values": ['yes', 'no']}]
-    
-    # Add prototype parameters only if prototypes are being used
-    if args.prototypes_to_use != 'no':
-        # prototype_strategy: only relevant when using prototypes
-        parameters += [{"name": "prototype_strategy", "type": "choice", "values": ['mean', 'kmeans']}]
-        # prototype_components: only relevant when using kmeans or gmm
-        parameters += [{"name": "prototype_components", "type": "range", "bounds": [1, 5]}]
-        # prototype_kind: how to classify using prototypes
-        parameters += [{"name": "prototype_kind", "type": "choice", "values": ['distance', 'kde', 'distance_weighted']}]
-        # KDE-specific parameters: only if prototype_kind will be kde (or might be)
-        # Since we're optimizing prototype_kind, we include these to allow kde exploration
-        parameters += [{"name": "kde_kernel", "type": "choice", "values": ['gaussian', 'exponential']}]
-        parameters += [{"name": "kde_bandwidth", "type": "choice", "values": ['scott', 'silverman']}]
-    
-    # Distance metrics: only relevant for triplet-based and distance-based classification
-    if args.classif_loss in ['triplet', 'softmax_contrastive'] or args.dloss in ['revTriplet', 'inverseTriplet', 'normae', 'inverse_softmax_contrastive']:
-        parameters += [{"name": "dist_fct", "type": "choice", "values": ['cosine', 'euclidean']}]
-        parameters += [{"name": "dmargin", "type": "range", "bounds": [0., 1.]}]
-    
-    # Domain loss specific parameters
-    if args.dloss in ['revTriplet', 'revDANN', 'DANN', 'inverseTriplet', 'normae', 'inverse_softmax_contrastive']:
-        # gamma = 0 will ensure DANN is not learned
-        parameters += [{"name": "gamma", "type": "range", "bounds": [1e-2, 1e2], "log_scale": True}]
-    
-    # Margin: only relevant for triplet-based losses
-    if args.classif_loss in ['triplet', 'softmax_contrastive']:
-        parameters += [{"name": "margin", "type": "range", "bounds": [0., 10.]}]
-    
-    # Epsilon for FGSM: only if FGSM is enabled
-    if args.fgsm:
-        parameters += [{"name": "epsilon", "type": "range", "bounds": [1e-4, 5e-1], "log_scale": True}]
-    
-    # Only optimize n_neighbors if not using auto k selection
-    # Only relevant for non-linear classifiers (not 'ce' or 'hinge')
-    if not args.auto_select_k and (args.classif_loss not in ['ce', 'hinge'] or args.dloss in ['inverse_softmax_contrastive', 'inverseTriplet']):
-        parameters += [{"name": "n_neighbors", "type": "range", "bounds": [1, 10], "log_scale": True}]
-    
-    # Data augmentation: always useful
-    parameters += [{"name": "n_aug", "type": "range", "bounds": [1, 5]}]
-    
-    # Some hyperparameters are not always required. They are set to a default value in Train.train()
+    db_dir = os.path.join(progress_root, "tmp", "db")
+    os.makedirs(db_dir, exist_ok=True)
+    db_path = os.path.join(db_dir, f"{getattr(args, 'run_tag', 'RUN')}_{getattr(args, 'task', 'unknown')}_{getattr(args, 'exp_id', 'exp')}_optuna_{getattr(args, 'model_name', 'model')}.db")
+    storage_name = f"sqlite:///{db_path}"
 
-    best_parameters, values, experiment, model = optimize(
-        parameters=parameters,
-        evaluation_function=safe_eval,
-        objective_name='mcc',
-        minimize=False,
-        total_trials=args.n_trials,
-        random_seed=getattr(args, 'seed', 41))
+    if getattr(args, 'reset_opt_state', 0) and os.path.exists(db_path):
+        os.remove(db_path)
+        print(f"[Optuna Resume] reset_opt_state=1, removed {db_path}.")
+
+    study_name = f"otitenet_study_{getattr(args, 'model_name', 'model')}"
+    # TPESampler with warm_up_steps: explore more initially, then exploit
+    n_trials_target = max(1, getattr(args, 'n_trials', 1))
+    warmup_steps = max(3, n_trials_target // 4)  # 25% of trials for warmup exploration
+    sampler = TPESampler(n_startup_trials=warmup_steps, seed=int(getattr(args, 'seed', 42)))
+    # Optional Optuna pruner (default: MedianPruner, can be disabled with --optuna_pruner none)
+    pruner_name = str(getattr(args, 'optuna_pruner', 'median')).strip().lower()
+    if n_trials_target <= 10 or pruner_name == 'none':
+        pruner = None
+    else:
+        pruner = MedianPruner(
+            n_startup_trials=max(5, n_trials_target // 4),
+            n_warmup_steps=max(8, int(getattr(args, 'n_epochs', 80) * 0.15)),
+        )
+    
+    study = optuna.create_study(
+        study_name=study_name, 
+        storage=storage_name, 
+        load_if_exists=True, 
+        direction="maximize",
+        sampler=sampler,
+        pruner=pruner
+    )
+
+    # Reload existing JSON cache (including the old Ax cache)
+    ax_trial_cache_path = trial_cache_path.replace('_optuna_trial_cache.json', '_ax_trial_cache.json')
+    for p in [ax_trial_cache_path, trial_cache_path]:
+        if os.path.exists(p) and not getattr(args, 'reset_opt_state', 0):
+            try:
+                with open(p, 'r') as f:
+                    payload = json.load(f)
+                    for r in payload.get("trials", []):
+                        ckey = r.get("cache_key")
+                        if not ckey: continue
+                        existing = trial_cache_by_key.get(ckey)
+                        # Preference: completed > failed; otherwise latest wins.
+                        if not existing or (r.get("status") == "completed" and existing.get("status") != "completed") or (r.get("status") == existing.get("status")):
+                            trial_cache_by_key[ckey] = r
+            except Exception:
+                pass
+    
+    # Rebuild trial_cache_rows from the deduplicated map
+    trial_cache_rows = list(trial_cache_by_key.values())
+
+    # Figure out which cache params are NOT in Optuna yet
+    optuna_known_params = set()
+    already_evaluated = 0
+    failures_to_redo = []
+    
+    for t in study.trials:
+        if t.state not in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.FAIL, optuna.trial.TrialState.PRUNED):
+            continue
+        
+        ckey = _params_cache_key(t.params)
+        optuna_known_params.add(ckey)
+        
+        # Success if value is valid, or if pruned
+        if t.value is not None and t.value > -1e8:
+            already_evaluated += 1
+        elif t.state == optuna.trial.TrialState.PRUNED:
+            already_evaluated += 1
+        else:
+            # Failure in Optuna: mark for redo
+            failures_to_redo.append(t.params)
+
+    # Count successful/pruned ones in cache that might not be in Optuna yet
+    for r in trial_cache_rows:
+        ckey = r.get("cache_key")
+        if r.get("status") in ["completed", "pruned"] and ckey not in optuna_known_params:
+            already_evaluated += 1
+
+    trials_to_run = max(0, getattr(args, 'n_trials', 0) - already_evaluated)
+    trial_counter['counter'] = already_evaluated
+
+    print(f"[Optuna Resume] Scheduling {trials_to_run} additional trials (successful={already_evaluated}, target={getattr(args, 'n_trials', 0)}).")
+
+    # Enqueue trials from local cache to Optuna if missing
+    enqueued_count = 0
+    for r in trial_cache_rows:
+        ckey = r.get("cache_key")
+        if not ckey: continue
+        
+        if r.get("status") == "completed" and ckey not in optuna_known_params:
+            try:
+                study.enqueue_trial(r["params"])
+                optuna_known_params.add(ckey)
+                enqueued_count += 1
+            except Exception:
+                pass
+        elif r.get("status") == "failed":
+            # Old failures in cache: redo them
+            try:
+                study.enqueue_trial(r["params"])
+                enqueued_count += 1
+            except Exception:
+                pass
+                
+    # Also redo Optuna-only failures
+    for f_params in failures_to_redo:
+        try:
+            study.enqueue_trial(f_params)
+            enqueued_count += 1
+        except Exception:
+            pass
+
+    print(f"[Optuna Queue] Enqueued {enqueued_count} trials from local cache/failures to Optuna.")
+
+    if trials_to_run > 0:
+        optuna.logging.set_verbosity(optuna.logging.WARNING)  # Disable overly verbose output
+        study.optimize(safe_eval, n_trials=trials_to_run)
+        
+    try:
+        best_parameters = study.best_params
+        best_trial = study.best_trial
+    except ValueError:
+        best_parameters = {}
+        best_trial = None
 
     lists, traces = get_empty_traces()
     # values, _, _, _ = get_empty_dicts()  # Pas élégant
@@ -2821,13 +3897,20 @@ if __name__ == "__main__":
         ds_part = train.path.split("/")[-1]
     except Exception:
         ds_part = "otite_ds_64"
+    # Use best parameters if available to build the search path accurately
     best_dist = str(best_parameters.get("dist_fct", getattr(train.args, "dist_fct", "none"))) if isinstance(best_parameters, dict) else str(getattr(train.args, "dist_fct", "none"))
     best_knn = int(best_parameters.get("n_neighbors", getattr(train.args, "n_neighbors", 0))) if isinstance(best_parameters, dict) else int(getattr(train.args, "n_neighbors", 0))
+    best_classif = str(best_parameters.get("classif_loss", train.args.classif_loss))
+    best_dloss = str(best_parameters.get("dloss", train.args.dloss))
+    best_proto = str(best_parameters.get("prototypes_to_use", train.args.prototypes_to_use))
+    best_npos = int(best_parameters.get("n_positives", train.args.n_positives))
+    best_nneg = int(best_parameters.get("n_negatives", train.args.n_negatives))
+    
     base_dir = (
         f"logs/best_models/{train.args.task}/{train.args.model_name}/"
         f"{ds_part}/nsize{train.args.new_size}/fgsm{train.args.fgsm}/ncal{train.args.n_calibration}/"
-        f"{train.args.classif_loss}/{train.args.dloss}/prototypes_{train.args.prototypes_to_use}/"
-        f"npos{train.args.n_positives}/nneg{train.args.n_negatives}"
+        f"{best_classif}/{best_dloss}/prototypes_{best_proto}/"
+        f"npos{best_npos}/nneg{best_nneg}"
     )
 
     # Prefer fully specified path with norm/dist/knn; else find any model.pth under base_dir; else fallback to current run
@@ -2838,6 +3921,12 @@ if __name__ == "__main__":
         f"dist_{best_dist}",
         f"knn{best_knn}"
     )
+    # Prefer Optuna-recorded trial path if available
+    if best_trial:
+        best_log_path = best_trial.user_attrs.get("complete_log_path")
+        if best_log_path:
+            candidate_paths.append(os.path.join(best_log_path, "model.pth"))
+
     candidate_paths.append(os.path.join(full_dir, "model.pth"))
 
     found_model_path = None
@@ -2855,16 +3944,13 @@ if __name__ == "__main__":
         found_model_path = f"{train.complete_log_path}/model.pth"
 
     if found_model_path is None or not os.path.exists(found_model_path):
-        raise RuntimeError(
-            "No trained checkpoint found after optimization; all trials may have failed. "
-            f"Last checked path: {found_model_path}"
-        )
+        print(f"Warning: No trained checkpoint found at '{found_model_path}'.")
+        print("Optimization finished, but skipping final evaluation pass as the model weights are unavailable.")
+        sys.exit(0)
 
     if not hasattr(train, "model") or not hasattr(train, "shap_model"):
-        raise RuntimeError(
-            "Training object is missing model attributes after optimization; "
-            "a trial likely failed before model initialization."
-        )
+        print("[Optuna Resume] Model attributes missing (all trials reused). Initializing minimal state for final evaluation...")
+        data_getter, loaders = train.setup_training_objects(best_parameters)
 
     train.model.load_state_dict(
         torch.load(
@@ -2873,14 +3959,15 @@ if __name__ == "__main__":
         )
     )
     # Need another model because the other can't be used to get shap values
-    train.shap_model.load_state_dict(
-        torch.load(
-            found_model_path,
-            map_location=train.args.device
-        )
-    )
     train.model.eval()
-    train.shap_model.eval()
+    if train.run_explainability and train.shap_model is not None:
+        train.shap_model.load_state_dict(
+            torch.load(
+                found_model_path,
+                map_location=train.args.device
+            )
+        )
+        train.shap_model.eval()
     prototypes = {
         'combined': train.combined_prototypes,
         'class': train.class_prototypes,
@@ -2899,7 +3986,10 @@ if __name__ == "__main__":
                                     size=train.args.new_size,
                                     normalize=train.args.normalize,
                                     n_aug=getattr(train.args, 'n_aug', 1),
+                                    num_workers=getattr(train.args, 'num_workers', 0),
                                     )
+    print("\n========== POST-OPTIMIZATION FINAL EVALUATION ==========")
+    print("Evaluating best checkpoint with train loop snapshot + train/valid/test predictions...")
     with torch.no_grad():
         _, best_lists1, _ = train.loop('train', None, train.params['gamma'], loaders['train'], lists, traces)
         for group in ["train", "valid", "test"]:
@@ -2915,8 +4005,11 @@ if __name__ == "__main__":
         experiment = set_run(experiment, train.best_params)
         # Register all parameters (fixed and optimized) to Comet
         register_all_params_to_comet(experiment, train.args, train.best_params)
-        train.log_predictions(best_lists, experiment, 0)
-        train.save_wrong_classif_imgs(experiment, {'cnn': train.shap_model, 'knn': knn}, best_lists, best_lists['test']['preds'], 
-                                    best_lists['test']['names'], 'test')
+        train.log_predictions(best_lists, None, experiment, 0)
+        if train.run_explainability and train.shap_model is not None:
+            train.save_wrong_classif_imgs(experiment, {'cnn': train.shap_model, 'knn': knn}, best_lists, best_lists['test']['preds'], 
+                                        best_lists['test']['names'], 'test')
+        else:
+            print('[INFO] Explainability disabled (run_explainability=0): skipping SHAP/Grad-CAM artifact generation.')
         
         experiment.end()

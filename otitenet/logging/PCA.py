@@ -27,7 +27,6 @@ def main():
     # Specify the paths to the images
     # image_paths = os.listdir('data/otite_ds/')
 
-    # import csv file infos.csv
     df = pd.read_csv('data/otite_ds/infos.csv')
     names = df['name'].values
     labels = df['label'].values

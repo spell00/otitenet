@@ -168,3 +168,89 @@ def predict_with_kde(
     except Exception as e:
         print(f"Error in KDE prediction: {e}")
         return None, None
+
+
+def predict_with_baseline(
+    embedding_tensor: torch.Tensor,
+    classifier_obj,
+    unique_labels: np.ndarray,
+):
+    """Predict using a pre-fitted baseline classifier.
+    
+    Args:
+        embedding_tensor: Input embedding (torch tensor)
+        classifier_obj: Fitted sklearn-style classifier
+        unique_labels: Unique label values (ordered)
+        
+    Returns:
+        Predicted class label, or None on error
+    """
+    try:
+        emb_np = embedding_tensor.detach().cpu().numpy()
+        if emb_np.ndim == 1:
+            emb_np = emb_np.reshape(1, -1)
+            
+        preds = classifier_obj.predict(emb_np)
+        # If preds are integers, map to unique_labels
+        if isinstance(preds[0], (int, np.integer)):
+            return unique_labels[preds[0]]
+        return preds[0]
+    except Exception as e:
+        print(f"Error in baseline prediction: {e}")
+        return None
+
+
+def predict_label(
+    embedding_tensor: torch.Tensor,
+    _args,
+    unique_labels: np.ndarray,
+    train_embeddings: np.ndarray = None,
+    train_labels: np.ndarray = None,
+    class_prototypes: dict = None,
+    best_config: str = None,
+    classifier_obj = None
+):
+    """Unified prediction entry point.
+    
+    Args:
+        embedding_tensor: Input embedding (torch tensor)
+        _args: Model/inference arguments
+        unique_labels: Array of unique labels
+        train_embeddings: Optional training embeddings (for KNN/KDE)
+        train_labels: Optional training labels (for KNN/KDE)
+        class_prototypes: Optional prototypes (for Prototype methods)
+        best_config: Optional specific best configuration (e.g. 'baseline_xgboost')
+        classifier_obj: Optional pre-fitted classifier object
+        
+    Returns:
+        Predicted label
+    """
+    config = best_config if best_config else str(_args.n_neighbors)
+    
+    # 1. Prototype methods
+    if config.startswith('protot_'):
+        return predict_label_from_prototypes(
+            embedding_tensor, class_prototypes, 
+            getattr(_args, 'dist_fct', 'euclidean')
+        )
+        
+    # 2. KDE methods
+    if config.startswith('kde'):
+        label, _ = predict_with_kde(
+            embedding_tensor, train_embeddings, train_labels, unique_labels
+        )
+        return label
+        
+    # 3. Baseline methods
+    if config.startswith('baseline_') and classifier_obj is not None:
+        return predict_with_baseline(embedding_tensor, classifier_obj, unique_labels)
+        
+    # 4. Default: KNN
+    from otitenet.ml import fit_knn_classifier
+    try:
+        k_val = int(config)
+    except:
+        k_val = 5
+        
+    knn = fit_knn_classifier(train_embeddings, train_labels, n_neighbors=k_val)
+    return predict_with_baseline(embedding_tensor, knn, unique_labels)

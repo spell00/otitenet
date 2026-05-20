@@ -102,10 +102,10 @@ def get_batch_metrics(lists, n_neighbors=5, random_state=42):
     
     # Compute NMI, ARI, AMI, silhouette score and others
     
-    nmi = normalized_mutual_info_score(y_test, preds)
-    ari = adjusted_rand_score(y_test, preds)
-    ami = adjusted_mutual_info_score(y_test, preds)
-    silhouette = silhouette_score(x_test, preds) if len(np.unique(preds)) > 1 else np.nan
+    nmi = float(normalized_mutual_info_score(y_test, preds))
+    ari = float(adjusted_rand_score(y_test, preds))
+    ami = float(adjusted_mutual_info_score(y_test, preds))
+    silhouette = float(silhouette_score(x_test, preds)) if len(np.unique(preds)) > 1 else np.nan
     
     return {
         'batch_entropy': batch_entropy,

@@ -12,6 +12,8 @@ This module contains all non-deep-learning classification code including:
 
 from .classifiers import (
     fit_knn_classifier,
+    fit_linearsvc_classifier,
+    fit_logreg_classifier,
     fit_baseline_classifiers,
     fit_kde_classifier,
     predict_with_prototypes,
@@ -33,6 +35,8 @@ from .optimization import (
 __all__ = [
     # Classifier fitting
     'fit_knn_classifier',
+    'fit_linearsvc_classifier',
+    'fit_logreg_classifier',
     'fit_baseline_classifiers',
     'fit_kde_classifier',
     'predict_with_prototypes',
