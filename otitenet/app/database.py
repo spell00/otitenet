@@ -515,3 +515,47 @@ def set_production_model(cursor, conn, model_dict, set_by_email):
             pass
         return False
 
+def ensure_people_user_email(conn, cursor):
+    """Ensure people.user_email exists so people can be scoped per logged-in user."""
+    try:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'people'
+              AND COLUMN_NAME = 'user_email'
+            """
+        )
+        has_col = cursor.fetchone()[0] > 0
+
+        if not has_col:
+            cursor.execute(
+                """
+                ALTER TABLE people
+                ADD COLUMN user_email VARCHAR(255) NULL AFTER id
+                """
+            )
+            conn.commit()
+
+        try:
+            cursor.execute(
+                """
+                CREATE INDEX idx_people_user_email
+                ON people(user_email)
+                """
+            )
+            conn.commit()
+        except Exception:
+            # index probably already exists
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+    except Exception as e:
+        print(f"Could not ensure people.user_email column: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
