@@ -8,11 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     libxext6 \
     libxrender1 \
-    grep \
-    sed \
-    awk \
     curl \
-    git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -24,11 +20,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application
 COPY . .
 
-# Install the package in editable mode
-RUN pip install -e .
+# Install the package
+RUN pip install --no-cache-dir -e .
 
-# Set PYTHONPATH
+# Expose port for FastAPI
+EXPOSE 8000
+
+# Set environment variables
 ENV PYTHONPATH="/app"
+ENV PYTHONUNBUFFERED=1
 
-# Default command (can be overridden by smoke test)
-CMD ["bash", "launch.sh", "--test"]
+# Run the FastAPI server by default
+CMD ["uvicorn", "otitenet.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

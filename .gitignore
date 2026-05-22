@@ -1,22 +1,48 @@
-.neptune/
-.venv/
+
+# IDE / Local Settings
+.idea/
 .vscode/
-Norm_E1_2023-11-14T17-46-22.png
-README.md
-adv1.png
-app.py
+*.iml
+local.properties
+
+# Python Environment & Build
+.venv/
+__pycache__/
+*.pyc
 build/
+dist/
+otitenet.egg-info/
+.neptune/
+mlruns/
+
+# Android Specific
+.gradle/
+app/build/
+capture/
+*.apk
+*.aar
+
+# Generated Data & Databases
+*.db
+data/mobile_deployments/
+logs/
+
+# Test Images & Temp Files (from your list)
+*.png
+*.jpg
+*.jpeg
+*.hprof
+error_log.txt
+
+
+Norm_E1_2023-11-14T17-46-22.png
+adv1.png
 data/
 data1.png
-dist/
 e103.jpg
-error_log.txt
-init_db.py
-logs/
-mlruns/
-model.pth
+# init_db.py
+# model.pth
 nimage.png
-otitenet.egg-info/
 output_image.png
 pca.png
 pca_batches.png
@@ -35,7 +61,6 @@ test_adv.png
 testemb.png
 testemb1.png
 your_file.jpeg
-otitenet/train/old/
 *__pycache__/*
 */__pycache__/*
 __pycache__/*
@@ -44,5 +69,8 @@ otitenet/train/__pycache__/*
 otitenet/infer/__pycache__/*
 otitenet/logging/__pycache__/*
 otitenet/app/__pycache__/*
+otitenet/api/__pycache__/*
 otitenet/utils/__pycache__/*
 otitenet/__pycache__/*
+otitenet/train/old/*
+otitenet/models/*
