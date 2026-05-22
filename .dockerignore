@@ -1,0 +1,16 @@
+.git
+.github
+.cometml-runs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+logs/
+output/
+best_models_old/
+data/queries/
+data/datasets/

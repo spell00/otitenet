@@ -15,6 +15,12 @@ otitenet.egg-info/
 .neptune/
 mlruns/
 
+# Desktop / Tauri build outputs
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/binaries/
+desktop/src-tauri/target/
+
 # Android Specific
 .gradle/
 app/build/

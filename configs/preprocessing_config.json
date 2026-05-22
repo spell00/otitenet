@@ -1,0 +1,15 @@
+{
+  "source_root": "data/datasets",
+  "output_base": "data/otite_ds",
+  "image_size": 224,
+  "split_mode": "by_dataset",
+  "include_datasets": [
+    "Banque_Calaman_USA_2020_trie_CM",
+    "Banque_Viscaino_Chili_2020",
+    "Banque_Comert_Turquie_2020_jpg"
+  ],
+  "exclude_datasets": [
+    "Banque_Comert_Turquie_2020",
+    "GMFUNL_jan2023"
+  ]
+}

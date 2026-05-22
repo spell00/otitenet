@@ -1,0 +1,88 @@
+/* /home/simon/otitenet/styles.css */
+
+/* Simple Streamlit-native light/dark styling */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+:root {
+  --accent-color: #ff6f61;
+  --accent-hover: #ff8276;
+  --radius: 10px;
+}
+
+/* Let Streamlit theme control white/light and black/dark backgrounds */
+html,
+body,
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stSidebar"],
+[data-testid="stHeader"] {
+  background: inherit !important;
+  font-family: 'Inter', sans-serif !important;
+}
+
+/* Remove the old blue gradient */
+.stApp {
+  background: transparent !important;
+}
+
+/* Main content spacing */
+.main .block-container,
+[data-testid="stMainBlockContainer"] {
+  padding-top: 2rem !important;
+  padding-bottom: 3rem !important;
+  max-width: 1450px !important;
+}
+
+/* Buttons only: keep your coral accent */
+.stButton>button,
+button[kind="primary"],
+button[kind="secondary"] {
+  background: var(--accent-color) !important;
+  color: white !important;
+  border: 0 !important;
+  border-radius: var(--radius) !important;
+  font-weight: 600 !important;
+}
+
+.stButton>button:hover,
+button[kind="primary"]:hover,
+button[kind="secondary"]:hover {
+  background: var(--accent-hover) !important;
+  color: white !important;
+}
+
+/* Tabs: simple, readable */
+div[data-testid="stTabs"] button[role="tab"] {
+  border-radius: var(--radius) var(--radius) 0 0 !important;
+  font-weight: 600 !important;
+}
+
+div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+  color: var(--accent-color) !important;
+  border-bottom: 2px solid var(--accent-color) !important;
+}
+
+/* Inputs: keep default theme, only round corners */
+input,
+textarea,
+[data-baseweb="input"]>div,
+[data-baseweb="textarea"]>div,
+[data-baseweb="select"]>div,
+.stTextInput input,
+.stNumberInput input {
+  border-radius: var(--radius) !important;
+}
+
+/* Expanders/cards: keep default theme, only soften */
+[data-testid="stExpander"],
+div[data-testid="stForm"],
+[data-testid="stMetric"],
+[data-testid="stDataFrame"],
+[data-testid="stTable"] {
+  border-radius: var(--radius) !important;
+}
+
+/* Images */
+img {
+  border-radius: var(--radius);
+}

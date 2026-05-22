@@ -77,7 +77,7 @@ If you need an apples-to-apples check against the registry score, use the app ac
 Raw source datasets should be placed under:
 - `data/datasets/<dataset_name>/...`
 
-Preprocessing and dataset assembly are already implemented in `otitenet/data/make_dataset2.py` and now support a separate config file:
+Preprocessing and dataset assembly are implemented in `src/otitenet/data/make_dataset2.py` and support a separate config file:
 - `configs/preprocessing_config.json`
 
 This config controls:
@@ -133,9 +133,107 @@ python scripts/analysis/generate_paper_analysis.py
 ```
 
 ### 4. Running the Application
+Full admin/web app:
 ```bash
 streamlit run app.py --server.address 0.0.0.0 --server.port 8502
 ```
+
+### 4.1 Building the Offline Executable App on Ubuntu
+The offline desktop app is separate from the online Streamlit app.
+
+- Online app: `app.py`, with admin or client behavior depending on who logs in.
+- Offline app: `app_offline.py`, the minimal client-shaped app with only `New Analysis` and `Historics`.
+
+The offline app packages whatever is in:
+```text
+data/mobile_deployments/current/
+├── manifest.json
+└── model.onnx
+```
+
+Before building, select the production model in the online app, then refresh the deployment folder:
+```bash
+python scripts/create_mobile_deployment.py
+```
+
+Export that production deployment to quantized ONNX. This is the lightweight production format used by the offline app, so the desktop executable does not need to ship PyTorch:
+```bash
+python -m pip install -r requirements-export.txt
+python scripts/export_offline_onnx_model.py
+```
+
+By default this creates a dynamic UINT8 ONNX model. Use `--no-quantize` only if you need a full-precision ONNX file for comparison.
+
+Install the standalone desktop build dependencies:
+```bash
+python -m pip install -r requirements-desktop.txt
+```
+
+`requirements-desktop.txt` is intentionally separate from `requirements.txt`. It uses ONNX Runtime and avoids training, plotting, experiment tracking, tests, and PyTorch packages.
+
+Build the offline Streamlit sidecar executable:
+```bash
+python -m PyInstaller packaging/pyinstaller/otitenet_streamlit.spec --clean -y
+```
+
+The executable is created at:
+```bash
+dist/otitenet-streamlit/otitenet-streamlit
+```
+
+Smoke test it on a free port:
+
+```bash
+# Run the offline app (default entrypoint is app_offline.py):
+OTITENET_STREAMLIT_PORT=8502 ./dist/otitenet-streamlit/otitenet-streamlit
+# Or, explicitly specify the entrypoint (optional, for clarity):
+OTITENET_STREAMLIT_PORT=8502 OTITENET_STREAMLIT_APP=app_offline.py ./dist/otitenet-streamlit/otitenet-streamlit
+```
+
+If you see an error about `streamlit_app.py` not existing, make sure:
+- You are running the `otitenet-streamlit` binary, not `streamlit run ...`
+- The file `dist/otitenet-streamlit/_internal/app_offline.py/app_offline.py` exists
+- The environment variable `OTITENET_STREAMLIT_APP` is not set to `streamlit_app.py`
+- You are not passing extra arguments to the binary
+
+To guarantee a clean run, you can unset the variable first:
+```bash
+unset OTITENET_STREAMLIT_APP
+OTITENET_STREAMLIT_PORT=8502 ./dist/otitenet-streamlit/otitenet-streamlit
+```
+
+Then open:
+```text
+http://127.0.0.1:8502
+```
+
+To build the Ubuntu desktop window/installer with Tauri, install Rust first:
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+```
+
+Copy the PyInstaller sidecar into Tauri using your Rust host triplet:
+```bash
+HOST_TRIPLET="$(rustc -Vv | sed -n 's/^host: //p')"
+mkdir -p desktop/src-tauri/binaries
+cp dist/otitenet-streamlit/otitenet-streamlit "desktop/src-tauri/binaries/otitenet-streamlit-${HOST_TRIPLET}"
+chmod +x "desktop/src-tauri/binaries/otitenet-streamlit-${HOST_TRIPLET}"
+```
+
+Build the desktop app:
+```bash
+cd desktop
+npm install
+npm run tauri:build
+```
+
+The Ubuntu bundle is written under:
+```text
+desktop/src-tauri/target/release/bundle/
+```
+
+See `docs/OFFLINE_DESKTOP.md` for the detailed offline build notes.
 
 ## 📂 Project Structure
 
@@ -144,7 +242,7 @@ streamlit run app.py --server.address 0.0.0.0 --server.port 8502
   - `migrations/`: DB schema updates.
   - `utils/`: DB init, model recovery, and common helpers.
   - `debug/`: Tools for isolating Grad-CAM and heatmap issues.
-- **`otitenet/`**: Primary Python package containing training loops and model architectures.
+- **`src/otitenet/`**: Primary Python package containing training loops and model architectures.
 - **`docs/`**: Detailed documentation, implementation reports, and refactoring history.
 - **`output/`**: All generated artifacts.
   - `analysis/`: Final CSV/MD reports (`PAPER_ANALYSIS.md`).

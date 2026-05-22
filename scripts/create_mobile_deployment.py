@@ -1,17 +1,22 @@
 # /home/simon/otitenet/scripts/create_mobile_deployment.py
 
-from pathlib import Path
 import argparse
 import shutil
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+for path in (SRC, ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from otitenet.api.mobile_deployment import (
     CURRENT_DIR,
     create_simple_torch_classifier_manifest,
     create_knn_embedding_manifest,
 )
-from otitenet.app.database import create_db
-
-
 DEFAULT_LABELS = "normal,notNormal"
 
 
@@ -71,6 +76,8 @@ def get_current_production_model_from_db():
     This function tries the clean database helper first. If unavailable,
     it falls back to querying common production_model table shapes.
     """
+    from otitenet.app.database import create_db
+
     conn, cursor = create_db()
 
     # Preferred path if your database.py already has get_production_model()

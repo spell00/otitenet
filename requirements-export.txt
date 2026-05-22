@@ -1,0 +1,4 @@
+# Extra dependencies for exporting and checking production PyTorch deployments.
+# Install this in the development/online environment, not the offline desktop env.
+onnx>=1.15,<1.16
+onnxruntime>=1.18,<1.19

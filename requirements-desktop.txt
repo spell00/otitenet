@@ -1,0 +1,14 @@
+# Standalone dependencies for the offline desktop app only.
+# Do not include the full online/training requirements here.
+
+numpy>=1.26.4,<2.0
+Pillow>=10,<12
+streamlit>=1.43,<2
+
+# Runtime for exported offline production models.
+onnxruntime>=1.18,<1.19
+
+pyinstaller>=6.6,<7
+
+mysql-connector-python
+onnx
