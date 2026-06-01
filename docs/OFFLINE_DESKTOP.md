@@ -15,22 +15,24 @@ The intended workflow is:
 
 ## Deployment Payload
 
-The offline app reads:
+The offline app reads the deployment files referenced by:
 
 ```text
 data/mobile_deployments/current/
 ├── manifest.json
-└── model.onnx
+├── embedding_model.onnx
+└── prototypes.npz
 ```
 
-Production runtime:
+Compact production runtime:
 
-- `model_type: "onnx_classifier"`
+- `model_type: "onnx_embedding_prototype"`
 - `runtime: "onnxruntime"`
-- `quantization: "dynamic_uint8"`
-- `files.model: "model.onnx"`
+- `head_type: "prototype"`
+- `files.model: "embedding_model.onnx"`
+- `files.prototypes: "prototypes.npz"`
 
-The Python offline code still has a PyTorch fallback for development, but the desktop build is intended to package only ONNX Runtime. Do not build the production executable from a deployment manifest that still points to `model.pth`.
+The Python offline code still has a PyTorch fallback for exact/full builds, but the compact desktop build is intended to package only ONNX Runtime. Do not build the compact executable from a deployment manifest that still points to `model.pth`.
 
 Future `knn_embedding` payloads can be added under the same manifest contract by including the embedding model plus reference embeddings/labels.
 
@@ -53,11 +55,11 @@ You can also pass a model file explicitly:
   --model-name resnet18
 ```
 
-Then export the current production deployment to ONNX:
+For compact packaging, export the current production embedding model to ONNX while preserving the prototype head:
 
 ```bash
 /home/simon/otitenet/.conda/bin/python -m pip install -r requirements-export.txt
-/home/simon/otitenet/.conda/bin/python scripts/export_offline_onnx_model.py
+/home/simon/otitenet/.conda/bin/python scripts/export_offline_onnx_model.py --embedding-output --no-quantize --keep-pytorch
 ```
 
 The export script:
@@ -67,10 +69,10 @@ The export script:
 - dynamically quantizes the ONNX weights to UINT8 by default
 - runs a one-sample ONNX Runtime check against the PyTorch model
 - backs up the old manifest to `manifest.pytorch.json`
-- rewrites `manifest.json` to use `onnx_classifier`
+- rewrites `manifest.json` to use `onnx_embedding_prototype` when the production model uses a prototype head
 - removes the old PyTorch model unless `--keep-pytorch` is passed
 
-Use `--no-quantize` if you need a full-precision ONNX file for debugging. Use `--keep-float` if you want to keep the intermediate full-precision ONNX file next to the quantized production file.
+Use `--no-quantize` for the closest compact predictions. Dynamic quantization is smaller but may move scores more.
 
 Use `--skip-check` only when ONNX Runtime is not available in the export environment.
 
@@ -80,17 +82,60 @@ Install the standalone desktop dependencies:
 
 ```bash
 /home/simon/otitenet/.conda/bin/python -m pip install -r requirements-desktop.txt
+/home/simon/otitenet/.conda/bin/python -m pip install -r requirements-export.txt
 ```
 
-`requirements-desktop.txt` is intentionally not based on `requirements.txt`. It excludes training, analysis, test, experiment tracking, and plotting packages such as scikit-optimize, matplotlib, seaborn, tensorboard, comet-ml, pytest, and TensorFlow.
+`requirements-desktop.txt` is intentionally not based on `requirements.txt`. It excludes most training, analysis, test, experiment tracking, and plotting packages such as scikit-optimize, matplotlib, seaborn, tensorboard, comet-ml, pytest, and TensorFlow.
 
-It also excludes PyTorch and torchvision. The offline executable should use `onnxruntime` with `data/mobile_deployments/current/model.onnx`.
+The compact PyInstaller spec excludes PyTorch and torchvision from the packaged app. The exact build includes them and is much larger.
 
-Build:
+All desktop build scripts run `scripts/ensure_desktop_python.sh` before doing work. The required interpreter is:
+
+```text
+/home/simon/otitenet/.conda/bin/python
+```
+
+The scripts fail if `PYTHON` or plain `python` resolves to another environment, for example the base conda Python 3.12 or an old Python 3.10 environment. Verify the build interpreter before long runs:
 
 ```bash
-/home/simon/otitenet/.conda/bin/python -m PyInstaller packaging/pyinstaller/otitenet_streamlit.spec --clean -y
+/home/simon/otitenet/.conda/bin/python --version
+scripts/ensure_desktop_python.sh sidecar compact
 ```
+
+Build compact, recommended:
+
+```bash
+PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:prepare:compact
+PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:sidecar:compact
+```
+
+This preserves a compact sidecar at:
+
+```text
+dist/otitenet-streamlit-compact/
+```
+
+From `desktop/`, run the equivalent command:
+
+```bash
+PYTHON=/home/simon/otitenet/.conda/bin/python npm run prepare:compact
+PYTHON=/home/simon/otitenet/.conda/bin/python npm run sidecar:build:compact
+```
+
+Build exact/full:
+
+```bash
+PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:prepare:exact
+PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:sidecar:exact
+```
+
+This preserves an exact sidecar at:
+
+```text
+dist/otitenet-streamlit-exact/
+```
+
+Each sidecar build also updates the active Tauri sidecar under `desktop/src-tauri/binaries/`. The last sidecar variant you build is the variant that `npm run tauri:build` packages. The `dist/otitenet-streamlit-compact/` and `dist/otitenet-streamlit-exact/` folders remain available for direct side-by-side testing.
 
 Smoke test on a free port:
 
@@ -100,13 +145,17 @@ OTITENET_STREAMLIT_PORT=8502 ./dist/otitenet-streamlit/otitenet-streamlit
 
 Then open `http://127.0.0.1:8502`.
 
+Compare compact and exact at the same time:
+
+```bash
+OTITENET_STREAMLIT_PORT=8502 ./dist/otitenet-streamlit-compact/otitenet-streamlit
+OTITENET_STREAMLIT_PORT=8503 ./dist/otitenet-streamlit-exact/otitenet-streamlit
+```
+
 ## Copy the Sidecar into Tauri
 
 ```bash
-HOST_TRIPLET="$(rustc -Vv | sed -n 's/^host: //p')"
-mkdir -p desktop/src-tauri/binaries
-cp dist/otitenet-streamlit/otitenet-streamlit "desktop/src-tauri/binaries/otitenet-streamlit-${HOST_TRIPLET}"
-chmod +x "desktop/src-tauri/binaries/otitenet-streamlit-${HOST_TRIPLET}"
+npm run desktop:sidecar:compact
 ```
 
 On Windows, copy `dist/otitenet-streamlit/otitenet-streamlit.exe` to `desktop/src-tauri/binaries/otitenet-streamlit-x86_64-pc-windows-msvc.exe`.
@@ -118,5 +167,28 @@ cd desktop
 npm install
 npm run tauri:build
 ```
+
+To produce variant-suffixed `.deb` installers from the repository root:
+
+```bash
+npm run desktop:tauri:compact
+npm run desktop:tauri:exact
+```
+
+Those commands write:
+
+```text
+desktop/src-tauri/target/release/bundle/deb/Otitenet_0.3.0_amd64_compact.deb
+desktop/src-tauri/target/release/bundle/deb/Otitenet_0.3.0_amd64_exact.deb
+```
+
+From `desktop/`, the equivalent commands are:
+
+```bash
+npm run tauri:build:compact
+npm run tauri:build:exact
+```
+
+Each variant build also refreshes Tauri's normal `.deb` output, such as `Otitenet_0.3.0_amd64.deb`. The suffixed files are copied from that output and preserved so both installers can coexist.
 
 The platform installer/app bundle will be under `desktop/src-tauri/target/release/bundle/`.

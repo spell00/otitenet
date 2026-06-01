@@ -116,6 +116,21 @@ def _fetch_person_results(ctx, person_id: int, limit: int = 1000) -> pd.DataFram
     return df
 
 
+def _clear_person_results(ctx, person_id: int) -> int:
+    cursor = ctx.cursor
+    conn = ctx.conn
+    cursor.execute("DELETE FROM results WHERE person_id=%s", (int(person_id),))
+    deleted = cursor.rowcount if cursor.rowcount is not None else 0
+    conn.commit()
+    return deleted
+
+
+def _history_csv_bytes(df: pd.DataFrame) -> bytes:
+    if df is None or df.empty:
+        return b""
+    return df.to_csv(index=False).encode("utf-8")
+
+
 def _render_summary(df: pd.DataFrame) -> None:
     if df.empty:
         return
@@ -301,7 +316,7 @@ def render(ctx: Any) -> None:
 
     st.session_state["person_id"] = person_id
 
-    c1, c2 = st.columns([1, 1])
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
 
     with c1:
         limit = st.number_input(
@@ -316,6 +331,12 @@ def render(ctx: Any) -> None:
     with c2:
         reload_clicked = st.button("Reload past results", key="past_results_reload")
 
+    with c3:
+        download_placeholder = st.empty()
+
+    with c4:
+        clear_clicked = st.button("Clear history", key="past_results_clear")
+
     cache_key = f"past_results_person_{person_id}_limit_{int(limit)}"
     if reload_clicked:
         st.session_state.pop(cache_key, None)
@@ -326,9 +347,29 @@ def render(ctx: Any) -> None:
 
     df = st.session_state.get(cache_key, pd.DataFrame())
 
+    with download_placeholder:
+        st.download_button(
+            "Download history",
+            data=_history_csv_bytes(df),
+            file_name=f"otitenet_history_person_{person_id}.csv",
+            mime="text/csv",
+            disabled=df.empty,
+            key="past_results_download",
+        )
+
     if df.empty:
         st.info("No past results found for this person yet.")
         return
+
+    if clear_clicked:
+        try:
+            deleted = _clear_person_results(ctx, int(person_id))
+        except Exception as exc:
+            st.error(f"Could not clear history: {exc}")
+        else:
+            st.session_state.pop(cache_key, None)
+            st.success(f"Cleared {deleted} stored result{'s' if deleted != 1 else ''}.")
+            st.rerun()
 
     _render_summary(df)
 

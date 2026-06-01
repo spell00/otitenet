@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
+from sklearn.preprocessing import LabelEncoder
 
 import numpy as np
 import pandas as pd
@@ -64,6 +65,7 @@ def _csv_escape(value):
     text = "" if value in [None, ""] else str(value)
     text = text.replace('"', '""')
     return f'"{text}"'
+
 
 
 def _append_trial_runtime_event(args, trial_idx, total_trials, event, status, score=None, error_message=None, run_dir=None):
@@ -481,8 +483,10 @@ class CNNSupervisedCompare:
 
     def _make_loaders(self):
         prototypes = {"combined": {}, "class": {}, "batch": {}}
+        batch_encoder = LabelEncoder().fit(np.array(self.unique_batches))
         return get_images_loaders(
             data=self.data,
+            batch_encoder=batch_encoder,
             random_recs=self.args.random_recs,
             weighted_sampler=self.args.weighted_sampler,
             is_transform=1,

@@ -31,7 +31,17 @@ capture/
 # Generated Data & Databases
 *.db
 data/mobile_deployments/
-logs/
+logs/**
+
+# Allow DVC pointer files to be tracked while keeping bulk artifacts ignored
+!data/
+data/*
+!data/*.dvc
+!data/**/*.dvc
+!logs/
+logs/*
+!logs/*.dvc
+!logs/**/*.dvc
 
 # Test Images & Temp Files (from your list)
 *.png
@@ -43,7 +53,8 @@ error_log.txt
 
 Norm_E1_2023-11-14T17-46-22.png
 adv1.png
-data/
+!src/otitenet/data/
+!src/otitenet/data/*.py
 data1.png
 e103.jpg
 # init_db.py

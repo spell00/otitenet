@@ -16,6 +16,7 @@ from otitenet.app.analysis import run_analysis_on_file
 from otitenet.app.display_metrics import _arrow_safe_dataframe
 from otitenet.app.utils import (
     format_classifier_config,
+    parse_classifier_config,
     resolve_best_classifier_config,
     strip_extension,
 )
@@ -51,8 +52,9 @@ def _normalize_analysis_result(result):
     complete_log_path = result[2] if len(result) > 2 else None
     existing = result[3] if len(result) > 3 else None
     gradcam_path = result[4] if len(result) > 4 else None
+    class_scores = result[5] if len(result) > 5 and isinstance(result[5], dict) else {}
 
-    return pred_label, confidence, complete_log_path, existing, gradcam_path
+    return pred_label, confidence, complete_log_path, existing, gradcam_path, class_scores
 
 
 def _clone_args(args):
@@ -73,12 +75,25 @@ def _current_head_config(args):
     4. args.n_neighbors fallback
     """
     explicit = st.session_state.get("sidebar_classification_head_config")
-    if explicit is not None and str(explicit).strip() not in {"", "None", "nan"}:
+    explicit_model_key = st.session_state.get("sidebar_classification_head_model_key")
+    selected_model_key = st.session_state.get("selected_model_selection_key")
+    explicit_matches_model = (
+        explicit_model_key is not None
+        and selected_model_key is not None
+        and explicit_model_key == selected_model_key
+    )
+    if explicit_matches_model and explicit is not None and str(explicit).strip() not in {"", "None", "nan"}:
         return str(explicit)
 
     existing = getattr(args, "best_classifier_config", None)
     if existing is not None and str(existing).strip() not in {"", "None", "nan"}:
         return str(existing)
+
+    siamese_inference = str(getattr(args, "siamese_inference", "linearsvc")).strip().lower()
+    if siamese_inference == "linearsvc":
+        return "baseline_linear_svc"
+    if siamese_inference == "logisticregression":
+        return "baseline_logreg"
 
     try:
         return str(resolve_best_classifier_config(args, use_optimized=True))
@@ -92,12 +107,21 @@ def _set_head_on_args(args, head_config):
 
     args.best_classifier_config = str(head_config)
     args.learned_classifier_label = format_classifier_config(head_config)
+    head_meta = parse_classifier_config(head_config)
+    args.classification_head_family = head_meta.get("family")
 
-    try:
-        if str(head_config).isdigit():
-            args.n_neighbors = int(head_config)
-    except Exception:
-        pass
+    if head_meta.get("family") == "knn":
+        args.n_neighbors = int(head_meta["k"])
+    elif head_meta.get("family") == "prototype":
+        args.prototypes_to_use = "class"
+        args.prototype_strategy = str(head_meta.get("strategy", "mean"))
+        args.prototype_components = int(head_meta.get("components", 1))
+    elif head_meta.get("family") == "baseline":
+        baseline_name = str(head_meta.get("name", ""))
+        if baseline_name == "linear_svc":
+            args.siamese_inference = "linearsvc"
+        elif baseline_name in {"logreg", "logistic_regression"}:
+            args.siamese_inference = "logisticregression"
 
     return args
 
@@ -188,20 +212,159 @@ def _find_gradcam_images(log_path: str, filename: str, n_layers: int = 4) -> Lis
     return found[: int(n_layers)]
 
 
-def _render_uploaded_previews(uploaded_files) -> None:
+def _sync_uploaded_image_store(uploaded_files) -> List[Dict[str, Any]]:
+    """
+    Persist uploaded image bytes independently of task/model selection.
+
+    Streamlit widget values can be invalidated by reruns triggered from other
+    controls. Keeping a normalized byte store lets the same imported images be
+    analyzed against multiple tasks/models without another upload.
+    """
+    store_key = "new_analysis_imported_images"
+
     if not uploaded_files:
+        return list(st.session_state.get(store_key, []))
+
+    stored_by_name = {
+        str(item.get("Filename")): item
+        for item in st.session_state.get(store_key, [])
+        if isinstance(item, dict) and item.get("Filename")
+    }
+    for file_obj in uploaded_files:
+        try:
+            file_bytes = file_obj.getvalue()
+        except Exception:
+            pos = None
+            try:
+                pos = file_obj.tell()
+            except Exception:
+                pass
+            file_bytes = file_obj.read()
+            if pos is not None:
+                try:
+                    file_obj.seek(pos)
+                except Exception:
+                    pass
+
+        filename = os.path.basename(file_obj.name)
+        stored_by_name[filename] = {
+            "Filename": filename,
+            "Bytes": file_bytes,
+            "Size": len(file_bytes) if file_bytes is not None else 0,
+            "Type": getattr(file_obj, "type", None),
+        }
+
+    st.session_state[store_key] = list(stored_by_name.values())
+
+    return list(st.session_state.get(store_key, []))
+
+
+def _select_images_for_current_run(uploaded_images: List[Dict[str, Any]], is_admin: bool):
+    if not uploaded_images:
+        return [], {}
+
+    if not is_admin:
+        return uploaded_images, {
+            "mode": "all",
+            "start": 0,
+            "end": len(uploaded_images),
+            "total": len(uploaded_images),
+        }
+
+    st.subheader("Batch run")
+    mode = st.radio(
+        "Files to process",
+        options=["All uploaded files", "Next batch"],
+        horizontal=True,
+        key="new_analysis_batch_mode",
+    )
+
+    total = len(uploaded_images)
+    if mode == "All uploaded files":
+        st.caption(f"This run will process all {total} uploaded file(s).")
+        return uploaded_images, {
+            "mode": "all",
+            "start": 0,
+            "end": total,
+            "total": total,
+        }
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        batch_size = int(
+            st.number_input(
+                "Batch size",
+                min_value=1,
+                max_value=max(total, 1),
+                value=min(10, total),
+                step=1,
+                key="new_analysis_batch_size",
+            )
+        )
+
+    current_start = int(st.session_state.get("new_analysis_batch_start", 0))
+    current_start = min(max(current_start, 0), total)
+
+    if current_start >= total:
+        with c2:
+            st.caption("All uploaded files have been covered by next-batch runs.")
+        with c3:
+            if st.button("Reset batch position", key="new_analysis_reset_batch_position"):
+                st.session_state["new_analysis_batch_start"] = 0
+                st.rerun()
+        return [], {
+            "mode": "next",
+            "start": current_start,
+            "end": current_start,
+            "total": total,
+        }
+
+    with c2:
+        start_1_based = int(
+            st.number_input(
+                "Start at",
+                min_value=1,
+                max_value=max(total, 1),
+                value=current_start + 1,
+                step=1,
+                key=f"new_analysis_batch_start_input_{current_start}",
+            )
+        )
+
+    start = min(max(start_1_based - 1, 0), max(total - 1, 0))
+    end = min(start + batch_size, total)
+    st.session_state["new_analysis_batch_start"] = start
+
+    with c3:
+        st.caption(f"This run will process files {start + 1}-{end} of {total}.")
+        if st.button("Reset batch position", key="new_analysis_reset_batch_position"):
+            st.session_state["new_analysis_batch_start"] = 0
+            st.rerun()
+
+    return uploaded_images[start:end], {
+        "mode": "next",
+        "start": start,
+        "end": end,
+        "total": total,
+    }
+
+
+def _render_uploaded_previews(uploaded_images) -> None:
+    if not uploaded_images:
         return
 
-    with st.expander("Uploaded image preview", expanded=len(uploaded_files) <= 3):
+    with st.expander("Uploaded image preview", expanded=len(uploaded_images) <= 3):
         cols_per_row = 3
-        for start in range(0, len(uploaded_files), cols_per_row):
+        for start in range(0, len(uploaded_images), cols_per_row):
             cols = st.columns(cols_per_row)
-            for col, file_obj in zip(cols, uploaded_files[start : start + cols_per_row]):
+            for col, image_info in zip(cols, uploaded_images[start : start + cols_per_row]):
                 with col:
+                    filename = image_info.get("Filename") if isinstance(image_info, dict) else getattr(image_info, "name", "")
+                    image_data = image_info.get("Bytes") if isinstance(image_info, dict) else image_info
                     try:
-                        st.image(file_obj, caption=file_obj.name, use_container_width=True)
+                        st.image(image_data, caption=filename, use_container_width=True)
                     except Exception:
-                        st.caption(file_obj.name)
+                        st.caption(filename)
 
 
 def _render_results_table(results: List[Dict[str, Any]]) -> None:
@@ -210,10 +373,12 @@ def _render_results_table(results: List[Dict[str, Any]]) -> None:
 
     df = pd.DataFrame(results)
 
+    score_cols = sorted([c for c in df.columns if c.startswith("Score ")])
     display_cols = [
         "Filename",
         "Prediction",
         "Confidence",
+        *score_cols,
         "Existing",
         "Grad-CAM",
         "Log Path",
@@ -225,6 +390,11 @@ def _render_results_table(results: List[Dict[str, Any]]) -> None:
 
     if "Confidence" in table.columns:
         table["Confidence"] = table["Confidence"].apply(_fmt_confidence)
+    for col in score_cols:
+        if col in table.columns:
+            table[col] = table[col].apply(_fmt_confidence)
+    if "Existing" in table.columns:
+        table["Existing"] = table["Existing"].apply(bool)
 
     st.subheader("Analysis results")
     st.dataframe(_arrow_safe_dataframe(table.drop(columns=["Log Path"], errors="ignore")), use_container_width=True)
@@ -261,6 +431,16 @@ def _render_single_result_observer(results: List[Dict[str, Any]], n_layers: int 
     with c2:
         st.markdown(f"**Prediction:** {row.get('Prediction')}")
         st.markdown(f"**Confidence:** {_fmt_confidence(row.get('Confidence'))}")
+        score_items = [
+            (str(k[len("Score "):]), row.get(k))
+            for k in sorted(row.keys())
+            if str(k).startswith("Score ")
+        ]
+        if score_items:
+            scores_df = pd.DataFrame(
+                [{"Class": label, "Score": _fmt_confidence(score)} for label, score in score_items]
+            )
+            st.dataframe(scores_df, hide_index=True, use_container_width=True)
         st.markdown(f"**Existing cached result:** {row.get('Existing')}")
         if row.get("Log Path"):
             with st.expander("Log path"):
@@ -322,15 +502,25 @@ def render(ctx):
         st.warning("No production model is currently selected by the admin.")
         return
 
+    upload_key_version = int(st.session_state.get("new_analysis_upload_key_version", 0))
+    upload_key = f"new_analysis_uploaded_files_{upload_key_version}"
+
     uploaded_files = st.file_uploader(
         "Upload one or more otoscope images",
         type=IMAGE_TYPES,
         accept_multiple_files=True,
-        key="new_analysis_uploaded_files",
+        key=upload_key,
     )
+    uploaded_images = _sync_uploaded_image_store(uploaded_files)
 
-    if uploaded_files:
-        _render_uploaded_previews(uploaded_files)
+    if uploaded_images:
+        if st.button("Clear uploaded images", key="new_analysis_clear_uploads"):
+            st.session_state["new_analysis_imported_images"] = []
+            st.session_state["new_analysis_last_results"] = []
+            st.session_state["new_analysis_batch_start"] = 0
+            st.session_state["new_analysis_upload_key_version"] = upload_key_version + 1
+            st.rerun()
+        _render_uploaded_previews(uploaded_images)
 
     st.divider()
 
@@ -409,15 +599,20 @@ def render(ctx):
     analysis_args, head_config = _prepare_analysis_args(ctx, infer_method, dist_metric)
     _render_current_model_summary(analysis_args, head_config, is_admin=is_admin)
 
-    if uploaded_files and len(uploaded_files) > 1:
-        st.info(f"Batch mode: {len(uploaded_files)} files will be processed.")
+    images_for_run, run_batch = _select_images_for_current_run(uploaded_images, is_admin=is_admin)
+
+    if uploaded_images and len(uploaded_images) > 1:
+        st.info(
+            f"{len(uploaded_images)} uploaded file(s) are stored. "
+            f"{len(images_for_run)} file(s) are queued for the next run."
+        )
 
     st.divider()
 
     run_clicked = st.button(
         "▶️ Run Analysis",
         key="new_analysis_run",
-        disabled=not bool(uploaded_files),
+        disabled=not bool(images_for_run),
         type="primary",
     )
 
@@ -428,7 +623,7 @@ def render(ctx):
             _render_single_result_observer(previous_results, n_layers=int(n_gradcam_layers))
         return
 
-    filenames = [os.path.basename(f.name) for f in uploaded_files]
+    filenames = [os.path.basename(f["Filename"]) for f in images_for_run]
 
     if force_reanalyze:
         _delete_existing_results_for_files(ctx, filenames)
@@ -438,16 +633,21 @@ def render(ctx):
     results = []
     start_time = time.time()
 
-    for idx, file_obj in enumerate(uploaded_files):
-        file_start = time.time()
-        filename = os.path.basename(file_obj.name)
+    run_total = len(images_for_run)
 
-        status_text.write(f"Processing {idx + 1}/{len(uploaded_files)}: {filename}")
-        progress_bar.progress(idx / max(len(uploaded_files), 1))
+    for idx, image_info in enumerate(images_for_run):
+        file_start = time.time()
+        filename = os.path.basename(image_info["Filename"])
+        display_idx = int(run_batch.get("start", 0)) + idx + 1
+
+        status_text.write(
+            f"Processing run item {idx + 1}/{run_total} "
+            f"(uploaded file {display_idx}/{run_batch.get('total', run_total)}): {filename}"
+        )
+        progress_bar.progress(idx / max(run_total, 1))
 
         try:
-            file_bytes = file_obj.read()
-            file_obj.seek(0)
+            file_bytes = image_info["Bytes"]
 
             result = run_analysis_on_file(
                 filename,
@@ -458,9 +658,10 @@ def render(ctx):
                 force_reanalyze=force_reanalyze,
                 show_validation_metrics=not skip_validation,
                 fast_infer=fast_infer,
+                quiet=True,
             )
 
-            pred_label, confidence, complete_log_path, existing, gradcam_path = _normalize_analysis_result(result)
+            pred_label, confidence, complete_log_path, existing, gradcam_path, class_scores = _normalize_analysis_result(result)
 
             gradcam_images = _find_gradcam_images(
                 complete_log_path,
@@ -468,19 +669,20 @@ def render(ctx):
                 n_layers=int(n_gradcam_layers),
             )
 
-            results.append(
-                {
-                    "Filename": filename,
-                    "Prediction": pred_label,
-                    "Confidence": confidence,
-                    "Existing": existing,
-                    "Log Path": complete_log_path,
-                    "Grad-CAM Path": gradcam_path,
-                    "Grad-CAM": len(gradcam_images),
-                    "Elapsed (s)": round(time.time() - file_start, 2),
-                    "Bytes": file_bytes,
-                }
-            )
+            row = {
+                "Filename": filename,
+                "Prediction": pred_label,
+                "Confidence": confidence,
+                "Existing": bool(existing),
+                "Log Path": complete_log_path,
+                "Grad-CAM Path": gradcam_path,
+                "Grad-CAM": len(gradcam_images),
+                "Elapsed (s)": round(time.time() - file_start, 2),
+                "Bytes": file_bytes,
+            }
+            for label, score in (class_scores or {}).items():
+                row[f"Score {label}"] = score
+            results.append(row)
 
             st.session_state["last_uploaded_name"] = filename
             st.session_state["last_complete_log_path"] = complete_log_path
@@ -505,11 +707,17 @@ def render(ctx):
             with st.expander(f"Error details for {filename}"):
                 st.code(traceback.format_exc())
 
-        progress_bar.progress((idx + 1) / max(len(uploaded_files), 1))
+        progress_bar.progress((idx + 1) / max(run_total, 1))
 
-    status_text.success(f"Finished {len(uploaded_files)} file(s) in {time.time() - start_time:.1f}s.")
+    status_text.success(f"Finished {run_total} file(s) in {time.time() - start_time:.1f}s.")
 
     st.session_state["new_analysis_last_results"] = results
+
+    if run_batch.get("mode") == "next":
+        st.session_state["new_analysis_batch_start"] = min(
+            int(run_batch.get("end", 0)),
+            int(run_batch.get("total", 0)),
+        )
 
     _render_results_table(results)
 

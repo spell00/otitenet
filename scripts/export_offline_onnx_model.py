@@ -30,12 +30,33 @@ class LogitsOnlyWrapper(torch.nn.Module):
         return torch_logits_from_output(self.model(image), self.model)
 
 
+class EmbeddingOnlyWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        output = self.model(image)
+        if isinstance(output, tuple):
+            output = output[0]
+        if output.ndim > 2:
+            output = output.reshape(output.shape[0], -1)
+        return output
+
+
 def load_manifest(deployment_dir: Path) -> dict:
     manifest_path = deployment_dir / "manifest.json"
     if not manifest_path.exists():
         raise FileNotFoundError(f"Missing deployment manifest: {manifest_path}")
     with manifest_path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _manifest_uses_web_head(manifest: dict) -> bool:
+    params = manifest.get("production_params", {}) or {}
+    prototypes = str(params.get("prototypes_to_use") or params.get("prototypes") or "").lower()
+    head = str(params.get("head") or manifest.get("head") or manifest.get("head_type") or "").lower()
+    return prototypes not in {"", "none", "no", "nan"} or "prototype" in head or "knn" in head
 
 
 def _check_onnx_export(wrapper: torch.nn.Module, onnx_path: Path, dummy: torch.Tensor) -> float:
@@ -63,8 +84,18 @@ def export_onnx(
     check: bool,
     quantize: bool,
     keep_float: bool,
+    allow_head_mismatch: bool,
+    embedding_output: bool,
 ) -> tuple[Path, float | None, str]:
     manifest = load_manifest(deployment_dir)
+    uses_web_head = _manifest_uses_web_head(manifest)
+    if uses_web_head and not (allow_head_mismatch or embedding_output):
+        raise RuntimeError(
+            "The deployment manifest records a prototype/KNN-style production head, "
+            "but this exporter writes logits from the model's linear classifier. "
+            "That will not match localhost scores. Export a matching embedding/prototype "
+            "deployment, or pass --allow-head-mismatch only if different scoring is intentional."
+        )
     deployment = OfflineDeployment(root=deployment_dir, manifest=manifest)
 
     source_model = deployment.model_file
@@ -72,10 +103,11 @@ def export_onnx(
         return source_model, None, str(manifest.get("quantization", "none"))
 
     model = load_state_dict_model(source_model, deployment, device="cpu")
-    wrapper = LogitsOnlyWrapper(model).eval()
+    wrapper = EmbeddingOnlyWrapper(model).eval() if embedding_output else LogitsOnlyWrapper(model).eval()
 
     height, width = deployment.input_size
     dummy = torch.zeros(1, 3, height, width, dtype=torch.float32)
+    output_name_for_graph = "embedding" if embedding_output else "logits"
 
     output_path = deployment_dir / output_name
     float_path = output_path.with_name(f"{output_path.stem}.float{output_path.suffix}")
@@ -85,12 +117,13 @@ def export_onnx(
         dummy,
         str(export_path),
         input_names=["image"],
-        output_names=["logits"],
+        output_names=[output_name_for_graph],
         dynamic_axes={
             "image": {0: "batch"},
-            "logits": {0: "batch"},
+            output_name_for_graph: {0: "batch"},
         },
         opset_version=opset,
+        dynamo=False,
     )
 
     quantization = "none"
@@ -104,12 +137,24 @@ def export_onnx(
     return output_path, max_abs_diff, quantization
 
 
-def update_manifest(deployment_dir: Path, onnx_path: Path, keep_pytorch: bool, quantization: str) -> dict:
+def update_manifest(
+    deployment_dir: Path,
+    onnx_path: Path,
+    keep_pytorch: bool,
+    quantization: str,
+    embedding_output: bool,
+) -> dict:
     manifest = load_manifest(deployment_dir)
     updated = copy.deepcopy(manifest)
 
-    updated["model_type"] = "onnx_classifier"
-    updated["runtime"] = "onnxruntime"
+    if embedding_output and _manifest_uses_web_head(manifest):
+        updated["model_type"] = "onnx_embedding_prototype"
+        updated["runtime"] = "onnxruntime"
+        updated["head_type"] = "prototype"
+    else:
+        updated["model_type"] = "onnx_classifier"
+        updated["runtime"] = "onnxruntime"
+        updated["head_type"] = "linear_classifier"
     updated["quantization"] = quantization
     updated.setdefault("files", {})
     updated["files"]["model"] = onnx_path.name
@@ -170,7 +215,20 @@ def main() -> None:
         default=0.25,
         help="Maximum accepted absolute difference for the export check.",
     )
+    parser.add_argument(
+        "--allow-head-mismatch",
+        action="store_true",
+        help="Allow logits-only ONNX export even when the manifest records a prototype/KNN production head.",
+    )
+    parser.add_argument(
+        "--embedding-output",
+        action="store_true",
+        help="Export model embeddings instead of logits. Use this for prototype-head parity without bundling PyTorch.",
+    )
     args = parser.parse_args()
+
+    if args.embedding_output and args.output_name == "model.onnx":
+        args.output_name = "embedding_model.onnx"
 
     deployment_dir = Path(args.deployment_dir)
     onnx_path, max_abs_diff, quantization = export_onnx(
@@ -180,6 +238,8 @@ def main() -> None:
         check=not args.skip_check,
         quantize=not args.no_quantize,
         keep_float=args.keep_float,
+        allow_head_mismatch=args.allow_head_mismatch,
+        embedding_output=args.embedding_output,
     )
     if max_abs_diff is not None and max_abs_diff > args.check_tolerance:
         raise RuntimeError(
@@ -192,6 +252,7 @@ def main() -> None:
         onnx_path,
         keep_pytorch=args.keep_pytorch,
         quantization=quantization,
+        embedding_output=args.embedding_output,
     )
 
     print("Exported offline production model to ONNX:")

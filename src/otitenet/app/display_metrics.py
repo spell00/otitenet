@@ -8,6 +8,7 @@ Each function returns placeholder data or a simple Streamlit output.
 
 import streamlit as st
 from typing import Any, Dict, List
+import pandas as pd
 
 
 def compute_classification_metrics(args, predictions):
@@ -55,11 +56,34 @@ def display_all_metrics(args, predictions):
 # --- Additional stubs for expected symbols ---
 
 def _arrow_safe_dataframe(df):
-    """Return a DataFrame compatible with Streamlit's Arrow safe display.
-    The real implementation would convert to Arrow table; for now we just
-    return the original pandas DataFrame unchanged.
-    """
-    return df
+    """Return a DataFrame compatible with Streamlit's Arrow display."""
+    if df is None:
+        return df
+
+    def _safe_display_value(value):
+        if value is None:
+            return ""
+        if isinstance(value, (bytes, bytearray)):
+            return f"<bytes {len(value)}>"
+        if isinstance(value, (tuple, list, dict, set)):
+            return str(value)
+        try:
+            if pd.isna(value):
+                return ""
+        except Exception:
+            pass
+        return str(value)
+
+    out = df.copy()
+    for col in out.columns:
+        series = out[col]
+
+        if series.dtype != "object":
+            continue
+
+        out[col] = series.map(_safe_display_value).astype("string")
+
+    return out
 
 def _best_head_config_for_args_global(args):
     """Return the best classification head config for given args.

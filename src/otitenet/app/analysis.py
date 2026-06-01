@@ -24,19 +24,110 @@ from otitenet.app.database import check_ds_exists, insert_score
 from otitenet.app.image_processing import get_image, preprocess_image
 from otitenet.app.utils import (
     get_model_params_path,
+    dataset_path_segment,
     _make_model_selection_key,
     _ensure_model_number_map,
 )
 from otitenet.app.inference import (
     predict_label_from_prototypes as _predict_label_from_prototypes,
     predict_with_prototype_distance_ratio as _predict_with_prototype_distance_ratio,
+    predict_with_prototype_distance_ratio_proba as _predict_with_prototype_distance_ratio_proba,
     predict_with_kde as _predict_with_kde,
 )
-from otitenet.ml import fit_knn_classifier
+from otitenet.ml import fit_knn_classifier, fit_linearsvc_classifier, fit_logreg_classifier
 from otitenet.app.utils import get_model_cache_key
 
 
 from contextlib import contextmanager, nullcontext
+
+
+def _normalize_probability_map(probas, labels):
+    """Convert model probabilities to a {class_label: probability} mapping."""
+    if probas is None:
+        return {}
+
+    if isinstance(probas, dict):
+        out = {}
+        for key, value in probas.items():
+            try:
+                out[str(key)] = float(value)
+            except Exception:
+                continue
+        return out
+
+    try:
+        arr = np.asarray(probas, dtype=float)
+        if arr.ndim == 2:
+            arr = arr[0]
+        arr = arr.reshape(-1)
+    except Exception:
+        return {}
+
+    out = {}
+    for idx, value in enumerate(arr):
+        if idx >= len(labels):
+            break
+        try:
+            out[str(labels[idx])] = float(value)
+        except Exception:
+            continue
+    return out
+
+
+def _classifier_classes_to_labels(classes, unique_labels):
+    labels = []
+    for raw_label in classes:
+        try:
+            raw_idx = int(raw_label)
+            if 0 <= raw_idx < len(unique_labels):
+                labels.append(unique_labels[raw_idx])
+                continue
+        except Exception:
+            pass
+        labels.append(raw_label)
+    return labels
+
+
+def _decision_scores_to_proba(scores):
+    arr = np.asarray(scores, dtype=float)
+    if arr.ndim == 1:
+        probs_pos = 1.0 / (1.0 + np.exp(-arr))
+        return np.vstack([1.0 - probs_pos, probs_pos]).T
+    arr = arr - np.max(arr, axis=1, keepdims=True)
+    exp = np.exp(arr)
+    denom = np.sum(exp, axis=1, keepdims=True)
+    return exp / np.maximum(denom, 1e-12)
+
+
+def _head_config_from_args(_args):
+    config = (
+        getattr(_args, "best_classifier_config", None)
+        or getattr(_args, "classification_head_config", None)
+        or getattr(_args, "head_config", None)
+    )
+    if config is not None and str(config).strip() not in {"", "None", "nan", "—"}:
+        return str(config).strip()
+
+    mode = str(getattr(_args, "siamese_inference", "linearsvc")).strip().lower()
+    if mode == "linearsvc":
+        return "baseline_linear_svc"
+    if mode == "logisticregression":
+        return "baseline_logreg"
+    return str(getattr(_args, "n_neighbors", 1))
+
+
+def _classifier_kind_from_config(config):
+    config = str(config or "").strip().lower()
+    if config in {"linearsvc", "linear_svc", "baseline_linearsvc", "baseline_linear_svc"}:
+        return "linearsvc"
+    if config in {"logisticregression", "logistic_regression", "logreg", "baseline_logreg", "baseline_logistic_regression"}:
+        return "logisticregression"
+    if config.startswith("baseline_linear_svc"):
+        return "linearsvc"
+    if config.startswith("baseline_logreg") or config.startswith("baseline_logistic_regression"):
+        return "logisticregression"
+    return "knn"
+
 
 @contextmanager
 def _quiet_streamlit_messages(enabled: bool = False):
@@ -70,36 +161,21 @@ def _quiet_streamlit_messages(enabled: bool = False):
             setattr(st, "spinner", original_spinner)
 
 
-def get_or_build_knn(_args, data, unique_labels, unique_batches, prototypes):
-    """Return a cached KNN for the selected model; build once if missing.
-
-    This avoids re-running predict loops for 'valid'/'test' during inference.
-    Encodes training data with model and fits KNN on encoded embeddings.
-    
-    NOTE: If prototypes are enabled, returns None since classification uses prototypes/KDE instead.
-    
-    Args:
-        _args: Model/inference arguments
-        data: Dataset object
-        unique_labels: Array of unique labels
-        unique_batches: Array of unique batch identifiers
-        prototypes: Prototype configuration dict
-        
-    Returns:
-        Tuple of (fitted_knn, unique_labels)
-    """
-    # Skip KNN if prototypes are enabled
+def get_or_build_embedding_classifier(_args, data, unique_labels, unique_batches, prototypes):
+    """Return a cached embedding classifier for the selected model/head."""
     use_prototypes = (_args.prototypes_to_use in ['combined', 'class'])
     if use_prototypes:
-        print("⏭️  Skipping KNN: using prototype-based classification instead")
+        print("⏭️  Skipping embedding classifier: using prototype-based classification instead")
         return None, unique_labels
-    
-    # Check cache
-    cache = st.session_state.setdefault('knn_cache', {})
-    key = get_model_cache_key(_args)
+
+    head_config = _head_config_from_args(_args)
+    classifier_kind = _classifier_kind_from_config(head_config)
+
+    cache = st.session_state.setdefault('embedding_classifier_cache', {})
+    key = f"{get_model_cache_key(_args)}|head={head_config}"
     if key in cache:
-        print("♻️  Using cached KNN")
-        return cache[key]['knn'], cache[key]['unique_labels']
+        print(f"♻️  Using cached {cache[key].get('classifier_kind', 'embedding')} classifier")
+        return cache[key]['classifier'], cache[key]['unique_labels']
 
     # ---- Fast path: load saved train_encodings.npz if available ----
     train_encs = None
@@ -176,6 +252,7 @@ def get_or_build_knn(_args, data, unique_labels, unique_batches, prototypes):
             prototypes=prototypes,
             size=_args.new_size,
             normalize=_args.normalize,
+            batch_encoder=getattr(train, '_batch_encoder', None)
         )
 
         # Encode training data with model
@@ -191,20 +268,30 @@ def get_or_build_knn(_args, data, unique_labels, unique_batches, prototypes):
         train_encs = np.concatenate(lists['train']['encoded_values'])
         train_cats = np.concatenate(lists['train']['cats'])
     
-    # Fit KNN (n_neighbors is adjusted by classif_loss strategy)
-    if _args.classif_loss not in ['ce', 'hinge']:
+    if classifier_kind == "linearsvc":
+        classifier = fit_linearsvc_classifier(train_encs, train_cats)
+        print(f"Using LinearSVC classifier on embeddings (train_n={train_encs.shape[0]})")
+    elif classifier_kind == "logisticregression":
+        classifier = fit_logreg_classifier(train_encs, train_cats)
+        print(f"Using LogisticRegression classifier on embeddings (train_n={train_encs.shape[0]})")
+    elif _args.classif_loss not in ['ce', 'hinge']:
         nn_count = int(_args.n_neighbors)
-        knn = fit_knn_classifier(train_encs, train_cats, n_neighbors=nn_count, metric='minkowski')
+        classifier = fit_knn_classifier(train_encs, train_cats, n_neighbors=nn_count, metric='minkowski')
+        print(f"Using KNN classifier on embeddings (k={nn_count}, train_n={train_encs.shape[0]})")
     else:
-        # If classification is CE/hinge, fallback to 1-NN
-        knn = fit_knn_classifier(train_encs, train_cats, n_neighbors=1, metric='minkowski')
+        classifier = fit_knn_classifier(train_encs, train_cats, n_neighbors=1, metric='minkowski')
+        print(f"Using KNN classifier on embeddings (k=1, train_n={train_encs.shape[0]})")
 
-    # Cache result and training data for KDE if needed
-    cache[key] = {'knn': knn, 'unique_labels': unique_labels}
+    cache[key] = {'classifier': classifier, 'unique_labels': unique_labels, 'classifier_kind': classifier_kind}
     st.session_state['train_embeddings'] = train_encs
     st.session_state['train_labels'] = train_cats
-    
-    return knn, unique_labels
+
+    return classifier, unique_labels
+
+
+def get_or_build_knn(_args, data, unique_labels, unique_batches, prototypes):
+    """Backward-compatible wrapper for older callers."""
+    return get_or_build_embedding_classifier(_args, data, unique_labels, unique_batches, prototypes)
 
 
 def _safe_generate_gradcam_for_prediction(filename, _args, model, image, prototypes, device_str, complete_log_path):
@@ -306,8 +393,16 @@ def _run_analysis_on_file_impl(filename, file_bytes, _args, cursor, conn, force_
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(1)
         
-        model, shap_model, prototypes, image_size, device_str, data, unique_labels, unique_batches, data_getter = \
-            load_model_and_prototypes(_args)
+        try:
+            model, shap_model, prototypes, image_size, device_str, data, unique_labels, unique_batches, data_getter = \
+                load_model_and_prototypes(_args)
+        except FileNotFoundError as exc:
+            selected_log_path = getattr(_args, "log_path", None)
+            st.error(
+                "Selected model artifacts are missing. Choose another model or rerun training for this row. "
+                f"Log Path: {selected_log_path or 'not set'}"
+            )
+            raise exc
         
         save_path = os.path.join('data/queries', filename)
         with open(save_path, 'wb') as f:
@@ -315,7 +410,7 @@ def _run_analysis_on_file_impl(filename, file_bytes, _args, cursor, conn, force_
         
         # Load saved hyperparameters
         params_path = os.path.join(f'logs/best_models/{_args.task}/{_args.model_name}',
-                                   f'{_args.path.split("/")[-1]}/nsize{_args.new_size}/{_args.fgsm}/{_args.n_calibration}/'
+                                   f'{dataset_path_segment(_args.path)}/nsize{_args.new_size}/{_args.fgsm}/{_args.n_calibration}/'
                                    f'{_args.classif_loss}/{_args.dloss}/{_args.prototypes_to_use}/'
                                    f'{_args.n_positives}/{_args.n_negatives}',
                                    'params.json')
@@ -351,14 +446,15 @@ def _run_analysis_on_file_impl(filename, file_bytes, _args, cursor, conn, force_
                                          prototypes_to_use=_args.prototypes_to_use,
                                          prototypes=prototypes,
                                          size=_args.new_size,
-                                         normalize=_args.normalize)
-            # Build or reuse cached KNN once per model selection
-            knn, unique_labels_knn = get_or_build_knn(_args, data, unique_labels, unique_batches, prototypes)
-            nets = {'cnn': shap_model, 'knn': knn}
+                                         normalize=_args.normalize,
+                                         batch_encoder=getattr(shap_model, '_batch_encoder', None) if 'shap_model' in locals() else None)
+            # Build or reuse cached embedding classifier once per model selection.
+            embedding_classifier, unique_labels_knn = get_or_build_embedding_classifier(_args, data, unique_labels, unique_batches, prototypes)
+            nets = {'cnn': shap_model, 'embedding_classifier': embedding_classifier}
         else:
             loaders = None
             unique_labels_knn = unique_labels
-            nets = {'cnn': shap_model, 'knn': None}
+            nets = {'cnn': shap_model, 'embedding_classifier': None}
         
         original, image = get_image(f'data/queries/{filename}', size=image_size, normalize=_args.normalize)
         
@@ -413,24 +509,28 @@ def _run_analysis_on_file_impl(filename, file_bytes, _args, cursor, conn, force_
                 valid_metrics_source = None
         
         # Get prediction (fast prototype-based, KDE, or KNN)
+        pred_probas = {}
         with torch.no_grad():
             emb_tensor = nets['cnn'](image.to(device_str))
             if fast_infer:
                 class_protos = prototypes.get('class', {}).get('train', {}) if isinstance(prototypes, dict) else {}
-                pred_lbl_fast = _predict_with_prototype_distance_ratio(emb_tensor, class_protos, dist_fct_name=str(_args.dist_fct).lower())
+                pred_lbl_fast, pred_probas_fast = _predict_with_prototype_distance_ratio_proba(
+                    emb_tensor, class_protos, dist_fct_name=str(_args.dist_fct).lower()
+                )
                 if pred_lbl_fast is None:
                     pred_label = unique_labels[0]
                     pred_confidence = 0.0
                 else:
                     pred_label = pred_lbl_fast
-                    pred_confidence = 1.0
+                    pred_confidence = float(pred_probas_fast.get(pred_label, 0.0))
+                pred_probas = _normalize_probability_map(pred_probas_fast, unique_labels)
             else:
                 # Check which classification method to use
                 use_prototypes = (_args.prototypes_to_use in ['combined', 'class'] and 
                                 prototypes.get('class', {}).get('train'))
                 use_kde = (use_prototypes and 
                           getattr(_args, 'prototype_kind', 'distance').lower() == 'kde')
-                use_knn = not use_prototypes and not use_kde
+                classifier_kind = _classifier_kind_from_config(_head_config_from_args(_args))
                 
                 embedding = emb_tensor.detach().cpu().numpy()
                 
@@ -439,10 +539,14 @@ def _run_analysis_on_file_impl(filename, file_bytes, _args, cursor, conn, force_
                     if 'train_embeddings' not in st.session_state or 'train_labels' not in st.session_state:
                         # Fallback to prototype distance if KDE data not available
                         class_protos = prototypes.get('class', {}).get('train', {})
-                        pred_lbl = _predict_with_prototype_distance_ratio(emb_tensor, class_protos, 
-                                                                         dist_fct_name=str(_args.dist_fct).lower())
+                        pred_lbl, pred_probas = _predict_with_prototype_distance_ratio_proba(
+                            emb_tensor,
+                            class_protos,
+                            dist_fct_name=str(_args.dist_fct).lower(),
+                        )
                         pred_label = pred_lbl if pred_lbl is not None else unique_labels[0]
-                        pred_confidence = 1.0
+                        pred_confidence = float(pred_probas.get(pred_label, 0.0)) if pred_lbl is not None else 0.0
+                        pred_probas = _normalize_probability_map(pred_probas, unique_labels)
                     else:
                         pred_label, pred_confidence = _predict_with_kde(
                             emb_tensor, 
@@ -455,25 +559,45 @@ def _run_analysis_on_file_impl(filename, file_bytes, _args, cursor, conn, force_
                         if pred_label is None:
                             pred_label = unique_labels[0]
                             pred_confidence = 0.0
+                        pred_probas = {str(pred_label): float(pred_confidence)}
                 
                 elif use_prototypes:
                     # Use prototype distance classification
                     class_protos = prototypes.get('class', {}).get('train', {})
-                    pred_lbl = _predict_with_prototype_distance_ratio(emb_tensor, class_protos, 
-                                                                     dist_fct_name=str(_args.dist_fct).lower())
+                    pred_lbl, pred_probas = _predict_with_prototype_distance_ratio_proba(
+                        emb_tensor,
+                        class_protos,
+                        dist_fct_name=str(_args.dist_fct).lower(),
+                    )
                     if pred_lbl is None:
                         pred_label = unique_labels[0]
                         pred_confidence = 0.0
                     else:
                         pred_label = pred_lbl
-                        pred_confidence = 1.0
+                        pred_confidence = float(pred_probas.get(pred_label, 0.0))
+                    pred_probas = _normalize_probability_map(pred_probas, unique_labels)
                 
                 else:
-                    # Use KNN classifier (original behavior)
-                    pred_probs = nets['knn'].predict_proba(embedding)
+                    # Use the selected embedding classifier head.
+                    embedding_classifier = nets['embedding_classifier']
+                    if hasattr(embedding_classifier, "predict_proba"):
+                        pred_probs = embedding_classifier.predict_proba(embedding)
+                    elif hasattr(embedding_classifier, "decision_function"):
+                        pred_probs = _decision_scores_to_proba(embedding_classifier.decision_function(embedding))
+                    else:
+                        pred_raw = embedding_classifier.predict(embedding)
+                        pred_probs = np.zeros((1, len(unique_labels)), dtype=float)
+                        try:
+                            pred_idx = int(pred_raw[0])
+                            pred_probs[0, pred_idx] = 1.0
+                        except Exception:
+                            pred_probs[0, 0] = 1.0
                     pred_class = int(np.argmax(pred_probs, axis=1)[0])
                     pred_confidence = float(pred_probs[0, pred_class]) if pred_probs.ndim == 2 else float(np.max(pred_probs))
-                    pred_label = unique_labels[pred_class]
+                    raw_class_labels = getattr(embedding_classifier, "classes_", unique_labels)
+                    class_labels = _classifier_classes_to_labels(raw_class_labels, unique_labels)
+                    pred_label = class_labels[pred_class] if pred_class < len(class_labels) else unique_labels[pred_class]
+                    pred_probas = _normalize_probability_map(pred_probs, class_labels)
         
         if show_validation_metrics:
             if valid_metrics_source == 'registry':
@@ -495,6 +619,10 @@ def _run_analysis_on_file_impl(filename, file_bytes, _args, cursor, conn, force_
             method_label = f"KDE ({getattr(_args, 'kde_kernel', 'gaussian')} kernel)"
         elif use_prototypes:
             method_label = f"Prototype-based ({getattr(_args, 'prototype_kind', 'distance')})"
+        elif _classifier_kind_from_config(_head_config_from_args(_args)) == "linearsvc":
+            method_label = "LinearSVC"
+        elif _classifier_kind_from_config(_head_config_from_args(_args)) == "logisticregression":
+            method_label = "LogisticRegression"
         else:
             method_label = f"KNN (k={_args.n_neighbors})"
         
@@ -504,7 +632,16 @@ def _run_analysis_on_file_impl(filename, file_bytes, _args, cursor, conn, force_
         )
         
         # Insert into database
-        insert_score(cursor, conn, filename, _args, pred_label, pred_confidence, complete_log_path)
+        insert_score(
+            cursor,
+            conn,
+            filename,
+            _args,
+            pred_label,
+            pred_confidence,
+            complete_log_path,
+            class_scores=pred_probas,
+        )
         st.success("✅ Results saved to database.")
 
         # Track the model number used for this run so the UI can show it immediately
@@ -544,4 +681,4 @@ def _run_analysis_on_file_impl(filename, file_bytes, _args, cursor, conn, force_
             complete_log_path,
         )
     
-    return pred_label, pred_confidence, complete_log_path, None
+    return pred_label, pred_confidence, complete_log_path, None, None, pred_probas

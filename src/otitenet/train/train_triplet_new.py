@@ -17,6 +17,7 @@ import uuid
 import copy
 import shutil
 import pickle
+import hashlib
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
@@ -55,14 +56,7 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 import mysql.connector
 
 # ...rest of user-supplied code (full content pasted by user)...
-import comet_ml
 from otitenet.logging.metrics import compute_batch_effect_metrics
-import logging
-import os
-import sys
-import traceback
-
-import matplotlib
 
 matplotlib.use('Agg')
 CUDA_VISIBLE_DEVICES = ""
@@ -70,6 +64,7 @@ CUDA_VISIBLE_DEVICES = ""
 from ..logging.loggings import LogConfusionMatrix, add_to_tracking, add_to_mlflow, create_tracking_run, log_mlflow, \
     TRACKING_API_TOKEN, TRACKING_PROJECT_NAME, TRACKING_MODEL_NAME, add_to_logger, add_to_comet, make_comet_logger
 from ..data.data_getters import GetData, get_distance_fct, get_images_loaders, get_n_features
+from ..data.dataset_paths import resolve_processed_dataset_path
 from ..utils.utils import get_optimizer, to_categorical, get_empty_dicts, get_empty_traces, \
     log_traces, save_tensor, get_best_params, get_best_params_comet
 from ..utils.encoding_utils import encode_split_with_augmentation, get_base_transform, get_knn_augmentation_transform
@@ -80,6 +75,7 @@ from ..utils.memory_telemetry import (
     reset_gpu_peak,
     record_gpu_peak,
 )
+from ..utils.training_config import disable_stn_when_unsupported, validate_n_calibration
 from ..models.cnn import Net, Net_deep_shap, Net_shap
 from ..logging.losses import TupletLoss,ArcFaceLoss, ArcFaceLossWithHSM, \
         ArcFaceLossWithSubcenters, ArcFaceLossWithSubcentersHSM, SoftmaxContrastiveLoss
@@ -89,6 +85,109 @@ from .batch_effects import get_batch_metrics
 from .completed_runs_metrics import append_completed_run_metrics
 
 warnings.filterwarnings("ignore")
+
+
+def _normalize_train_datasets(value):
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        parts = [str(x).strip() for x in value]
+    else:
+        parts = [x.strip() for x in str(value).replace(";", ",").split(",")]
+    return ",".join(list(dict.fromkeys([x for x in parts if x and x.lower() not in {"none", "nan", "null"}])))
+
+
+def _normalize_single_dataset(value):
+    if isinstance(value, (list, tuple, set, np.ndarray)):
+        return _normalize_train_datasets(value)
+    return str(value or "").strip()
+
+
+def _dataset_path_segment(path):
+    text = str(path or "").strip().replace("\\", "/").strip("/")
+    for prefix in ("./data/", "data/"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return text or "otite_ds_64"
+
+
+def _split_config_from_args(args):
+    train_datasets = _normalize_train_datasets(
+        getattr(args, "effective_train_datasets", None)
+        or getattr(args, "train_datasets", "")
+    )
+    valid_dataset = _normalize_single_dataset(
+        getattr(args, "effective_valid_dataset", None)
+        or getattr(args, "valid_dataset", "")
+    )
+    test_dataset = _normalize_single_dataset(
+        getattr(args, "effective_test_dataset", None)
+        or getattr(args, "test_dataset", "")
+    )
+    key = "|".join([train_datasets, valid_dataset, test_dataset])
+    
+    # Generate dataset subdirectory string instead of split hash
+    from otitenet.data.dataset_paths import dataset_output_subdir, DATASET_SHORT_NAMES
+    
+    # Collect all unique datasets
+    all_datasets = set()
+    if train_datasets and train_datasets != 'from_infos_csv':
+        all_datasets.update([d.strip() for d in train_datasets.split(',')])
+    if valid_dataset and valid_dataset != 'from_infos_csv':
+        all_datasets.add(valid_dataset)
+    if test_dataset and test_dataset != 'from_infos_csv':
+        all_datasets.add(test_dataset)
+    
+    # Generate subdirectory string using short names, sorted and deduplicated
+    # This ensures that the same datasets in any order yield the same segment, and no duplicates
+    if all_datasets:
+        # Use DATASET_SHORT_NAMES if available, else just the name
+        short_names = []
+        for d in sorted(all_datasets):
+            short = DATASET_SHORT_NAMES.get(d, d) if 'DATASET_SHORT_NAMES' in locals() or 'DATASET_SHORT_NAMES' in globals() else d
+            short_names.append(short)
+        # Remove duplicates while preserving order (shouldn't be any after set, but just in case)
+        seen = set()
+        unique_short_names = [x for x in short_names if not (x in seen or seen.add(x))]
+        dataset_subdir = "-".join(unique_short_names)
+    else:
+        dataset_subdir = ""
+
+    return {
+        "train_datasets": train_datasets,
+        "valid_dataset": valid_dataset,
+        "test_dataset": test_dataset,
+        "split_config_key": key,
+        "split_segment": dataset_subdir,
+    }
+
+
+def _ensure_registry_split_columns(cursor, conn):
+    columns = {
+        "train_datasets": "TEXT NULL",
+        "valid_dataset": "VARCHAR(255) NULL",
+        "test_dataset": "VARCHAR(255) NULL",
+        "split_config_key": "VARCHAR(1024) NULL",
+    }
+    for col, col_type in columns.items():
+        try:
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'best_models_registry'
+                  AND COLUMN_NAME = %s
+                """,
+                (col,),
+            )
+            has_col = cursor.fetchone()[0] > 0
+            if not has_col:
+                cursor.execute(f"ALTER TABLE best_models_registry ADD COLUMN {col} {col_type}")
+                conn.commit()
+        except Exception as e:
+            print(f"Warning: could not ensure best_models_registry.{col}: {e}")
 
 # Ax emits noisy kwargs type-check warnings in this environment even for valid runtime values.
 # Keep actual training errors visible while silencing that specific logger.
@@ -124,33 +223,43 @@ def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=No
             database="results_db"
         )
         cursor = conn.cursor()
+        _ensure_registry_split_columns(cursor, conn)
         
         # New columns for prototype aggregation
         proto_strat = params.get('prototype_strategy', 'mean')
         proto_comp = params.get('prototype_components', 1)
+        train_datasets = params.get('train_datasets', '')
+        valid_dataset = params.get('valid_dataset', '')
+        test_dataset = params.get('test_dataset', '')
+        split_key = params.get('split_config_key', '|'.join([str(train_datasets or ''), str(valid_dataset or ''), str(test_dataset or '')]))
 
-        cursor.execute("""
-            SELECT mcc FROM best_models_registry
-            WHERE model_name=%s AND nsize=%s AND fgsm=%s AND prototypes=%s AND npos=%s AND nneg=%s 
-                  AND dloss=%s AND dist_fct=%s AND classif_loss=%s AND n_calibration=%s AND normalize=%s AND n_neighbors=%s
-                  AND prototype_strategy=%s AND prototype_components=%s
-        """, (
-            params['model_name'], 
-            str(params.get('nsize', 224)), 
-            params['fgsm'], 
-            params['prototypes'], 
-            params['npos'], 
-            params['nneg'], 
-            params['dloss'], 
-            params.get('dist_fct', 'euclidean'),
-            params.get('classif_loss', 'triplet'),
-            params['n_calibration'], 
-            params['normalize'],
-            str(params.get('n_neighbors', 1)),
-            proto_strat,
-            proto_comp
-        ))
-        row = cursor.fetchone()
+        try:
+            cursor.execute("""
+                SELECT mcc FROM best_models_registry
+                WHERE model_name=%s AND nsize=%s AND fgsm=%s AND prototypes=%s AND npos=%s AND nneg=%s 
+                      AND dloss=%s AND dist_fct=%s AND classif_loss=%s AND n_calibration=%s AND normalize=%s AND n_neighbors=%s
+                      AND prototype_strategy=%s AND prototype_components=%s
+                      AND COALESCE(split_config_key, '')=%s
+            """, (
+                params['model_name'], 
+                str(params.get('nsize', 224)), 
+                params['fgsm'], 
+                params['prototypes'], 
+                params['npos'], 
+                params['nneg'], 
+                params['dloss'], 
+                params.get('dist_fct', 'euclidean'),
+                params.get('classif_loss', 'triplet'),
+                params['n_calibration'], 
+                params['normalize'],
+                str(params.get('n_neighbors', 1)),
+                proto_strat,
+                proto_comp,
+                split_key
+            ))
+            row = cursor.fetchone()
+        except mysql.connector.Error:
+            row = None
         if row is None or row[0] is None or float(mcc) >= float(row[0]):
             # Extract batch metrics if provided
             batch_entropy = None
@@ -182,8 +291,9 @@ def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=No
                     REPLACE INTO best_models_registry
                     (model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss, n_calibration, 
                      accuracy, mcc, batch_entropy_norm, batch_nmi, batch_ari, normalize, n_neighbors, 
-                     prototype_strategy, prototype_components, log_path)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     prototype_strategy, prototype_components, train_datasets, valid_dataset, test_dataset,
+                     split_config_key, log_path)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     params['model_name'],
                     str(params.get('nsize', 224)),
@@ -204,6 +314,10 @@ def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=No
                     str(params.get('n_neighbors', 1)),
                     proto_strat,
                     proto_comp,
+                    train_datasets,
+                    valid_dataset,
+                    test_dataset,
+                    split_key,
                     log_path
                 ))
             except mysql.connector.Error as e:
@@ -421,7 +535,7 @@ class TrainAE:
 
         run_tag = getattr(self.args, 'run_tag', 'PROD')
         task = getattr(self.args, 'task', 'notNormal')
-        dataset = os.path.basename(str(self.path).rstrip('/'))
+        dataset = _dataset_path_segment(self.path).replace("/", "_")
         # Per-task CSV (legacy behavior)
         completed_csv = f'logs/progresses/{task}/{dataset}/{run_tag}_{task}_completed_runs_metrics.csv'
         os.makedirs(os.path.dirname(completed_csv), exist_ok=True)
@@ -443,6 +557,7 @@ class TrainAE:
             'n_negatives': getattr(self.args, 'n_negatives', ''),
         }
         strategy_label = _resolve_strategy_label(run_id['classif_loss'], run_id['knn'])
+        split_config = _split_config_from_args(self.args)
         # Resolve lists to scalars
         best_vals_scalars = _extract_best_values_as_scalars(best_vals)
         row = {
@@ -468,6 +583,10 @@ class TrainAE:
             'dist_fct': run_id['dist_fct'],
             'knn': run_id['knn'],
             'n_negatives': run_id['n_negatives'],
+            'train_datasets': split_config['train_datasets'],
+            'valid_dataset': split_config['valid_dataset'],
+            'test_dataset': split_config['test_dataset'],
+            'split_config_key': split_config['split_config_key'],
             'retry_count': getattr(self.args, 'retry_count', ''),
             'train_mcc': best_vals_scalars.get('train', {}).get('mcc', best_vals.get('train_mcc', '')),
             'valid_mcc': best_vals_scalars.get('valid', {}).get('mcc', best_vals.get('valid_mcc', '')),
@@ -533,7 +652,11 @@ class TrainAE:
         self.log_comet = log_comet
         self.log_mlflow = log_mlflow
         self.args = args
-        self.path = path
+        self.path = resolve_processed_dataset_path(path, 
+                                                   getattr(args, 'train_datasets', None),
+                                                   getattr(args, 'valid_dataset', None),
+                                                   getattr(args, 'test_dataset', None))
+        args.path = self.path
 
         self.amp_enabled = bool(int(getattr(self.args, 'amp', 1))) and str(getattr(self.args, 'device', '')).startswith('cuda')
         amp_dtype_name = str(getattr(self.args, 'amp_dtype', 'bf16')).lower()
@@ -566,6 +689,7 @@ class TrainAE:
         self.data = None
         self.unique_labels = None
         self.unique_batches = None
+        self._batch_encoder = None
         self.triplet_loss = None
         self.triplet_dloss = None
         
@@ -650,7 +774,7 @@ class TrainAE:
             self._epoch_timing_csv = os.path.join(self.complete_log_path, 'epoch_timing.csv')
             if not os.path.exists(self._epoch_timing_csv):
                 with open(self._epoch_timing_csv, 'w') as f:
-                    f.write('epoch,gap_prev_s,train_s,eval_s,prototypes_s,loader_refresh_s,logging_s,best_update_s,total_s\n')
+                    f.write('epoch,gap_prev_s,deep_train_s,classifier_fit_s,eval_s,prototypes_s,loader_refresh_s,logging_s,best_update_s,total_s\n')
 
         if self._epoch_metrics_csv is None:
             self._epoch_metrics_csv = os.path.join(self.complete_log_path, 'epoch_metrics.csv')
@@ -695,6 +819,14 @@ class TrainAE:
                 k: self._json_safe(v)
                 for k, v in (params or {}).items()
             }
+            args_dict = {
+                k: self._json_safe(v)
+                for k, v in vars(self.args).items()
+            }
+            params_dict = {
+                k: self._json_safe(v)
+                for k, v in (params or {}).items()
+            }
             payload = {
                 'created_at': datetime.now().isoformat(timespec='seconds'),
                 'finished_at': None,
@@ -706,6 +838,9 @@ class TrainAE:
                 'foldername': self.foldername,
                 'args': args_dict,
                 'optimized_params': params_dict,
+                'train_datasets': args_dict.get('train_datasets'),
+                'valid_dataset': args_dict.get('valid_dataset'),
+                'test_dataset': args_dict.get('test_dataset'),
             }
             with open(metadata_path, 'w') as f:
                 json.dump(payload, f, indent=2)
@@ -789,6 +924,7 @@ class TrainAE:
                 'best_values': self._json_safe(
                     _extract_best_values_as_scalars(best_vals)
                 ),
+                'split_config': self._json_safe(_split_config_from_args(self.args)),
                 'batch_metrics': self._json_safe(getattr(self, 'batch_metrics', {})),
                 'params': {k: self._json_safe(v) for k, v in (params or {}).items()},
                 'artifacts': {
@@ -829,16 +965,22 @@ class TrainAE:
         with open(self._epoch_timing_csv, 'a') as f:
             f.write(
                 f"{epoch + 1},{timing.get('gap_prev_s', 0.0):.3f},{timing.get('train_s', 0.0):.3f},"
-                f"{timing.get('eval_s', 0.0):.3f},{timing.get('prototypes_s', 0.0):.3f},"
+                f"{timing.get('classifier_fit_s', 0.0):.3f},{timing.get('eval_s', 0.0):.3f},{timing.get('prototypes_s', 0.0):.3f},"
                 f"{timing.get('loader_refresh_s', 0.0):.3f},{timing.get('logging_s', 0.0):.3f},"
                 f"{timing.get('best_update_s', 0.0):.3f},{timing.get('total_s', 0.0):.3f}\n"
             )
         print(
             f"EpochTiming|epoch={epoch + 1}|gap_prev={timing.get('gap_prev_s', 0.0):.2f}s|"
-            f"train={timing.get('train_s', 0.0):.2f}s|eval={timing.get('eval_s', 0.0):.2f}s|"
+            f"deep_train={timing.get('train_s', 0.0):.2f}s|classifier_fit={timing.get('classifier_fit_s', 0.0):.2f}s|"
+            f"eval={timing.get('eval_s', 0.0):.2f}s|"
             f"prototypes={timing.get('prototypes_s', 0.0):.2f}s|loader={timing.get('loader_refresh_s', 0.0):.2f}s|"
             f"logging={timing.get('logging_s', 0.0):.2f}s|best_update={timing.get('best_update_s', 0.0):.2f}s|"
             f"total={timing.get('total_s', 0.0):.2f}s"
+        )
+        print(
+            f"DeepVsClassifierTiming|epoch={epoch + 1}|"
+            f"deep_layers_train_s={timing.get('train_s', 0.0):.2f}|"
+            f"embedding_classifier_fit_s={timing.get('classifier_fit_s', 0.0):.2f}"
         )
 
     def _save_raw_inputs_manifest(self, data_getter, path):
@@ -1170,6 +1312,7 @@ class TrainAE:
             early_stop_counter = 0
             warmup = 0
             prev_epoch_end = None
+            best_lists = {}
             for epoch in range(0, self.args.n_epochs):
                 self.epoch = epoch
                 epoch_start = time.perf_counter()
@@ -1189,7 +1332,7 @@ class TrainAE:
                 for group in train_groups:
                     if group == 'train' and epoch < warmup:
                         continue
-                    _, best_lists1, _ = self.loop(group, optimizer_model, params['gamma'], loaders[group], lists, traces)
+                    _, best_lists[group], _ = self.loop(group, optimizer_model, params['gamma'], loaders[group], lists, traces)
                 train_s = time.perf_counter() - t_train_start
                 if epoch < warmup:
                     values['all']['dloss'] += [np.mean(traces['all']['dloss'])]
@@ -1213,13 +1356,19 @@ class TrainAE:
                 logging_s = time.perf_counter() - t_log_start
                 self.model.eval()
                 t_eval_start = time.perf_counter()
-                self.set_prototypes('train', best_lists1)
-                for group in ["valid", "test"]:
-                    # Run predict to accumulate encodings first
-                    _, best_lists2, _, knn = self.predict(group, loaders[group], lists, traces)
+                classifier_fit_s = 0.0
+                self._embedding_classifier_cache = {}
+                self.set_prototypes('train', best_lists['train'])
+                # Run predict to accumulate encodings first
+                _, best_lists['valid'], _, knn = self.predict('valid', loaders['valid'], lists, traces)
+                classifier_fit_s += float(getattr(self, '_last_classifier_fit_s', 0.0) or 0.0)
+
+                _, best_lists['test'], _, knn = self.predict('test', loaders['test'], lists, traces)
+                classifier_fit_s += float(getattr(self, '_last_classifier_fit_s', 0.0) or 0.0)
+
                 eval_s = time.perf_counter() - t_eval_start
                 # put the best lists together. keys are all only in one dict
-                best_lists = {**best_lists1, **best_lists2}
+                best_lists = {**best_lists['train'], **best_lists['valid'], **best_lists['test']}
                 # After encodings exist, update prototypes
                 t_proto_start = time.perf_counter()
                 self.set_prototypes('valid', best_lists)
@@ -1235,6 +1384,7 @@ class TrainAE:
                 }
                 t_loader_start = time.perf_counter()
                 loaders = get_images_loaders(data=self.data,
+                                             batch_encoder=self._batch_encoder,
                                             random_recs=self.args.random_recs,
                                             weighted_sampler=self.args.weighted_sampler,
                                             is_transform=params['is_transform'],
@@ -1359,6 +1509,7 @@ class TrainAE:
                 self._log_epoch_timing(epoch, {
                     'gap_prev_s': gap_prev,
                     'train_s': train_s,
+                    'classifier_fit_s': classifier_fit_s,
                     'eval_s': eval_s,
                     'prototypes_s': prototypes_s,
                     'loader_refresh_s': loader_refresh_s,
@@ -1384,29 +1535,33 @@ class TrainAE:
                     self.model.train()
                     self.model.to(self.args.device)
                     
+                    best_lists = {}
                     for group in ['all', 'train', 'calibration']:
-                        _, best_lists1, _ = self.loop_calibration(group, optimizer_model, params['gamma'], loaders[group], lists, traces)
+                        _, best_lists[group], _ = self.loop_calibration(group, optimizer_model, params['gamma'], loaders[group], lists, traces)
+                        self.set_prototypes(group, best_lists[group])
                     self.model.eval()
                     for group in ["valid", "test"]:
-                        _, best_lists2, _, _ = self.predict(group, loaders[group], lists, traces)
+                        _, best_lists[group], _, _ = self.predict(group, loaders[group], lists, traces)
+                        self.set_prototypes(group, best_lists[group])
                     # put the best lists together. keys are all only in one dict
-                    best_lists = {**best_lists1, **best_lists2}
+                    best_lists = {**best_lists['all'], **best_lists['train'], **best_lists['valid'], **best_lists['test'], **best_lists['calibration']}
 
-                    self.set_prototypes('train', best_lists)
-                    self.set_prototypes('valid', best_lists)
-                    self.set_prototypes('test', best_lists)
-                    self.set_prototypes('all', best_lists)
-                    self.set_prototypes('calibration', best_lists)
+                    # self.set_prototypes('train', best_lists)
+                    # self.set_prototypes('valid', best_lists)
+                    # self.set_prototypes('test', best_lists)
+                    # self.set_prototypes('all', best_lists)
+                    # self.set_prototypes('calibration', best_lists)
 
-                    self.model.eval()
-                    for group in ["valid", "test"]:
-                        _, best_lists, _, _ = self.predict(group, loaders[group], lists, traces)
+                    # self.model.eval()
+                    # for group in ["valid", "test"]:
+                    #     _, best_lists, _, _ = self.predict(group, loaders[group], lists, traces)
                     prototypes = {
                         'combined': self.combined_prototypes,
                         'class': self.class_prototypes,
                         'batch': self.batch_prototypes
                     }
                     loaders = get_images_loaders(data=self.data,
+                                                batch_encoder=self._batch_encoder,
                                                 random_recs=self.args.random_recs,
                                                 weighted_sampler=self.args.weighted_sampler,
                                                 is_transform=params['is_transform'],
@@ -1538,10 +1693,11 @@ class TrainAE:
             self.shap_model.eval()
         print("\n========== FINAL EVALUATION PASS (BEST CHECKPOINT) ==========")
         print("Running train loop snapshot + train/valid/test predictions...")
+        best_lists = {}
         with torch.no_grad():
-            _, best_lists1, _ = self.loop('train', optimizer_model, params['gamma'], loaders['train'], lists, traces)
+            _, _, _ = self.loop('train', optimizer_model, params['gamma'], loaders['train'], lists, traces)
             for group in ["train", "valid", "test"]:
-                _, best_lists2, traces, knn = self.predict(group, loaders[group], lists, traces)
+                _, best_lists[group], traces, knn = self.predict(group, loaders[group], lists, traces)
             batch_metrics = get_batch_metrics(lists)
             for key, value in batch_metrics.items():
                 traces[key] = value
@@ -1561,7 +1717,7 @@ class TrainAE:
         # Persist fitted embedding classifier artifact (when using mlp_head)
         self._save_inference_classifier(self.complete_log_path)
 
-        best_lists = {**best_lists1, **best_lists2}
+        best_lists = {**best_lists['train'], **best_lists['valid'], **best_lists['test']}
 
         # Logging every model is taking too much resources and it makes it quite complicated to get information when
         # Too many runs have been made. This will make the notebook so much easier to work with
@@ -1620,21 +1776,37 @@ class TrainAE:
         proto_val = str(self.args.prototypes_to_use)
         if proto_val.startswith("prototypes_"):
             proto_val = proto_val[len("prototypes_"):]
+        split_config = _split_config_from_args(self.args)
+        split_csv = {
+            **split_config,
+            "train_datasets": split_config["train_datasets"].replace(",", ";"),
+            "split_config_key": split_config["split_config_key"].replace(",", ";"),
+        }
+        dataset_segment = _dataset_path_segment(self.path)
+        # Use deduplicated split_segment for all path constructions
+        split_config = _split_config_from_args(self.args)
+        split_segment = split_config["split_segment"]
+        # Only append split_segment if it is not already part of dataset_segment
+        # if split_segment and split_segment not in dataset_segment:
+        #     dataset_path_with_split = f"{dataset_segment}/{split_segment}"
+        # else:
+        dataset_path_with_split = dataset_segment
 
 
         line_found = False
         if not os.path.exists(models_csv_path):
             os.makedirs(log_dir, exist_ok=True)
             with open(models_csv_path, 'w') as f:
-                f.write('valid_mcc,model,path,n_neighbors,nsize,fgsm,n_calibration,loss,dloss,dist_fct,prototype,n_positives,n_negatives,normalize,task,complete_log_path\n')
-                f.write(f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},{params["n_neighbors"]},nsize{self.args.new_size},fsgm{self.args.fgsm},ncal{self.args.n_calibration},' \
+                f.write('valid_mcc,model,path,n_neighbors,nsize,fgsm,n_calibration,loss,dloss,dist_fct,prototype,n_positives,n_negatives,normalize,task,train_datasets,valid_dataset,test_dataset,split_config_key,complete_log_path\n')
+                f.write(f'{self.best_mcc},{self.args.model_name},{dataset_segment},{params["n_neighbors"]},nsize{self.args.new_size},fsgm{self.args.fgsm},ncal{self.args.n_calibration},' \
                     f'{self.args.classif_loss},{self.args.dloss},{dist_fct_val},prototypes_{proto_val},' \
-                    f'npos{self.args.n_positives},nneg{self.args.n_negatives},{self.args.normalize},{task_val},{self.complete_log_path}\n')
+                    f'npos{self.args.n_positives},nneg{self.args.n_negatives},{self.args.normalize},{task_val},' \
+                    f'{split_csv["train_datasets"]},{split_csv["valid_dataset"]},{split_csv["test_dataset"]},{split_csv["split_config_key"]},{self.complete_log_path}\n')
 
         else:
             with open(models_csv_path, 'r') as f:
                 lines = f.readlines()
-            lines = pd.read_csv(models_csv_path).to_csv(index=False).splitlines(keepends=True)  # Reformat lines to ensure consistent formatting
+            # lines = pd.read_csv(models_csv_path).to_csv(index=False).splitlines(keepends=True)  # Reformat lines to ensure consistent formatting
             for i, line in enumerate(lines[1:]):  # skip header
                 line_parts = line.strip().split(',')
                 if len(line_parts) < 16:
@@ -1650,29 +1822,39 @@ class TrainAE:
                         f"Invalid valid_mcc in {models_csv_path} at data row {i + 2}: "
                         f"value={line_parts[0]!r}. row={line!r}"
                     ) from exc
-                if (line_parts[1:-1] == [self.args.model_name, f'{self.path.split("/")[-1]}', str(params["n_neighbors"]), f'nsize{self.args.new_size}', f'fsgm{self.args.fgsm}', f'ncal{self.args.n_calibration}', 
+                compare_parts = line_parts[1:-1]
+                expected_parts = [self.args.model_name, dataset_segment, str(params["n_neighbors"]), f'nsize{self.args.new_size}', f'fsgm{self.args.fgsm}', f'ncal{self.args.n_calibration}', 
                                        str(self.args.classif_loss), str(self.args.dloss), dist_fct_val,
                                        f'prototypes_{proto_val}',
                                        f'npos{self.args.n_positives}', f'nneg{self.args.n_negatives}',
                                        self.args.normalize,
-                                       task_val]):
+                                       task_val]
+                if len(compare_parts) >= 18:
+                    expected_parts += [
+                        split_csv["train_datasets"],
+                        split_csv["valid_dataset"],
+                        split_csv["test_dataset"],
+                        split_csv["split_config_key"],
+                    ]
+                if compare_parts == expected_parts:
                     if self.best_mcc >= line_mcc:
-                        lines[i + 1] = f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},{params["n_neighbors"]},nsize{self.args.new_size},fgsm{self.args.fgsm},' \
-                                        f'ncal{self.args.n_calibration},{self.args.classif_loss},{self.args.dloss},{dist_fct_val},' \
-                                        f'prototypes_{proto_val},npos{self.args.n_positives},' \
-                                        f'nneg{self.args.n_negatives},{self.args.normalize},{task_val},{self.complete_log_path}\n'
+                        lines[i + 1] = f'{self.best_mcc},{self.args.model_name},{dataset_segment},{params["n_neighbors"]},nsize{self.args.new_size},fgsm{self.args.fgsm},' \
+                                        f'ncal{self.args.n_calibration},{self.args.classif_loss},{self.args.dloss},{dist_fct_val},prototypes_{proto_val},' \
+                                        f'npos{self.args.n_positives},nneg{self.args.n_negatives},{self.args.normalize},{task_val},' \
+                                        f'{split_csv["train_datasets"]},{split_csv["valid_dataset"]},{split_csv["test_dataset"]},{split_csv["split_config_key"]},{self.complete_log_path}\n'
                     else:
                         lines[i + 1] = line
                     line_found = True
                     break
 
             if not line_found:
-                lines.append(f'{self.best_mcc},{self.args.model_name},{self.path.split("/")[-1]},{params["n_neighbors"]},'\
+                lines.append(f'{self.best_mcc},{self.args.model_name},{dataset_segment},{params["n_neighbors"]},'\
                              f'nsize{self.args.new_size},fgsm{self.args.fgsm},'\
                              f'ncal{self.args.n_calibration},{self.args.classif_loss},' \
                              f'{self.args.dloss},{dist_fct_val},prototypes_{proto_val},' \
                              f'npos{self.args.n_positives},nneg{self.args.n_negatives},' \
-                             f'{self.args.normalize},{task_val},{self.complete_log_path}\n')
+                             f'{self.args.normalize},{task_val},' \
+                             f'{split_csv["train_datasets"]},{split_csv["valid_dataset"]},{split_csv["test_dataset"]},{split_csv["split_config_key"]},{self.complete_log_path}\n')
 
             # Update CSV with consistent formatting
             for i, line in enumerate(lines[1:], start=1):
@@ -1696,8 +1878,10 @@ class TrainAE:
         if proto_val.startswith("prototypes_"):
             proto_val = proto_val[len("prototypes_"):]
 
+        # Get split config for path construction
+        split_config = _split_config_from_args(self.args)
         n_neighbors_val = params.get('n_neighbors', getattr(self.args, 'n_neighbors', 5))
-        params_str = f'{self.path.split("/")[-1]}/nsize{self.args.new_size}/fgsm{self.args.fgsm}/ncal{self.args.n_calibration}/{self.args.classif_loss}/' \
+        params_str = f'{dataset_path_with_split}/nsize{self.args.new_size}/fgsm{self.args.fgsm}/ncal{self.args.n_calibration}/{self.args.classif_loss}/' \
             f'{self.args.dloss}/prototypes_{proto_val}/' \
             f'npos{self.args.n_positives}/nneg{self.args.n_negatives}/' \
             f'protoagg_{getattr(self.args, "prototype_strategy", "mean")}_{getattr(self.args, "prototype_components", 1)}/' \
@@ -1738,7 +1922,11 @@ class TrainAE:
             'classif_loss': self.args.classif_loss,
             'n_calibration': self.args.n_calibration,
             'normalize': self.args.normalize,
-            'n_neighbors': params.get('n_neighbors', getattr(self.args, 'n_neighbors', 5))
+            'n_neighbors': params.get('n_neighbors', getattr(self.args, 'n_neighbors', 5)),
+            'train_datasets': split_config['train_datasets'],
+            'valid_dataset': split_config['valid_dataset'],
+            'test_dataset': split_config['test_dataset'],
+            'split_config_key': split_config['split_config_key'],
         }
         
         # Get batch metrics if available
@@ -1957,12 +2145,28 @@ class TrainAE:
     def log_predictions(self, best_lists, run=None, comet_logger=None, step=0):
         cats, labels, preds, scores, names = [{'train': [], 'valid': [], 'test': []} for _ in range(5)]
         for group in ['valid', 'test']:
+            if len(best_lists[group]['preds']) == 0:
+                raise ValueError(
+                    f"Cannot log {group} predictions: best_lists[{group!r}]['preds'] is empty. "
+                    f"This usually means the split was evaluated with loop() instead of predict(), "
+                    f"or the {group} loader produced no batches. "
+                    f"Split size={len(self.data['labels'].get(group, []))}, "
+                    f"loader_batches={len(self.loaders.get(group, [])) if hasattr(self, 'loaders') else 'unknown'}."
+                )
             cats[group] = np.concatenate(best_lists[group]['cats'])
             labels[group] = np.concatenate(best_lists[group]['labels'])
             # Use KNN outputs directly (assume best_lists[group]['preds'] contains KNN probabilities or one-hot)
             scores[group] = np.concatenate(best_lists[group]['preds'])
             preds[group] = scores[group].argmax(1)
             names[group] = np.concatenate(best_lists[group]['names'])
+            observed_counts = self._cat_counts(cats[group])
+            if len(observed_counts) < 2:
+                raise ValueError(
+                    f"Cannot log {group} ROC AUC because only one class is present in observed predictions. "
+                    f"Observed counts from best_lists[{group!r}]['cats']: {observed_counts}. "
+                    f"Data split counts: {self._label_counts(self.data['labels'][group])}"
+                )
+            auc_value = self._roc_auc_present_classes(cats[group], scores[group], group)
             score_colnames = [f'probs_{l}' for l in self.unique_labels]
             colnames = ['label'] + score_colnames + ['pred', 'name']
             df = pd.DataFrame(
@@ -1975,23 +2179,24 @@ class TrainAE:
             df.to_csv(f'{self.complete_log_path}/{group}_predictions.csv', index=False)
             if self.log_tracking and run is not None:
                 run[f"{group}_predictions"].track_files(f'{self.complete_log_path}/{group}_predictions.csv')
-                run[f'{group}_AUC'] = metrics.roc_auc_score(y_true=to_categorical(cats[group], len(self.unique_labels)), y_score=scores[group], multi_class='ovr')
-                save_roc_curve(
-                    scores[group],
-                    to_categorical(cats[group], len(self.unique_labels)),
-                    self.unique_labels,
-                    f'{self.complete_log_path}/{group}_roc_curve.png',
-                    binary=False,
-                    acc=metrics.accuracy_score(cats[group], np.array(scores[group].argmax(1))),
-                    mlops='mlflow',
-                    epoch=step,
-                    logger=None
-                )
-                run[f'{group}_ROC'].upload(f'{self.complete_log_path}/{group}_roc_curve.png')
+                run[f'{group}_AUC'] = auc_value
+                try:
+                    save_roc_curve(
+                        scores[group],
+                        to_categorical(cats[group], len(self.unique_labels)),
+                        self.unique_labels,
+                        f'{self.complete_log_path}/{group}_roc_curve.png',
+                        binary=False,
+                        acc=metrics.accuracy_score(cats[group], np.array(scores[group].argmax(1))),
+                        mlops='mlflow',
+                        epoch=step,
+                        logger=None
+                    )
+                    run[f'{group}_ROC'].upload(f'{self.complete_log_path}/{group}_roc_curve.png')
+                except ValueError as exc:
+                    print(f"Warning: skipped {group} ROC curve plot: {exc}")
             if self.log_comet and comet_logger is not None:
-                comet_logger.log_metric(f'{group}_AUC',
-                            metrics.roc_auc_score(y_true=to_categorical(cats[group], len(self.unique_labels)), y_score=scores[group], multi_class='ovr'),
-                            step=step)
+                comet_logger.log_metric(f'{group}_AUC', auc_value, step=step)
 
                 # TODO ADD OTHER FINAL METRICS HERE
                 comet_logger.log_metric(f'{group}_acc',
@@ -2001,21 +2206,22 @@ class TrainAE:
                             MCC(cats[group], scores[group].argmax(1)),
                             step=step)
 
-                save_roc_curve(
-                    scores[group],
-                    to_categorical(cats[group], len(self.unique_labels)),
-                    self.unique_labels,
-                    f'{self.complete_log_path}/{group}_roc_curve.png',
-                    binary=False,
-                    acc=metrics.accuracy_score(cats[group], np.array(scores[group].argmax(1))),
-                    mlops='comet',
-                    epoch=step,
-                    logger=comet_logger
-                )
+                try:
+                    save_roc_curve(
+                        scores[group],
+                        to_categorical(cats[group], len(self.unique_labels)),
+                        self.unique_labels,
+                        f'{self.complete_log_path}/{group}_roc_curve.png',
+                        binary=False,
+                        acc=metrics.accuracy_score(cats[group], np.array(scores[group].argmax(1))),
+                        mlops='comet',
+                        epoch=step,
+                        logger=comet_logger
+                    )
+                except ValueError as exc:
+                    print(f"Warning: skipped {group} ROC curve plot: {exc}")
             if self.log_mlflow:
-                mlflow.log_metric(f'{group}_AUC',
-                            metrics.roc_auc_score(y_true=to_categorical(cats[group], len(self.unique_labels)), y_score=scores[group], multi_class='ovr'),
-                            step=step)
+                mlflow.log_metric(f'{group}_AUC', auc_value, step=step)
 
                 # TODO ADD OTHER FINAL METRICS HERE
                 mlflow.log_metric(f'{group}_acc',
@@ -2025,17 +2231,20 @@ class TrainAE:
                             MCC(cats[group], scores[group].argmax(1)),
                             step=step)
 
-                save_roc_curve(
-                    scores[group],
-                    to_categorical(cats[group], len(self.unique_labels)),
-                    self.unique_labels,
-                    f'{self.complete_log_path}/{group}_roc_curve.png',
-                    binary=False,
-                    acc=metrics.accuracy_score(cats[group], np.array(scores[group].argmax(1))),
-                    mlops='mlflow',
-                    epoch=step,
-                    logger=None
-                )
+                try:
+                    save_roc_curve(
+                        scores[group],
+                        to_categorical(cats[group], len(self.unique_labels)),
+                        self.unique_labels,
+                        f'{self.complete_log_path}/{group}_roc_curve.png',
+                        binary=False,
+                        acc=metrics.accuracy_score(cats[group], np.array(scores[group].argmax(1))),
+                        mlops='mlflow',
+                        epoch=step,
+                        logger=None
+                    )
+                except ValueError as exc:
+                    print(f"Warning: skipped {group} ROC curve plot: {exc}")
     
     def get_losses(self, enc, to_rec, not_to_rec, pos_batch_sample, neg_batch_sample, dpreds, domains, labels, group):
         if self.args.classif_loss == 'cosine':
@@ -2083,7 +2292,10 @@ class TrainAE:
 
         elif 'arcfacewithsubcenters' in self.args.classif_loss:
             classif_loss, subcenters = self.arcloss(enc, labels)
-            lists[group]['subcenters'] += [_tensor_to_numpy(subcenters)]
+            if 'subcenters' in lists[group]:
+                lists[group]['subcenters'] += [_tensor_to_numpy(subcenters)]
+            else:
+                lists[group]['subcenters'] = [_tensor_to_numpy(subcenters)]
 
         elif 'arcface' in self.args.classif_loss:
             classif_loss = self.arcloss(enc, labels)
@@ -2150,7 +2362,7 @@ class TrainAE:
             neg_batch_sample = neg_batch_sample.to(self.args.device).float()
             neg_batch_sample = neg_batch_sample.requires_grad_(True)
 
-            domains = to_categorical(domain.long(), self.n_batches).squeeze().float().to(self.args.device)
+            domains = to_categorical(domain.long(), self.n_batches).float().to(self.args.device)
 
             with self._autocast_context():
                 enc, dpreds = self.model(data)
@@ -2160,7 +2372,8 @@ class TrainAE:
             dpreds_np = _tensor_to_numpy(dpreds)
             enc_np = _tensor_to_numpy(enc.view(enc.shape[0], -1))
 
-            lists[group]['domains'] += [np.array([self.unique_batches[np.argmax(d)] for d in domain_np])]
+            # Use LabelEncoder to decode domain indices back to original batch values
+            lists[group]['domains'] += [self._batch_encoder.inverse_transform([np.argmax(d) for d in domain_np])]
             lists[group]['classes'] += [label_np]
             if group == 'train':
                 lists[group]['preds'] += [dpreds_np]
@@ -2283,7 +2496,7 @@ class TrainAE:
             data, names, labels, _, old_labels, domain, to_rec, not_to_rec, pos_batch_sample, neg_batch_sample = batch
             data = data.to(self.args.device).float()
             to_rec = to_rec.to(self.args.device).float()
-            domains = to_categorical(domain.long(), self.n_batches).squeeze().float().to(self.args.device)
+            domains = to_categorical(domain.long(), self.n_batches).float().to(self.args.device)
             with self._autocast_context():
                 enc, dpreds = self.model(data)
 
@@ -2319,20 +2532,23 @@ class TrainAE:
             dpreds_np = _tensor_to_numpy(dpreds)
             enc_np = _tensor_to_numpy(enc.view(enc.shape[0], -1))
 
-            lists[group]['domains'] += [np.array([self.unique_batches[np.argmax(d)] for d in domain_np])]
+            lists[group]['domains'] += [self._batch_encoder.inverse_transform([np.argmax(d) for d in domain_np])]
             lists[group]['classes'] += [label_np]
-            if group == 'train':
-                lists[group]['preds'] += [dpreds_np]
             lists[group]['encoded_values'] += [enc_np]
+
             lists[group]['names'] += [names]
+            lists[group]['cats'] += [label_np]
             # lists[group]['inputs'] += [data.view(data.shape[0], -1).detach().cpu().numpy()]
             lists[group]['labels'] += [np.array(
                 [self.unique_labels[x] for x in label_np])]
             lists[group]['old_labels'] += [np.array(old_labels)]
+            traces[group]['acc'] += [np.mean([0 if pred != dom else 1 for pred, dom in
+                                                zip(dpreds_np.argmax(1),
+                                                    _tensor_to_numpy(domains.argmax(1)))])]
             traces[group]['dom_acc'] += [np.mean([0 if pred != dom else 1 for pred, dom in
                                                 zip(dpreds_np.argmax(1),
                                                     _tensor_to_numpy(domains.argmax(1)))])]
-            traces[group]['closs'] += [classif_loss.item()]
+            traces[group]['closs'] += [0]
             traces[group]['dloss'] += [dloss.item()]
             lists[group]['cats'] += [label_np]
             if self.model.training:
@@ -2599,6 +2815,7 @@ class TrainAE:
         # import nearest_neighbors from sklearn
         classif_loss = None
         cls_confmat = None
+        classifier_fit_s = 0.0
 
         def _safe_concat(chunks):
             if chunks and len(chunks) > 0:
@@ -2639,8 +2856,21 @@ class TrainAE:
             if train_encs is None or train_cats is None or train_encs.size == 0 or train_cats.size == 0:
                 embedding_classifier = None
             else:
-                if siamese_inference == 'mlp_head':
+                cache = getattr(self, '_embedding_classifier_cache', {})
+                cache_key = (
+                    siamese_inference,
+                    int(self.params.get('n_neighbors', 0) or 0),
+                    tuple(train_encs.shape),
+                    int(np.asarray(train_cats).shape[0]),
+                )
+                cached = cache.get(cache_key)
+                if cached is not None:
+                    embedding_classifier, embedding_classifier_kind = cached
+                    print(f"Reusing {embedding_classifier_kind} classifier on embeddings (train_n={train_encs.shape[0]}, fit_s=0.000)")
+
+                if embedding_classifier is None and siamese_inference == 'mlp_head':
                     try:
+                        fit_start = time.perf_counter()
                         embedding_classifier = MLPClassifier(
                             hidden_layer_sizes=(128,),
                             activation='relu',
@@ -2654,33 +2884,43 @@ class TrainAE:
                             n_iter_no_change=15,
                         )
                         embedding_classifier.fit(train_encs, train_cats)
+                        classifier_fit_s += time.perf_counter() - fit_start
                         embedding_classifier_kind = 'mlp_head'
-                        print(f"Using MLP head on embeddings (train_n={train_encs.shape[0]})")
+                        print(f"Using MLP head on embeddings (train_n={train_encs.shape[0]}, fit_s={classifier_fit_s:.3f})")
                     except Exception as e:
                         print(f"MLP head fitting failed, falling back to KNN: {e}")
                         siamese_inference = 'knn'
 
-                if siamese_inference == 'knn':
+                if embedding_classifier is None and siamese_inference == 'knn':
                     requested_k = self.params.get('n_neighbors', 0)
                     if requested_k is None or requested_k <= 0:
                         requested_k = min(25, max(1, train_encs.shape[0]))
                         self.params['n_neighbors'] = requested_k
                     k_val = min(requested_k, max(1, train_encs.shape[0]))
+                    fit_start = time.perf_counter()
                     embedding_classifier = fit_knn_classifier(
                         train_encs, train_cats,
                         n_neighbors=k_val,
                         metric='minkowski'
                     )
+                    classifier_fit_s += time.perf_counter() - fit_start
                     embedding_classifier_kind = 'knn'
-                    print(f"Using KNN classifier with k={k_val}")
-                elif siamese_inference == 'linearsvc':
+                    print(f"Using KNN classifier with k={k_val} (fit_s={classifier_fit_s:.3f})")
+                elif embedding_classifier is None and siamese_inference == 'linearsvc':
+                    fit_start = time.perf_counter()
                     embedding_classifier = fit_linearsvc_classifier(train_encs, train_cats)
+                    classifier_fit_s += time.perf_counter() - fit_start
                     embedding_classifier_kind = 'linearsvc'
-                    print(f"Using LinearSVC classifier on embeddings (train_n={train_encs.shape[0]})")
-                elif siamese_inference == 'logisticregression':
+                    print(f"Using LinearSVC classifier on embeddings (train_n={train_encs.shape[0]}, fit_s={classifier_fit_s:.3f})")
+                elif embedding_classifier is None and siamese_inference == 'logisticregression':
+                    fit_start = time.perf_counter()
                     embedding_classifier = fit_logreg_classifier(train_encs, train_cats)
+                    classifier_fit_s += time.perf_counter() - fit_start
                     embedding_classifier_kind = 'logisticregression'
-                    print(f"Using LogisticRegression classifier on embeddings (train_n={train_encs.shape[0]})")
+                    print(f"Using LogisticRegression classifier on embeddings (train_n={train_encs.shape[0]}, fit_s={classifier_fit_s:.3f})")
+                if embedding_classifier is not None and cached is None:
+                    cache[cache_key] = (embedding_classifier, embedding_classifier_kind)
+                    self._embedding_classifier_cache = cache
         else:
             KNeighborsClassifier = self.model
         # plot_decision_boundary(KNeighborsClassifier, train_encs, train_cats)
@@ -2693,7 +2933,7 @@ class TrainAE:
             data, names, labels, _, old_labels, domain, to_rec, not_to_rec, pos_batch_sample, neg_batch_sample = batch
             data = data.to(self.args.device).float()
             to_rec = to_rec.to(self.args.device).float()
-            domains = to_categorical(domain.long(), self.n_batches).squeeze().float().to(self.args.device)
+            domains = to_categorical(domain.long(), self.n_batches).float().to(self.args.device)
             with self._autocast_context():
                 enc, dpreds = self.model(data)
             enc_np = _tensor_to_numpy(enc.view(enc.shape[0], -1))
@@ -2744,8 +2984,9 @@ class TrainAE:
             domain_np = _tensor_to_numpy(domains)
             label_np = _tensor_to_numpy(labels)
             dpreds_np = _tensor_to_numpy(dpreds)
+            enc_np = _tensor_to_numpy(enc.view(enc.shape[0], -1))
 
-            lists[group]['domains'] += [np.array([self.unique_batches[np.argmax(d)] for d in domain_np])]
+            lists[group]['domains'] += [self._batch_encoder.inverse_transform([np.argmax(d) for d in domain_np])]
             lists[group]['classes'] += [label_np]
             lists[group]['encoded_values'] += [enc_np]
 
@@ -2758,13 +2999,19 @@ class TrainAE:
             labels_t = labels.to(self.args.device).long().view(-1)
             preds_t = torch.as_tensor(preds, device=self.args.device).long().view(-1)
             if preds_t.numel() != labels_t.numel():
-                min_n = min(preds_t.numel(), labels_t.numel())
-                preds_t = preds_t[:min_n]
-                labels_t = labels_t[:min_n]
+                raise ValueError(
+                    f"Prediction/label length mismatch in group={group}: "
+                    f"preds={preds_t.numel()} labels={labels_t.numel()} "
+                    f"exp_id={getattr(self.args, 'exp_id', 'unknown')}"
+                )
             cls_confmat = _update_confmat_gpu(cls_confmat, labels_t, preds_t, len(self.unique_labels))
             batch_acc = (preds_t == labels_t).float().mean().item() if labels_t.numel() > 0 else 0.0
             dom_pred_t = dpreds.argmax(1).long()
-            dom_true_t = domains.argmax(1).long()
+            # Handle domains tensor dimension mismatch - if 1D, use directly; if 2D, use argmax
+            if domains.dim() == 1:
+                dom_true_t = domains.long()
+            else:
+                dom_true_t = domains.argmax(1).long()
             dom_acc = (dom_pred_t == dom_true_t).float().mean().item() if dom_true_t.numel() > 0 else 0.0
             traces[group]['acc'] += [batch_acc]
             traces[group]['dom_acc'] += [dom_acc]
@@ -2844,7 +3091,7 @@ class TrainAE:
             self._log_file_event('pca_batches_png', f'{self.complete_log_path}/pca_batches.png')
 
         # Auto-select best k if enabled
-        if self.args.auto_select_k and self.args.classif_loss not in ['ce', 'hinge'] and group == 'valid':
+        if self.args.auto_select_k and self.args.classif_loss not in ['ce', 'hinge'] and group == 'valid' and siamese_inference == 'knn':
             # Only attempt auto-k if we already accumulated valid encodings
             valid_encs = _safe_concat(lists['valid']['encoded_values']) if lists['valid']['encoded_values'] else None
             valid_cats = _safe_concat(lists['valid']['cats']) if lists['valid']['cats'] else None
@@ -2876,12 +3123,14 @@ class TrainAE:
             
             if valid_encs is not None and valid_encs.size > 0 and train_encs is not None:
                 # Use ML module for k optimization
+                fit_start = time.perf_counter()
                 best_k, best_mcc, mcc_per_k = evaluate_knn_with_k_search(
                     train_encs_aug, train_cats_aug,
                     valid_encs, valid_cats,
                     min_k=1,
                     max_k=max_k
                 )
+                classifier_fit_s += time.perf_counter() - fit_start
                 #best_k = best_k_result['best_k']
                 #best_mcc = best_k_result['best_mcc']
                 
@@ -2889,8 +3138,10 @@ class TrainAE:
                 print(f"Auto-selected k={best_k} with validation MCC={best_mcc:.4f}")
             else:
                 print("Auto-select k skipped due to lack of validation encodings or training encodings.")
+        elif self.args.auto_select_k and group == 'valid' and siamese_inference != 'knn':
+            print(f"Auto-select k skipped because siamese_inference={siamese_inference}; KNN k-search only applies to siamese_inference=knn.")
 
-
+        self._last_classifier_fit_s = classifier_fit_s
         return None, lists, traces, embedding_classifier if embedding_classifier is not None else KNeighborsClassifier
 
     def predict_prototypes(self, group, loader, lists, traces):
@@ -2930,7 +3181,7 @@ class TrainAE:
             data, names, labels, _, old_labels, domain, to_rec, not_to_rec, pos_batch_sample, neg_batch_sample = batch
             data = data.to(self.args.device).float()
             to_rec = to_rec.to(self.args.device).float()
-            domains = to_categorical(domain.long(), self.n_batches).squeeze().float().to(self.args.device)
+            domains = to_categorical(domain.long(), self.n_batches).float().to(self.args.device)
             with self._autocast_context():
                 enc, dpreds = self.model(data)
             if self.args.classif_loss not in ['ce', 'hinge']:
@@ -2960,7 +3211,7 @@ class TrainAE:
             dpreds_np = _tensor_to_numpy(dpreds)
             enc_np = _tensor_to_numpy(enc.view(enc.shape[0], -1))
 
-            lists[group]['domains'] += [np.array([self.unique_batches[np.argmax(d)] for d in domain_np])]
+            lists[group]['domains'] += [self._batch_encoder.inverse_transform([np.argmax(d) for d in domain_np])]
             lists[group]['classes'] += [label_np]
             lists[group]['encoded_values'] += [enc_np]
 
@@ -3062,9 +3313,7 @@ class TrainAE:
         all_names = np.concatenate([self.all_samples['names'][group] for group in groups])
         all_subcenters = np.concatenate([self.all_samples['subcenters'][group] for group in groups])
         all_batches = np.concatenate([self.all_samples['batches'][group] for group in groups])
-        all_batches_cat = np.array([
-            np.argwhere(x == self.unique_batches) for x in all_batches
-        ]).flatten()
+        all_batches_cat = self._batch_encoder.transform(all_batches)
         
         # Perform K-Means clustering with sub-centers as initial centroids
         subcenters = self.model.get_subcenters().detach().cpu().numpy()
@@ -3272,6 +3521,196 @@ class TrainAE:
             means[label] = np.mean(encodings[inds], axis=0)
         self.means = means
 
+    def _append_to_group(self, target_group, values_by_key):
+        for key, values in values_by_key.items():
+            if len(values) == 0:
+                continue
+            selected = np.concatenate(values, axis=0)
+            current = self.data[key][target_group]
+            if len(current) == 0:
+                self.data[key][target_group] = selected
+            else:
+                self.data[key][target_group] = np.concatenate((current, selected), axis=0)
+
+    def _label_counts(self, labels):
+        labels_arr = np.asarray(labels)
+        return {
+            str(label): int(np.sum(labels_arr == label))
+            for label in np.unique(labels_arr)
+        }
+
+    def _cat_counts(self, cats):
+        cats_arr = np.asarray(cats).reshape(-1)
+        return {
+            str(self.unique_labels[int(cat)] if 0 <= int(cat) < len(self.unique_labels) else cat): int(np.sum(cats_arr == cat))
+            for cat in np.unique(cats_arr)
+        }
+
+    def _roc_auc_present_classes(self, cats, scores, group):
+        cats_arr = np.asarray(cats).reshape(-1).astype(int)
+        scores_arr = np.asarray(scores)
+        present = np.unique(cats_arr)
+        if len(present) < 2:
+            raise ValueError(
+                f"Cannot compute {group} ROC AUC because only one class is present. "
+                f"Observed counts: {self._cat_counts(cats_arr)}"
+            )
+        if len(present) == 2:
+            positive_class = int(present[1])
+            return metrics.roc_auc_score(
+                (cats_arr == positive_class).astype(int),
+                scores_arr[:, positive_class],
+            )
+
+        present_scores = scores_arr[:, present]
+        row_sums = present_scores.sum(axis=1, keepdims=True)
+        present_scores = np.divide(
+            present_scores,
+            row_sums,
+            out=np.full_like(present_scores, 1.0 / len(present), dtype=float),
+            where=row_sums != 0,
+        )
+        remap = {int(label): idx for idx, label in enumerate(present)}
+        present_y = np.array([remap[int(label)] for label in cats_arr])
+        return metrics.roc_auc_score(
+            to_categorical(present_y, len(present)),
+            present_scores,
+            multi_class='ovr',
+        )
+
+    def _validate_split_class_counts(self, context):
+        problems = {}
+        counts_by_group = {}
+        for group in ['train', 'valid', 'test']:
+            counts = self._label_counts(self.data['labels'][group])
+            counts_by_group[group] = counts
+            if len(counts) < 2:
+                problems[group] = counts
+        if problems:
+            raise ValueError(
+                f"Invalid split after {context}: train/valid/test must each contain at least two classes. "
+                f"Problem groups: {problems}. All counts: {counts_by_group}"
+            )
+
+    def _validate_eval_labels_seen_in_train(self):
+        train_labels = set(np.asarray(self.data['labels']['train']).tolist())
+        problems = {}
+        for group in ['valid', 'test']:
+            group_labels = set(np.asarray(self.data['labels'][group]).tolist())
+            missing = sorted(str(label) for label in group_labels if label not in train_labels)
+            if missing:
+                problems[group] = missing
+        if problems:
+            raise ValueError(
+                "Invalid split: every valid/test label must be present in train. "
+                f"Missing train labels by split: {problems}"
+            )
+
+    def _apply_calibration_split(self, data_getter):
+        n_calibration = int(getattr(self.args, 'n_calibration', 0) or 0)
+        if n_calibration == 0:
+            return
+
+        source_groups = ['valid', 'test']
+        labels = [
+            label for label in list(self.unique_labels)
+            if any(np.any(np.asarray(self.data['labels'][group]) == label) for group in source_groups)
+        ]
+        if not labels:
+            raise ValueError("Cannot build calibration split because valid/test contain no labels.")
+
+        if n_calibration < len(labels):
+            raise ValueError(
+                f"n_calibration={n_calibration} is too small for {len(labels)} classes. "
+                "Use at least one calibration sample per valid/test class, or set n_calibration=0."
+            )
+
+        available = {label: {group: [] for group in source_groups} for label in labels}
+        for group in source_groups:
+            group_labels = np.asarray(self.data['labels'][group])
+            for label in labels:
+                for idx in np.where(group_labels == label)[0]:
+                    available[label][group].append(int(idx))
+
+        base = n_calibration // len(labels)
+        remainder = n_calibration % len(labels)
+        requested_by_label = {
+            label: base + (1 if i < remainder else 0)
+            for i, label in enumerate(labels)
+        }
+        shortages = {
+            str(label): {
+                'requested': requested_by_label[label],
+                'available': sum(len(available[label][group]) for group in source_groups),
+                'available_by_split': {group: len(available[label][group]) for group in source_groups},
+            }
+            for label in labels
+            if sum(len(available[label][group]) for group in source_groups) < requested_by_label[label]
+        }
+        if shortages:
+            raise ValueError(
+                "Cannot build calibration split from valid/test with the requested n_calibration. "
+                f"Per-class availability: {shortages}"
+            )
+
+        rng = np.random.default_rng(int(getattr(self.args, 'seed', 42)))
+        selected_by_group = {group: [] for group in source_groups}
+        for label in labels:
+            label_choices = []
+            for group in source_groups:
+                label_choices.extend((group, idx) for idx in available[label][group])
+            chosen_positions = rng.choice(
+                len(label_choices),
+                size=requested_by_label[label],
+                replace=False,
+            )
+            for pos in chosen_positions:
+                group, idx = label_choices[int(pos)]
+                selected_by_group[group].append(idx)
+
+        calibration_values = {key: [] for key in ['inputs', 'labels', 'old_labels', 'names', 'cats', 'batches']}
+        train_append_values = {key: [] for key in ['inputs', 'labels', 'old_labels', 'names', 'cats', 'batches']}
+        for group in source_groups:
+            selected = np.array(sorted(set(selected_by_group[group])), dtype=int)
+            if selected.size == 0:
+                continue
+            for key in calibration_values:
+                selected_values = self.data[key][group][selected]
+                calibration_values[key].append(selected_values)
+                if group != 'train':
+                    train_append_values[key].append(selected_values)
+            if group != 'train':
+                keep_mask = np.ones(len(self.data['labels'][group]), dtype=bool)
+                keep_mask[selected] = False
+                for key in calibration_values:
+                    self.data[key][group] = self.data[key][group][keep_mask]
+
+        self._append_to_group('calibration', calibration_values)
+        self._append_to_group('train', train_append_values)
+
+        actual = len(self.data['labels']['calibration'])
+        if actual != n_calibration:
+            raise RuntimeError(
+                f"Calibration split construction mismatch: requested {n_calibration}, built {actual}."
+            )
+
+        if data_getter is not None and getattr(data_getter, 'manifest_dir', None) is not None:
+            data_getter.data = self.data
+            data_getter.save_split_manifests(data_getter.manifest_dir)
+            calibration_manifest = os.path.join(data_getter.manifest_dir, 'splits', 'calibration.csv')
+            pd.DataFrame({
+                'name': self.data['names']['calibration'],
+                'label': self.data['labels']['calibration'],
+                'batch': self.data['batches']['calibration'],
+            }).to_csv(calibration_manifest, index=False)
+
+        counts = {
+            str(label): int(np.sum(np.asarray(self.data['labels']['calibration']) == label))
+            for label in labels
+        }
+        sources = {group: int(len(set(selected_by_group[group]))) for group in source_groups}
+        print(f"[CalibrationSplit] n_calibration={n_calibration} labels={list(map(str, labels))} counts={counts} sources={sources}")
+
     def setup_training_objects(self, params):
         # Assign hyperparameters
         self.params = params
@@ -3330,8 +3769,20 @@ class TrainAE:
             os.makedirs(self.complete_log_path, exist_ok=True)
 
         data_getter = GetData(self.path, self.args.valid_dataset, self.args, manifest_dir=self.complete_log_path)
+        split_debug = getattr(data_getter, 'split_debug', {}) or {}
+        if split_debug.get('effective_train_datasets') is not None:
+            self.args.effective_train_datasets = _normalize_train_datasets(split_debug.get('effective_train_datasets'))
+        if split_debug.get('effective_valid_dataset') is not None:
+            self.args.effective_valid_dataset = _normalize_single_dataset(split_debug.get('effective_valid_dataset'))
+        if split_debug.get('effective_test_dataset') is not None:
+            self.args.effective_test_dataset = _normalize_single_dataset(split_debug.get('effective_test_dataset'))
         self.unique_labels = data_getter.unique_labels
         self.unique_batches = data_getter.unique_batches
+        # self._batch_encoder should be defined only once, in __init__
+        if not hasattr(self, '_batch_encoder') or self._batch_encoder is None:
+            from sklearn.preprocessing import LabelEncoder
+            self._batch_encoder = LabelEncoder()
+            self._batch_encoder.fit(self.unique_batches)
         
         proto_strategy = getattr(self.args, 'prototype_strategy', 'mean')
         proto_components = getattr(self.args, 'prototype_components', 1)
@@ -3344,6 +3795,10 @@ class TrainAE:
         )
         
         self.data, self.unique_labels, self.unique_batches = data_getter.get_variables()
+        self._validate_split_class_counts('initial split')
+        self._validate_eval_labels_seen_in_train()
+        self._apply_calibration_split(data_getter)
+        self._validate_split_class_counts('calibration split')
         self.make_samples_weights()
         self.set_arcloss()
 
@@ -3366,6 +3821,7 @@ class TrainAE:
             'batch': self.batch_prototypes
         }
         loaders = get_images_loaders(data=self.data,
+                                     batch_encoder=self._batch_encoder,
                                         random_recs=self.args.random_recs,
                                         weighted_sampler=self.args.weighted_sampler,
                                         is_transform=params['is_transform'],
@@ -3422,7 +3878,7 @@ if __name__ == "__main__":
     parser.add_argument('--task', type=str, default='notNormal', help='Binary classification?')
     parser.add_argument('--is_stn', type=int, default=1, help='Transform train data?')
     parser.add_argument('--weighted_sampler', type=int, default=1, help='Weighted sampler?')
-    parser.add_argument('--n_calibration', type=int, default=0, help='n_calibration - NOT optimized, fixed at 0')
+    parser.add_argument('--n_calibration', type=int, default=0, help='Number of balanced calibration samples to draw from valid/test (0 disables calibration)')
     parser.add_argument('--remove_noisy_samples', type=int, default=0, help='Remove noisy samples?')
     parser.add_argument('--noisy_cluster_limit', type=int, default=10, help='Noisy cluster limit?')
     parser.add_argument('--prototypes_to_use', type=str, default=None, help='Which prototypes - if None, will optimize')
@@ -3442,8 +3898,8 @@ if __name__ == "__main__":
     parser.add_argument('--epsilon', type=float, default=0.1, help='Epsilon for FGSM')
     parser.add_argument('--n_neighbors', type=int, default=1, help='Number of neighbors for KNN evaluation')
     parser.add_argument('--valid_dataset', type=str, default='Banque_Viscaino_Chili_2020', help='Validation dataset')
-    parser.add_argument('--train_datasets', type=str, default='', help='Optional comma-separated training datasets. If empty, all datasets except valid/test are used.')
-    parser.add_argument('--test_dataset', type=str, default='', help='Optional dedicated test dataset. If omitted or unavailable, half of the validation set is used as test.')
+    parser.add_argument('--train_datasets', type=str, default='Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM,GMFUNL_jan2023', help='Optional comma-separated training datasets. If empty, all datasets except valid/test are used.')
+    parser.add_argument('--test_dataset', type=str, default='inference', help='Optional dedicated test dataset. If omitted or unavailable, half of the validation set is used as test.')
     parser.add_argument('--new_size', type=int, default=64, help='New size for images')
     parser.add_argument('--normalize', type=str, default=None, help='Normalize images - if None, will optimize')
     parser.add_argument('--n_aug', type=int, default=1, help='Number of augmentations per image (1=original only)')
@@ -3452,6 +3908,7 @@ if __name__ == "__main__":
     parser.add_argument('--run_tag', type=str, default='prod', help='Tag to identify run type in logs/MLOps (e.g., TEST_SMOKE)')
     parser.add_argument('--trial_index', type=int, default=0, help='Current trial index when launched by an external scheduler')
     parser.add_argument('--reset_opt_state', type=int, default=0, help='Reset Bayesian optimization state and start from scratch (0/1)')
+    parser.add_argument('--force_retrain', type=int, default=0, help='Force fresh training from best parameters in resume final-pass, skipping checkpoint reuse (0/1)')
     parser.add_argument('--log_tracking', type=int, default=0, help='Enable Tracking logging (0/1)')
     parser.add_argument('--log_comet', type=int, default=1, help='Enable Comet logging (0/1)')
     parser.add_argument('--log_mlflow', type=int, default=0, help='Enable MLflow logging (0/1)')
@@ -3465,7 +3922,18 @@ if __name__ == "__main__":
     parser.add_argument('--amp', type=int, default=1, help='Enable CUDA automatic mixed precision (0/1)')
     parser.add_argument('--amp_dtype', type=str, default='bf16', choices=['bf16', 'fp16'], help='AMP dtype to use on CUDA')
 
+
     args = parser.parse_args()
+
+    # Allow environment variable override for num_workers
+    env_num_workers = os.environ.get("NUM_WORKERS")
+    if env_num_workers is not None:
+        try:
+            args.num_workers = int(env_num_workers)
+            print(f"[INFO] Overriding num_workers from environment: {args.num_workers}")
+        except Exception:
+            print(f"[WARN] Invalid NUM_WORKERS env var: {env_num_workers}")
+
     _set_global_seeds(getattr(args, 'seed', 1), deterministic=True)
     args.exp_id = f'{args.exp_id}_{args.task}_{args.run_tag}'
     
@@ -3489,15 +3957,13 @@ if __name__ == "__main__":
         args.normalize = None
     
     # Mark which ones are None before applying defaults
-    # NOTE: n_calibration is NEVER optimized - it stays at 0
+    # n_calibration is fixed by the CLI and is never optimized.
     if args.dloss is None:
         optimize_params['dloss'] = True
         args.dloss = "inverseTriplet"
     if args.classif_loss is None:
         optimize_params['classif_loss'] = True
         args.classif_loss = "softmax_contrastive"
-    # Always keep n_calibration at 0 - never optimize it
-    args.n_calibration = 0
     if args.prototypes_to_use is None:
         optimize_params['prototypes_to_use'] = True
         args.prototypes_to_use = "no"
@@ -3513,6 +3979,14 @@ if __name__ == "__main__":
     if args.normalize is None:
         optimize_params['normalize'] = True
         args.normalize = "no"
+    args = validate_n_calibration(args)
+    args = disable_stn_when_unsupported(args)
+    if int(getattr(args, 'auto_select_k', 0) or 0) and str(getattr(args, 'siamese_inference', 'linearsvc')).strip().lower() != 'knn':
+        print(
+            f"[Config] Disabling auto_select_k because siamese_inference={args.siamese_inference}; "
+            "KNN k-search only applies when siamese_inference=knn."
+        )
+        args.auto_select_k = 0
     
     try:
         mlflow.create_experiment(
@@ -3894,7 +4368,7 @@ if __name__ == "__main__":
     # Loading best model that was saved during training
     # Build params path consistent with save_best_run()
     try:
-        ds_part = train.path.split("/")[-1]
+        ds_part = _dataset_path_segment(train.path)
     except Exception:
         ds_part = "otite_ds_64"
     # Use best parameters if available to build the search path accurately
@@ -3913,7 +4387,8 @@ if __name__ == "__main__":
         f"npos{best_npos}/nneg{best_nneg}"
     )
 
-    # Prefer fully specified path with norm/dist/knn; else find any model.pth under base_dir; else fallback to current run
+    # Prefer fully specified path with norm/dist/knn; else find any model.pth under base_dir; else fallback to current run.
+    # Include cached completed trial paths so resume-with-0-trials can still run final evaluation.
     candidate_paths = []
     full_dir = os.path.join(
         base_dir,
@@ -3921,26 +4396,175 @@ if __name__ == "__main__":
         f"dist_{best_dist}",
         f"knn{best_knn}"
     )
-    # Prefer Optuna-recorded trial path if available
+    # Prefer Optuna-recorded best trial path if available.
     if best_trial:
         best_log_path = best_trial.user_attrs.get("complete_log_path")
         if best_log_path:
             candidate_paths.append(os.path.join(best_log_path, "model.pth"))
 
+    # Also consider all completed Optuna trials (highest score first), because older studies
+    # may have a best trial without complete_log_path in user attrs.
+    try:
+        complete_trials = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+        ]
+        complete_trials.sort(key=lambda t: float(t.value), reverse=True)
+        for t in complete_trials:
+            t_log_path = t.user_attrs.get("complete_log_path")
+            if t_log_path:
+                candidate_paths.append(os.path.join(str(t_log_path), "model.pth"))
+    except Exception:
+        pass
+
+    # Include local JSON cache entries from completed trials.
+    try:
+        cached_completed = [r for r in trial_cache_rows if r.get('status') == 'completed']
+        cached_completed.sort(key=lambda r: float(r.get('score', -1e9)), reverse=True)
+        for r in cached_completed:
+            cached_log_path = r.get('complete_log_path')
+            if cached_log_path:
+                candidate_paths.append(os.path.join(str(cached_log_path), "model.pth"))
+    except Exception:
+        pass
+
     candidate_paths.append(os.path.join(full_dir, "model.pth"))
 
-    found_model_path = None
+
+    def _datasets_match(meta, args):
+        def _as_dataset_list(value):
+            if value is None:
+                return []
+            if isinstance(value, (list, tuple, set, np.ndarray)):
+                raw_parts = [str(x).strip() for x in value]
+            else:
+                raw_parts = [x.strip() for x in str(value).replace(';', ',').split(',')]
+            return [x.lower() for x in raw_parts if x and x.lower() not in {'none', 'nan', 'null'}]
+
+        def _single_dataset(value):
+            items = _as_dataset_list(value)
+            if not items:
+                return ""
+            if len(items) == 1:
+                return items[0]
+            return ",".join(items)
+
+        meta_args = meta.get('args') if isinstance(meta.get('args'), dict) else {}
+
+        # Prefer effective split fields when present; fall back to explicit split fields.
+        meta_train = _as_dataset_list(meta_args.get('effective_train_datasets', meta.get('train_datasets')))
+        meta_valid = _single_dataset(meta_args.get('effective_valid_dataset', meta.get('valid_dataset')))
+        meta_test = _single_dataset(meta_args.get('effective_test_dataset', meta.get('test_dataset')))
+
+        arg_train = _as_dataset_list(
+            getattr(args, 'effective_train_datasets', None) or getattr(args, 'train_datasets', '')
+        )
+        arg_valid = _single_dataset(
+            getattr(args, 'effective_valid_dataset', None) or getattr(args, 'valid_dataset', '')
+        )
+        arg_test = _single_dataset(
+            getattr(args, 'effective_test_dataset', None) or getattr(args, 'test_dataset', '')
+        )
+
+        checks = []
+        if meta_train and arg_train:
+            checks.append(sorted(meta_train) == sorted(arg_train))
+        if meta_valid and arg_valid:
+            checks.append(meta_valid == arg_valid)
+        if meta_test and arg_test:
+            checks.append(meta_test == arg_test)
+
+        # If metadata does not include split fields, do not block checkpoint reuse.
+        if not checks:
+            return True
+        return all(checks)
+
+    expected_split_segment = (_split_config_from_args(train.args) or {}).get('split_segment', '')
+
+    def _path_matches_expected_split(model_path):
+        if not expected_split_segment:
+            return True
+        normalized = os.path.abspath(str(model_path)).replace('\\', '/')
+        return f"/{expected_split_segment}/" in f"/{normalized}/"
+
+    def _path_matches_checkpoint_filters(model_path):
+        return _path_matches_expected_split(model_path)
+
+    if int(getattr(train.args, 'force_retrain', 0) or 0):
+        print(
+            "[CheckpointLoad] force_retrain=1: skipping checkpoint reuse and "
+            "training a fresh model from best parameters."
+        )
+        retrain_params = dict(best_parameters) if isinstance(best_parameters, dict) else {}
+        train.train(retrain_params)
+        print("[CheckpointLoad] Forced retraining completed. Exiting resume final-pass path.")
+        sys.exit(0)
+
+    # De-duplicate candidate paths while preserving priority.
+    dedup_candidate_paths = []
+    seen_candidate_paths = set()
     for p in candidate_paths:
-        if os.path.exists(p):
-            found_model_path = p
-            break
+        if not p:
+            continue
+        key = os.path.abspath(str(p))
+        if key in seen_candidate_paths:
+            continue
+        seen_candidate_paths.add(key)
+        dedup_candidate_paths.append(str(p))
+    candidate_paths = dedup_candidate_paths
+
+    found_model_path = None
+    weak_model_path = None
+    for p in candidate_paths:
+        if not _path_matches_checkpoint_filters(p):
+            continue
+        meta_path = os.path.join(os.path.dirname(p), 'run_metadata.json')
+        if not os.path.exists(p):
+            continue
+        if not os.path.exists(meta_path):
+            if weak_model_path is None:
+                weak_model_path = p
+            continue
+        try:
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+            if _datasets_match(meta, train.args):
+                found_model_path = p
+                break
+            if weak_model_path is None:
+                weak_model_path = p
+        except Exception as e:
+            print(f"Warning: Could not read metadata {meta_path}: {e}")
+            if weak_model_path is None:
+                weak_model_path = p
+    # Fallback: search all model.pth under base_dir and check metadata
     if found_model_path is None and os.path.isdir(base_dir):
         for root, dirs, files in os.walk(base_dir):
             if "model.pth" in files:
-                found_model_path = os.path.join(root, "model.pth")
-                break
+                meta_path = os.path.join(root, 'run_metadata.json')
+                candidate = os.path.join(root, "model.pth")
+                if not _path_matches_checkpoint_filters(candidate):
+                    continue
+                if not os.path.exists(meta_path):
+                    if weak_model_path is None:
+                        weak_model_path = candidate
+                    continue
+                try:
+                    with open(meta_path, 'r') as f:
+                        meta = json.load(f)
+                    if _datasets_match(meta, train.args):
+                        found_model_path = candidate
+                        break
+                    if weak_model_path is None:
+                        weak_model_path = candidate
+                except Exception as e:
+                    print(f"Warning: Could not read metadata {meta_path}: {e}")
+                    if weak_model_path is None:
+                        weak_model_path = candidate
+    if found_model_path is None and weak_model_path is not None:
+        found_model_path = weak_model_path
+    # Last resort: use current training run's complete path
     if found_model_path is None:
-        # last resort: use current training run's complete path
         found_model_path = f"{train.complete_log_path}/model.pth"
 
     if found_model_path is None or not os.path.exists(found_model_path):
@@ -3952,28 +4576,51 @@ if __name__ == "__main__":
         print("[Optuna Resume] Model attributes missing (all trials reused). Initializing minimal state for final evaluation...")
         data_getter, loaders = train.setup_training_objects(best_parameters)
 
-    train.model.load_state_dict(
-        torch.load(
-            found_model_path,
-            map_location=train.args.device
-        )
+    checkpoint_state = torch.load(
+        found_model_path,
+        map_location=train.args.device
     )
+
+    def _strict_load_or_retrain_from_scratch(model, state_dict, model_name):
+        try:
+            model.load_state_dict(state_dict)
+            return
+        except RuntimeError as strict_exc:
+            print(
+                f"[CheckpointLoad] {model_name}: strict load failed due to shape mismatch. "
+                "Training a new model from scratch with the selected best parameters."
+            )
+            print(f"[CheckpointLoad] Source checkpoint: {found_model_path}")
+            print(f"[CheckpointLoad] Runtime error: {strict_exc}")
+
+            retrain_params = dict(best_parameters) if isinstance(best_parameters, dict) else {}
+            try:
+                train.train(retrain_params)
+            except Exception as retrain_exc:
+                raise RuntimeError(
+                    "Checkpoint shape mismatch detected, and fallback retraining from scratch failed."
+                ) from retrain_exc
+
+            print(
+                "[CheckpointLoad] Retraining from scratch completed successfully. "
+                "Exiting resume final-pass path to avoid mixing old and new checkpoints."
+            )
+            sys.exit(0)
+
+    _strict_load_or_retrain_from_scratch(train.model, checkpoint_state, "train.model")
     # Need another model because the other can't be used to get shap values
     train.model.eval()
     if train.run_explainability and train.shap_model is not None:
-        train.shap_model.load_state_dict(
-            torch.load(
-                found_model_path,
-                map_location=train.args.device
-            )
-        )
+        _strict_load_or_retrain_from_scratch(train.shap_model, checkpoint_state, "train.shap_model")
         train.shap_model.eval()
     prototypes = {
         'combined': train.combined_prototypes,
         'class': train.class_prototypes,
         'batch': train.batch_prototypes,
     }
+    
     loaders = get_images_loaders(data=train.data,
+                                 batch_encoder=train._batch_encoder,
                                     random_recs=train.args.random_recs,
                                     weighted_sampler=train.args.weighted_sampler,
                                     is_transform=1,
@@ -3990,11 +4637,14 @@ if __name__ == "__main__":
                                     )
     print("\n========== POST-OPTIMIZATION FINAL EVALUATION ==========")
     print("Evaluating best checkpoint with train loop snapshot + train/valid/test predictions...")
+    best_lists = {}
     with torch.no_grad():
-        _, best_lists1, _ = train.loop('train', None, train.params['gamma'], loaders['train'], lists, traces)
+        # Keep one loop snapshot for training dynamics, then compute inference probabilities via predict().
+        _, _, _ = train.loop('train', None, train.params['gamma'], loaders['train'], lists, traces)
         for group in ["train", "valid", "test"]:
-            _, best_lists2, traces, knn = train.predict(group, loaders[group], lists, traces)
-    best_lists = {**best_lists1, **best_lists2}
+            _, best_lists[group], traces, _ = train.predict(group, loaders[group], lists, traces)
+        
+    best_lists = {**best_lists['train'], **best_lists['valid'], **best_lists['test']}
     if train.log_comet:
         COMET_API_KEY = os.environ.get("COMET_API_KEY", "")
         COMET_PROJECT_NAME = os.environ.get("COMET_PROJECT_NAME", "otitenet")
@@ -4006,8 +4656,10 @@ if __name__ == "__main__":
         # Register all parameters (fixed and optimized) to Comet
         register_all_params_to_comet(experiment, train.args, train.best_params)
         train.log_predictions(best_lists, None, experiment, 0)
+        # Ensure classifier is defined by running predict for 'test' group
+        _, _, _, classifier = train.predict('test', loaders['test'], lists, traces)
         if train.run_explainability and train.shap_model is not None:
-            train.save_wrong_classif_imgs(experiment, {'cnn': train.shap_model, 'knn': knn}, best_lists, best_lists['test']['preds'], 
+            train.save_wrong_classif_imgs(experiment, {'cnn': train.shap_model, 'knn': classifier}, best_lists, best_lists['test']['preds'], 
                                         best_lists['test']['names'], 'test')
         else:
             print('[INFO] Explainability disabled (run_explainability=0): skipping SHAP/Grad-CAM artifact generation.')

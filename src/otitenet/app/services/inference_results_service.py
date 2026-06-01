@@ -412,12 +412,35 @@ def compute_inference_metrics(df: pd.DataFrame) -> Dict[str, Any]:
     except Exception:
         auc = np.nan
 
-    return {
+    out = {
         "ACC": acc,
         "MCC": mcc,
         "AUC": auc,
         "N": int(len(valid)),
     }
+
+    for label in sorted(set(y_true) | set(y_pred)):
+        true_pos = y_true == label
+        pred_pos = y_pred == label
+        tp = int(np.sum(true_pos & pred_pos))
+        fp = int(np.sum(~true_pos & pred_pos))
+        fn = int(np.sum(true_pos & ~pred_pos))
+        support = int(np.sum(true_pos))
+
+        precision = tp / (tp + fp) if (tp + fp) else np.nan
+        recall = tp / (tp + fn) if (tp + fn) else np.nan
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if np.isfinite(precision) and np.isfinite(recall) and (precision + recall)
+            else np.nan
+        )
+        display_label = str(label)
+        out[f"F1 {display_label}"] = f1
+        out[f"Recall {display_label}"] = recall
+        out[f"Precision {display_label}"] = precision
+        out[f"Support {display_label}"] = support
+
+    return out
 
 
 # -------------------------------------------------

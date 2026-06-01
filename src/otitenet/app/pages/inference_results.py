@@ -1,6 +1,7 @@
 """Inference Results page."""
 
 import glob
+import json
 import os
 
 import numpy as np
@@ -184,7 +185,7 @@ def render(ctx):
                         head_config = ""
                         head_label = "—"
                         head_score = np.nan
-                    performance_rows.append({
+                    perf_row = {
                         "#": rank_value,
                         "Model ID": perf_model_id,
                         "Model Name": perf_model_row.get("Model Name"),
@@ -195,7 +196,15 @@ def render(ctx):
                         "MCC": fmt_metric(metrics["MCC"]),
                         "AUC": fmt_metric(metrics["AUC"]),
                         "N analyzed": metrics["N"],
-                    })
+                    }
+                    for metric_name, metric_value in metrics.items():
+                        if metric_name in {"ACC", "MCC", "AUC", "N"}:
+                            continue
+                        if metric_name.startswith(("F1 ", "Recall ", "Precision ")):
+                            perf_row[metric_name] = fmt_metric(metric_value)
+                        elif metric_name.startswith("Support "):
+                            perf_row[metric_name] = metric_value
+                    performance_rows.append(perf_row)
             if performance_rows:
                 _top_n_perf_df = pd.DataFrame(performance_rows)
                 st.session_state["inference_topn_performance_df"] = _top_n_perf_df.copy()
@@ -360,13 +369,14 @@ def render(ctx):
                                 quiet=True,
                             )
                             pred_label, confidence, complete_log_path, _existing, gradcam_path = normalize_analysis_result(analysis_result)
+                            class_scores = analysis_result[5] if isinstance(analysis_result, (tuple, list)) and len(analysis_result) > 5 and isinstance(analysis_result[5], dict) else {}
 
                             ground_truth = inference_ground_truth(img_name, inference_dir)
                             is_correct = labels_match(pred_label, ground_truth)
                             if is_correct is True:
                                 correct_count += 1
 
-                            results.append({
+                            result_row = {
                                 'Filename': img_name,
                                 'Head': _head_config_label_global(selected_head_config),
                                 'Head Config': selected_head_config,
@@ -374,7 +384,10 @@ def render(ctx):
                                 'Prediction': pred_label,
                                 'Correct': is_correct,
                                 'Confidence': fmt_confidence(confidence),
-                            })
+                            }
+                            for label, score in class_scores.items():
+                                result_row[f"Score {label}"] = fmt_confidence(score)
+                            results.append(result_row)
 
                         accuracy = correct_count / len(results) if results else 0
 
@@ -402,23 +415,59 @@ def render(ctx):
 
             if model_id is not None and inference_filenames:
                 placeholders = ",".join(["%s"] * len(inference_filenames))
-                cursor.execute(
-                    f"""
-                    SELECT filename, pred_label, confidence, timestamp, log_path
-                    FROM results
-                    WHERE person_id=%s AND model_id=%s AND filename IN ({placeholders})
-                    ORDER BY timestamp DESC
-                    """,
-                    tuple([st.session_state.person_id, model_id] + inference_filenames),
-                )
+                try:
+                    cursor.execute(
+                        f"""
+                        SELECT filename, pred_label, confidence, timestamp, log_path, class_scores
+                        FROM results
+                        WHERE person_id=%s AND model_id=%s AND filename IN ({placeholders})
+                        ORDER BY timestamp DESC
+                        """,
+                        tuple([st.session_state.person_id, model_id] + inference_filenames),
+                    )
+                except Exception:
+                    # Backward-compatible fallback if class_scores column is unavailable.
+                    cursor.execute(
+                        f"""
+                        SELECT filename, pred_label, confidence, timestamp, log_path
+                        FROM results
+                        WHERE person_id=%s AND model_id=%s AND filename IN ({placeholders})
+                        ORDER BY timestamp DESC
+                        """,
+                        tuple([st.session_state.person_id, model_id] + inference_filenames),
+                    )
                 existing_results = cursor.fetchall()
 
             if existing_results:
                 raw_existing_count = len(existing_results)
                 existing_df = pd.DataFrame(
                     existing_results,
-                    columns=['Filename', 'Prediction', 'Confidence', 'Timestamp', 'Log Path'],
+                    columns=['Filename', 'Prediction', 'Confidence', 'Timestamp', 'Log Path', 'Class Scores'] if len(existing_results[0]) >= 6 else ['Filename', 'Prediction', 'Confidence', 'Timestamp', 'Log Path'],
                 )
+
+                score_cols = []
+                if 'Class Scores' in existing_df.columns:
+                    def _parse_scores(value):
+                        if isinstance(value, dict):
+                            return value
+                        if value in [None, "", b""]:
+                            return {}
+                        try:
+                            if isinstance(value, (bytes, bytearray)):
+                                value = value.decode('utf-8', errors='ignore')
+                            parsed = json.loads(str(value))
+                            return parsed if isinstance(parsed, dict) else {}
+                        except Exception:
+                            return {}
+
+                    parsed_score_series = existing_df['Class Scores'].apply(_parse_scores)
+                    score_labels = sorted({str(lbl) for row_scores in parsed_score_series for lbl in row_scores.keys()})
+                    for score_label in score_labels:
+                        col_name = f"Score {score_label}"
+                        existing_df[col_name] = parsed_score_series.apply(
+                            lambda row_scores: fmt_confidence(row_scores.get(score_label)) if score_label in row_scores else ""
+                        )
+                        score_cols.append(col_name)
 
                 # Keep only the most recent row per inference filename for display/counts.
                 # The results table may contain many historical rows for the same inference
@@ -466,9 +515,30 @@ def render(ctx):
                 metric_cols[2].metric("AUC", fmt_metric(selected_metrics["AUC"]))
                 metric_cols[3].metric("N analyzed", selected_metrics["N"])
 
+                per_class_metric_rows = []
+                for metric_name, metric_value in selected_metrics.items():
+                    if not metric_name.startswith(("F1 ", "Recall ", "Precision ", "Support ")):
+                        continue
+                    metric_type, class_label = metric_name.split(" ", 1)
+                    per_class_metric_rows.append(
+                        {
+                            "Class": class_label,
+                            "Metric": metric_type,
+                            "Score": metric_value if metric_type == "Support" else fmt_metric(metric_value),
+                        }
+                    )
+                if per_class_metric_rows:
+                    per_class_metrics_df = pd.DataFrame(per_class_metric_rows)
+                    per_class_metrics_df = per_class_metrics_df.pivot(
+                        index="Class",
+                        columns="Metric",
+                        values="Score",
+                    ).reset_index()
+                    st.dataframe(_arrow_safe_dataframe(per_class_metrics_df), use_container_width=True)
+
                 existing_df['Confidence'] = existing_df['Confidence'].apply(fmt_confidence)
                 existing_df = existing_df[
-                    ['Filename', 'Head', 'Head Config', 'Ground Truth', 'Prediction', 'Correct', 'Confidence', 'Top-N Correct %', 'Timestamp', 'Log Path']
+                    ['Filename', 'Head', 'Head Config', 'Ground Truth', 'Prediction', *score_cols, 'Correct', 'Confidence', 'Top-N Correct %', 'Timestamp', 'Log Path']
                 ]
 
                 st.dataframe(
@@ -497,6 +567,15 @@ def render(ctx):
                     st.markdown(f"**Prediction:** {observe_row['Prediction']}")
                     st.markdown(f"**Confidence:** {observe_row['Confidence']}")
                     st.markdown(f"**Ground Truth:** {observe_row['Ground Truth']}")
+                    observe_score_cols = [c for c in observe_row.index if str(c).startswith('Score ')]
+                    if observe_score_cols:
+                        observe_score_df = pd.DataFrame(
+                            [{
+                                'Class': str(c)[len('Score '):],
+                                'Score': observe_row[c],
+                            } for c in observe_score_cols]
+                        )
+                        st.dataframe(_arrow_safe_dataframe(observe_score_df), use_container_width=True, hide_index=True)
                     correct_value = observe_row['Correct']
                     if correct_value is True:
                         st.success("Correct: True")

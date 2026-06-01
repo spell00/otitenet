@@ -1,5 +1,6 @@
 import argparse
 import io
+import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,18 +13,23 @@ from sklearn.decomposition import PCA
 
 from otitenet.app.display_metrics import (
     _arrow_safe_dataframe,
-    _best_head_config_for_args_global,
     _head_config_label_global,
 )
 from otitenet.app.model_loading import load_model_and_prototypes
 from otitenet.app.utils import (
     _make_model_selection_key,
     _unique_preserve_order,
+    attach_task_column,
     ensure_int,
     extract_params_from_log_path,
+    filter_models_df_by_task,
+    format_classifier_config,
     get_calibration_metrics,
+    get_model_split_config,
     get_split_mcc_metrics,
+    resolve_best_classifier_config,
 )
+from otitenet.app.utils_dataset_names import get_short_dataset_name, get_short_dataset_names
 from otitenet.data.data_getters import get_images_loaders
 from otitenet.logging.metrics import MCC
 from otitenet.train.train_triplet_new import TrainAE
@@ -108,6 +114,21 @@ def _apply_model_row_to_args(args, row_dict: Dict[str, Any]):
     if proto_comp is not None:
         local_args.prototype_components = ensure_int(proto_comp)
 
+    for row_key, arg_key in {
+        "train_datasets": "train_datasets",
+        "Train Datasets": "train_datasets",
+        "valid_dataset": "valid_dataset",
+        "Valid Dataset": "valid_dataset",
+        "test_dataset": "test_dataset",
+        "Test Dataset": "test_dataset",
+    }.items():
+        if row.get(row_key) is not None:
+            setattr(local_args, arg_key, row.get(row_key))
+
+    if row.get("_split_config_in_path") or row.get("Split Segment") or row.get("split_config_key"):
+        local_args.split_config_in_path = True
+        local_args._split_config_in_path = True
+
     dataset = row.get("Dataset") or parsed.get("Dataset")
     if dataset:
         dataset = str(dataset)
@@ -124,13 +145,58 @@ def top_models_head_label(row_dict, args):
 
         head_config = row.get("Head Config")
         if head_config is None or str(head_config).strip() in {"", "nan", "None"}:
-            head_config = _best_head_config_for_args_global(local_args)
+            head_config = resolve_best_classifier_config(local_args, use_optimized=True)
+
+        metadata = _load_model_row_metadata(row)
+        metadata_args = metadata.get("args", {}) if isinstance(metadata, dict) else {}
+        kind = str(metadata_args.get("kind") or metadata.get("kind", "") if isinstance(metadata, dict) else "").strip().lower()
+        variant = str(metadata_args.get("variant") or metadata.get("variant", "") if isinstance(metadata, dict) else "").strip().lower()
+        exp_id = str(metadata_args.get("exp_id") or "").strip().lower()
+        complete_log_path = str(metadata.get("complete_log_path", "") if isinstance(metadata, dict) else "").strip().lower()
+        siamese_inference = str(metadata_args.get("siamese_inference") or getattr(local_args, "siamese_inference", "linearsvc")).strip().lower()
 
         classif_loss = str(getattr(local_args, "classif_loss", "")).lower()
-        if classif_loss in {"ce", "cross_entropy", "cross-entropy"} and str(head_config) in {"0", "0.0", "knn0", "None", ""}:
-            return "CE classifier head"
+        is_cnn_mlp = (
+            variant in {"cnn_transfer", "cnn_scratch", "mlp"}
+            or "cnn_mlp_compare" in complete_log_path
+            or ("_cnn_" in exp_id and "_siamese_" not in exp_id)
+            or ("_mlp_" in exp_id and "_siamese_" not in exp_id)
+        )
+        if is_cnn_mlp:
+            variant_label = {
+                "cnn_transfer": "CNN transfer",
+                "cnn_scratch": "CNN scratch",
+                "mlp": "MLP",
+            }.get(variant, "CNN/MLP")
+            if "_cnn_" in exp_id:
+                variant_label = "CNN transfer"
+            elif "_mlp_" in exp_id:
+                variant_label = "MLP"
+            if classif_loss in {"ce", "cross_entropy", "cross-entropy"}:
+                return f"{variant_label} CE head"
+            if classif_loss == "hinge":
+                return f"{variant_label} hinge head"
+            return f"{variant_label} classifier head"
 
-        label = _head_config_label_global(head_config)
+        if classif_loss in {"ce", "cross_entropy", "cross-entropy"} and str(head_config) in {"0", "0.0", "knn0", "None", ""}:
+            if siamese_inference == "knn":
+                return f"KNN (nn={ensure_int(row.get('N_Neighbors'))})"
+            if siamese_inference == "logisticregression":
+                return "Logistic Regression"
+            return "Linear SVC"
+
+        if head_config is None or str(head_config).strip() in {"", "nan", "None"}:
+            if siamese_inference == "knn":
+                return f"KNN (nn={ensure_int(row.get('N_Neighbors'))})"
+            if siamese_inference == "logisticregression":
+                return "Logistic Regression"
+            if siamese_inference == "mlp_head":
+                return "MLP Head"
+            return "Linear SVC"
+
+        label = format_classifier_config(head_config)
+        if not label or str(label).strip() in {"", "—", "None", "nan"}:
+            label = _head_config_label_global(head_config)
         label = label.replace("KNN (k=", "KNN (nn=")
         label = label.replace("KNN k=", "KNN (nn=")
         return label
@@ -140,6 +206,29 @@ def top_models_head_label(row_dict, args):
             return f"KNN (nn={nn})"
         except Exception:
             return "—"
+
+
+def _load_model_row_metadata(row: dict) -> dict:
+    log_path = row.get("Log Path") or row.get("log_path")
+    if not log_path:
+        return {}
+
+    candidates = [
+        os.path.join(str(log_path), "run_metadata.json"),
+        os.path.join(str(log_path), "run_summary.json"),
+    ]
+
+    for path in candidates:
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                if isinstance(payload, dict):
+                    return payload
+        except Exception:
+            continue
+
+    return {}
 
 
 # -------------------------------------------------
@@ -154,25 +243,40 @@ def _query_best_models(cursor) -> Tuple[List[tuple], bool]:
             SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg,
                    dloss, dist_fct, classif_loss, n_calibration,
                    accuracy, mcc, normalize, n_neighbors, log_path, model_rank,
-                   prototype_strategy, prototype_components
+                   prototype_strategy, prototype_components,
+                   train_datasets, valid_dataset, test_dataset, split_config_key
             FROM best_models_registry
-            WHERE model_rank IS NOT NULL
-            ORDER BY model_rank ASC
+            ORDER BY (model_rank IS NULL) ASC, model_rank ASC, mcc DESC
             """
         )
         return cursor.fetchall() or [], True
     except Exception:
-        cursor.execute(
-            """
-            SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg,
-                   dloss, dist_fct, classif_loss, n_calibration,
-                   accuracy, mcc, normalize, n_neighbors, log_path,
-                   prototype_strategy, prototype_components
-            FROM best_models_registry
-            ORDER BY mcc DESC
-            """
-        )
-        return cursor.fetchall() or [], False
+        try:
+            cursor.execute(
+                """
+                SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg,
+                       dloss, dist_fct, classif_loss, n_calibration,
+                       accuracy, mcc, normalize, n_neighbors, log_path,
+                       prototype_strategy, prototype_components,
+                       train_datasets, valid_dataset, test_dataset, split_config_key
+                FROM best_models_registry
+                ORDER BY mcc DESC
+                """
+            )
+            return cursor.fetchall() or [], False
+        except Exception:
+            cursor.execute(
+                """
+                SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg,
+                       dloss, dist_fct, classif_loss, n_calibration,
+                       accuracy, mcc, normalize, n_neighbors, log_path,
+                       prototype_strategy, prototype_components
+                FROM best_models_registry
+                ORDER BY mcc DESC
+                """
+            )
+            rows = cursor.fetchall() or []
+            return [tuple(list(row) + [None, None, None, None]) for row in rows], False
 
 
 def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.DataFrame:
@@ -182,6 +286,7 @@ def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.Data
             "NNeg", "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration",
             "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path", "#",
             "Proto_Strat", "Proto_Comp",
+            "train_datasets", "valid_dataset", "test_dataset", "split_config_key",
         ]
     else:
         columns = [
@@ -189,6 +294,7 @@ def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.Data
             "NNeg", "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration",
             "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path",
             "Proto_Strat", "Proto_Comp",
+            "train_datasets", "valid_dataset", "test_dataset", "split_config_key",
         ]
 
     if not rows:
@@ -199,29 +305,19 @@ def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.Data
     if df.empty:
         return df
 
-    group_cols = [
-        "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
-        "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration",
-        "Normalize", "N_Neighbors",
-    ]
-
-    for col in group_cols:
-        if col not in df.columns:
-            df[col] = ""
-
-    dedupe_frame = df[group_cols].copy().fillna("").astype(str)
-    df["_dedupe_key"] = dedupe_frame.apply(lambda r: "|".join(r.values.tolist()), axis=1)
-
     if "MCC" in df.columns:
         df["_mcc_numeric"] = pd.to_numeric(df["MCC"], errors="coerce").fillna(float("-inf"))
         df = df.sort_values("_mcc_numeric", ascending=False).drop(columns=["_mcc_numeric"])
 
-    df = df.drop_duplicates(subset=["_dedupe_key"], keep="first")
-    df = df.drop(columns=["_dedupe_key"], errors="ignore")
-
     if "Log Path" in df.columns:
         df = df.dropna(subset=["Log Path"])
         df = df[df["Log Path"].astype(str) != ""]
+
+    for idx, row in df.iterrows():
+        split_config = get_model_split_config(row.get("Log Path"))
+        for col in ["train_datasets", "valid_dataset", "test_dataset", "split_config_key"]:
+            if col in df.columns and (pd.isna(row.get(col)) or str(row.get(col)).strip() in {"", "None", "nan"}):
+                df.at[idx, col] = split_config.get(col)
 
     return df.reset_index(drop=True)
 
@@ -239,22 +335,65 @@ def _attach_metrics(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = np.nan
 
+    # --- Prefer classifier head metrics from optimization cache if available ---
+    try:
+        from otitenet.app.pages.learned_embedding import _get_heads_for_model_args, args_from_model_row
+    except ImportError:
+        _get_heads_for_model_args = None
+        args_from_model_row = None
+
     for idx, row in df.iterrows():
         log_path = row.get("Log Path")
-
-        split_metrics = get_split_mcc_metrics(log_path)
-        if split_metrics:
-            df.at[idx, "Train MCC"] = split_metrics.get("train_mcc", np.nan)
-            df.at[idx, "Valid MCC"] = split_metrics.get("valid_mcc", np.nan)
-            df.at[idx, "Test MCC"] = split_metrics.get("test_mcc", np.nan)
-            df.at[idx, "Train AUC"] = split_metrics.get("train_auc", np.nan)
-            df.at[idx, "Valid AUC"] = split_metrics.get("valid_auc", np.nan)
-            df.at[idx, "Test AUC"] = split_metrics.get("test_auc", np.nan)
+        # Try to get classifier head metrics from optimization cache
+        head_metrics = None
+        if _get_heads_for_model_args and args_from_model_row:
+            try:
+                model_args = args_from_model_row(argparse.Namespace(), row.to_dict())
+                head_rows, _ = _get_heads_for_model_args(model_args, row.to_dict())
+                # Pick the best head (highest Valid MCC)
+                if head_rows:
+                    best_head = max(head_rows, key=lambda r: float(r.get("Valid MCC", float('-inf')) if r.get("Valid MCC") is not None else float('-inf')))
+                    head_metrics = best_head
+            except Exception:
+                pass
+        if head_metrics:
+            df.at[idx, "Train MCC"] = head_metrics.get("Train MCC", np.nan)
+            df.at[idx, "Valid MCC"] = head_metrics.get("Valid MCC", np.nan)
+            df.at[idx, "Test MCC"] = head_metrics.get("Test MCC", np.nan)
+            df.at[idx, "Train AUC"] = head_metrics.get("Train AUC", np.nan)
+            df.at[idx, "Valid AUC"] = head_metrics.get("Valid AUC", np.nan)
+            df.at[idx, "Test AUC"] = head_metrics.get("Test AUC", np.nan)
+            # Add any extra metrics (F1, Recall, etc.)
+            for metric_name, metric_value in head_metrics.items():
+                if " F1 " in metric_name or " Recall " in metric_name or " Precision " in metric_name or " Support " in metric_name:
+                    if metric_name not in df.columns:
+                        df[metric_name] = np.nan
+                    df.at[idx, metric_name] = metric_value
+        else:
+            # Fallback to log summary metrics
+            split_metrics = get_split_mcc_metrics(log_path)
+            if split_metrics:
+                df.at[idx, "Train MCC"] = split_metrics.get("train_mcc", np.nan)
+                df.at[idx, "Valid MCC"] = split_metrics.get("valid_mcc", np.nan)
+                df.at[idx, "Test MCC"] = split_metrics.get("test_mcc", np.nan)
+                df.at[idx, "Train AUC"] = split_metrics.get("train_auc", np.nan)
+                df.at[idx, "Valid AUC"] = split_metrics.get("valid_auc", np.nan)
+                df.at[idx, "Test AUC"] = split_metrics.get("test_auc", np.nan)
+                for metric_name, metric_value in split_metrics.items():
+                    if " F1 " in metric_name or " Recall " in metric_name or " Precision " in metric_name or " Support " in metric_name:
+                        if metric_name not in df.columns:
+                            df[metric_name] = np.nan
+                        df.at[idx, metric_name] = metric_value
 
         calibration_metrics = get_calibration_metrics(log_path)
         if calibration_metrics and not calibration_metrics.get("error"):
             df.at[idx, "ECE"] = calibration_metrics.get("ece", np.nan)
             df.at[idx, "Brier"] = calibration_metrics.get("brier", np.nan)
+
+    if "Valid MCC" in df.columns and "MCC" in df.columns:
+        df["Valid MCC"] = pd.to_numeric(df["Valid MCC"], errors="coerce").fillna(
+            pd.to_numeric(df["MCC"], errors="coerce")
+        )
 
     valid_sort = pd.to_numeric(df.get("Valid MCC"), errors="coerce")
     mcc_sort = pd.to_numeric(df.get("MCC"), errors="coerce")
@@ -282,28 +421,39 @@ def _order_model_columns(df: pd.DataFrame) -> pd.DataFrame:
         "Train AUC", "Valid AUC", "Test AUC",
         "ECE", "Brier",
     ]
+    per_class_cols = [
+        c for c in df.columns
+        if " F1 " in c or " Recall " in c or " Precision " in c or " Support " in c
+    ]
 
     ordered_cols = []
     if "#" in df.columns:
         ordered_cols.append("#")
 
     preferred_non_metric = [
-        "Model ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
+        "Model ID", "Task", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
         "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration", "Normalize",
-        "N_Neighbors", "Proto_Strat", "Proto_Comp", "Log Path",
+        "N_Neighbors", "Proto_Strat", "Proto_Comp",
+        "train_datasets", "valid_dataset", "test_dataset",
+        "Source", "Log Path",
     ]
 
     ordered_cols += [c for c in preferred_non_metric if c in df.columns and c not in ordered_cols]
     ordered_cols += [c for c in metric_cols if c in df.columns and c not in ordered_cols]
+    ordered_cols += [c for c in sorted(per_class_cols) if c not in ordered_cols]
     ordered_cols += [c for c in df.columns if c not in ordered_cols]
 
     return df[ordered_cols]
 
 
-def load_best_models_table(cursor) -> pd.DataFrame:
+def load_best_models_table(cursor, task: Optional[str] = None) -> pd.DataFrame:
     rows, use_db_rank = _query_best_models(cursor)
     df = _models_dataframe_from_rows(rows, use_db_rank)
+    if df.empty:
+        return df
 
+    df = attach_task_column(df)
+    df = filter_models_df_by_task(df, task)
     if df.empty:
         return df
 
@@ -613,7 +763,7 @@ def compute_pca_for_args(_args, proto_strategies=None, proto_components=1):
 # -------------------------------------------------
 
 def _render_top_models_table(models_df: pd.DataFrame, args) -> None:
-    st.write("**Top Models (best per parameter combination):**")
+    st.write("**Top Models (all registry rows):**")
     st.markdown("**Table:** Top Models")
 
     display_columns = [
@@ -626,6 +776,11 @@ def _render_top_models_table(models_df: pd.DataFrame, args) -> None:
         lambda r: top_models_head_label(r.to_dict(), args),
         axis=1,
     )
+    # Add short name columns for datasets if present
+    for col in ["train_datasets", "valid_dataset", "test_dataset", "Train Datasets", "Valid Dataset", "Test Dataset"]:
+        if col in display_df.columns:
+            short_col = f"Short {col.replace('_', ' ').title()}"
+            display_df[short_col] = display_df[col].apply(get_short_dataset_names)
 
     cols_now = list(display_df.columns)
     if "Head" in cols_now:
@@ -641,32 +796,87 @@ def _render_calibration_vs_performance(models_df: pd.DataFrame) -> None:
     st.markdown("---")
     st.subheader("📈 Calibration vs Performance")
 
-    plot_df = models_df.dropna(subset=["MCC", "ECE", "Brier"]).copy()
+    plot_df = models_df.copy()
+    calibration_errors = []
+    calibration_missing = 0
+    # Ensure ECE and Brier columns exist and are numeric, compute if missing
+    for idx, row in plot_df.iterrows():
+        for col, metric_key in [("ECE", "ece"), ("Brier", "brier")]:
+            val = row.get(col, np.nan)
+            if pd.isna(val):
+                log_path = row.get("Log Path")
+                if log_path:
+                    metrics = get_calibration_metrics(log_path)
+                    if metrics and not metrics.get("error"):
+                        plot_df.at[idx, "ECE"] = metrics.get("ece", np.nan)
+                        plot_df.at[idx, "Brier"] = metrics.get("brier", np.nan)
+                    elif metrics and metrics.get("error"):
+                        calibration_errors.append({
+                            "Model ID": row.get("Model ID"),
+                            "Model": row.get("Model Name"),
+                            "Reason": metrics.get("error"),
+                            "Log Path": log_path,
+                        })
+                    else:
+                        calibration_missing += 1
+                else:
+                    calibration_missing += 1
+    for col in ["ECE", "Brier"]:
+        if col not in plot_df.columns:
+            plot_df[col] = np.nan
+        plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+    if "Valid MCC" in plot_df.columns:
+        plot_df["Calibration Plot MCC"] = pd.to_numeric(plot_df["Valid MCC"], errors="coerce")
+    else:
+        plot_df["Calibration Plot MCC"] = np.nan
+    if "MCC" in plot_df.columns:
+        plot_df["Calibration Plot MCC"] = plot_df["Calibration Plot MCC"].fillna(
+            pd.to_numeric(plot_df["MCC"], errors="coerce")
+        )
+    plot_df = plot_df.dropna(subset=["Calibration Plot MCC", "ECE", "Brier"]).copy()
+
+    st.caption(
+        f"Calibration points available: {len(plot_df)} / {len(models_df)} models. "
+        "A point requires saved validation probabilities in valid_predictions.csv."
+    )
 
     if plot_df.empty:
         st.info("Calibration metrics not available for plotting. Run models to compute ECE and Brier scores.")
+        if calibration_errors or calibration_missing:
+            with st.expander("Calibration rows skipped"):
+                rows = calibration_errors[:]
+                if calibration_missing:
+                    rows.append({"Reason": f"{calibration_missing} rows had no valid_predictions.csv calibration artifact"})
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
         return
 
     col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown("**MCC vs ECE**")
+        st.markdown("**Valid MCC vs ECE**")
         fig, ax = plt.subplots(figsize=(6, 3.5))
-        ax.scatter(plot_df["MCC"], plot_df["ECE"], alpha=0.6, s=50)
-        ax.set_xlabel("MCC (higher is better)", fontsize=10)
+        ax.scatter(plot_df["Calibration Plot MCC"], plot_df["ECE"], alpha=0.6, s=50)
+        ax.set_xlabel("Valid MCC (higher is better)", fontsize=10)
         ax.set_ylabel("ECE (lower is better)", fontsize=10)
-        ax.set_title("Expected Calibration Error vs MCC", fontsize=11)
+        ax.set_title("Expected Calibration Error vs Valid MCC", fontsize=11)
         ax.grid(True, alpha=0.3)
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
 
+    if calibration_errors or calibration_missing:
+        with st.expander("Calibration rows skipped"):
+            rows = calibration_errors[:]
+            if calibration_missing:
+                rows.append({"Reason": f"{calibration_missing} rows had no valid_predictions.csv calibration artifact"})
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
     with col2:
-        st.markdown("**MCC vs Brier Score**")
+        st.markdown("**Valid MCC vs Brier Score**")
         fig, ax = plt.subplots(figsize=(6, 3.5))
-        ax.scatter(plot_df["MCC"], plot_df["Brier"], alpha=0.6, s=50)
-        ax.set_xlabel("MCC (higher is better)", fontsize=10)
+        ax.scatter(plot_df["Calibration Plot MCC"], plot_df["Brier"], alpha=0.6, s=50)
+        ax.set_xlabel("Valid MCC (higher is better)", fontsize=10)
         ax.set_ylabel("Brier Score (lower is better)", fontsize=10)
-        ax.set_title("Brier Score vs MCC", fontsize=11)
+        ax.set_title("Brier Score vs Valid MCC", fontsize=11)
         ax.grid(True, alpha=0.3)
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
@@ -1052,6 +1262,9 @@ def _render_model_usage_summary(cursor) -> None:
     st.subheader("📊 Models Used for Analysis")
 
     try:
+        # Get the active task from session state or args if available
+        active_task = st.session_state.get("production_task") or None
+
         cursor.execute(
             """
             SELECT model_name, task, nsize, fgsm, normalize, n_calibration,
@@ -1075,6 +1288,10 @@ def _render_model_usage_summary(cursor) -> None:
         ]
 
         usage_df = pd.DataFrame(usage_rows, columns=usage_columns)
+
+        # Filter by active task if set
+        if active_task is not None:
+            usage_df = usage_df[usage_df["Task"] == active_task]
 
         st.markdown("**Table:** Model Usage Summary")
         st.dataframe(_arrow_safe_dataframe(usage_df), use_container_width=True)
@@ -1105,17 +1322,20 @@ def render(
     """
     cursor = ctx.cursor
     args = ctx.args
+    active_task = st.session_state.get("production_task") or getattr(args, "task", None)
 
     st.header(title)
-
-    models_df = pd.DataFrame()
+    if active_task:
+        st.caption(f"Task: {active_task}")
 
     if include_model_table or include_calibration or include_model_selector:
         try:
-            models_df = load_best_models_table(cursor)
-
+            models_df = load_best_models_table(cursor, task=active_task)
             if models_df.empty:
-                st.warning("No models found in leaderboard.")
+                if active_task:
+                    st.warning(f"No models found in leaderboard for task {active_task}.")
+                else:
+                    st.warning("No models found in leaderboard.")
             else:
                 _update_model_number_map(models_df)
 

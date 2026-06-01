@@ -1,320 +1,233 @@
-# Otitenet - AI-Powered Otitis Classification
+# Otitenet
 
-## Project Overview
-Otitenet is a framework for domain-generalized otitis classification using Siamese networks (ResNet-18, VGG16, EfficientNet, ViT) with prototype representations, structural regularization, and advanced interpretability (SHAP/Grad-CAM).
+Otitenet is a framework for otitis classification with domain-generalized image embeddings, prototype/KNN heads, SHAP/Grad-CAM interpretability, a Streamlit web app, an offline desktop app, and an Android client.
 
-## 🚀 Quick Start
+## Quick Start
 
-### 1. Installation
-Ensure you are using **Python 3.11**.
+### 1. Install Python Dependencies
+
+Use the project Python environment. The desktop build scripts expect:
+
+```text
+/home/simon/otitenet/.conda/bin/python
+```
+
+For the research/web environment:
+
 ```bash
 python -m pip install -r requirements.txt
 python setup.py
 ```
 
-### 2. Database Setup
-The system uses MySQL for result tracking. Ensure `results_db` is configured:
+For offline desktop packaging:
+
+```bash
+/home/simon/otitenet/.conda/bin/python -m pip install -r requirements-desktop.txt
+/home/simon/otitenet/.conda/bin/python -m pip install -r requirements-export.txt
+```
+
+### DVC Workflow (Recommended)
+
+This repo is initialized with DVC to version large datasets and artifacts outside Git history.
+
+Current default remote:
+
+```text
+localstorage -> /home/simon/dvc-storage/otitenet
+```
+
+Initial tracked paths (practical baseline):
+
+```bash
+/home/simon/otitenet/.conda/bin/dvc add -f data/datasets logs/progresses
+/home/simon/otitenet/.conda/bin/dvc push
+git add data.dvc logs/progresses.dvc .dvc/config .gitignore
+```
+
+Daily commands:
+
+```bash
+# pull data/artifacts referenced by .dvc files
+/home/simon/otitenet/.conda/bin/dvc pull
+
+# if .dvc files changed, restore workspace state
+/home/simon/otitenet/.conda/bin/dvc checkout
+
+# after updating tracked data/artifacts
+/home/simon/otitenet/.conda/bin/dvc add -f data/datasets logs/progresses
+/home/simon/otitenet/.conda/bin/dvc push
+git add data.dvc logs/progresses.dvc
+```
+
+To switch from local storage to shared/on-prem/cloud storage later:
+
+```bash
+/home/simon/otitenet/.conda/bin/dvc remote add -d <remote_name> <remote_url_or_path>
+```
+
+### 2. Initialize MySQL
+
+The online app stores users, model selections, and analysis results in MySQL.
+
 ```sql
 CREATE DATABASE results_db;
 GRANT ALL PRIVILEGES ON results_db.* TO 'y_user'@'%' IDENTIFIED BY 'password';
 FLUSH PRIVILEGES;
 ```
-Initialize the schema:
+
 ```bash
 python scripts/utils/init_db.py
 ```
 
-### 3. Launching Experiments
-Use the root bash scripts to manage large-scale runs:
-- **`./launch.sh`**: Standard batch execution for the full model grid.
-  - `--test`: Run in smoke mode (1 epoch, 1 trial).
-  - `--jobs=N`: Limit concurrent jobs.
-  - `--force`: Ignore `.done` markers and rerun everything.
-- **`./launch_optimize.sh`**: Run hyperparameter optimization.
+The offline desktop app does not require MySQL. It stores users and history locally under `~/.otitenet/offline/`.
 
-### 3.1 Dataset Split Control
-For deterministic runs (`groupkfold=1`), dataset membership is controlled by batch name.
+### 3. Build the Dataset
 
-- `--valid_dataset`: dataset reserved for validation.
-- `--test_dataset`: dataset reserved for test. If omitted, the code tries `GMFUNL_jan2023`.
-- `--train_datasets`: optional comma-separated list of datasets to use for training.
+Raw source datasets go under:
 
-Default behavior:
-- If `--train_datasets` is not provided, all datasets except `valid_dataset` and `test_dataset` are used for training.
-- If `--test_dataset` is not found, half of the validation dataset is reassigned to test, and the remaining half stays validation.
-
-Example:
-```bash
-python -m otitenet.train.train_triplet_new \
-  --path=./data/otite_ds_64 \
-  --groupkfold=1 \
-  --valid_dataset=Banque_Viscaino_Chili_2020 \
-  --test_dataset=GMFUNL_jan2023 \
-  --train_datasets=Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM
-```
-
-At runtime, the loader prints a split debug summary such as:
 ```text
-[SplitDebug] mode=deterministic valid_dataset=Banque_Viscaino_Chili_2020 test_dataset=GMFUNL_jan2023 train_datasets=['Banque_Comert_Turquie_2020_jpg', 'Banque_Calaman_USA_2020_trie_CM'] fallback_used=False
-[SplitDebug] reason=using all samples from explicit test dataset 'GMFUNL_jan2023' counts(train=945, valid=880, test=15)
+data/datasets/<dataset_name>/
 ```
 
-### 3.1.1 Score Semantics and Split Reuse
-There are two different validation scores in the project, and they should not be interpreted as the same measurement.
+Build the processed dataset from the config:
 
-- `best_models_registry.mcc`: the training-time best validation MCC saved by the training loop for the selected run.
-- `Learned Embedding Classification` in the Streamlit app: a post-hoc validation MCC computed after loading the saved backbone, encoding the train/valid sets again, and searching over downstream classifiers such as KNN, prototype strategies, and baseline ML models.
-
-Important consequences:
-
-- A discrepancy between these two values is expected even when they use the same validation split, because they are not the same classifier pipeline.
-- The embedding section may also use train-time augmentation for the encoded train embeddings via `n_aug`, which can further change the downstream validation MCC.
-- The app now reuses saved split manifests from the selected model directory when they exist, so train/valid/test membership matches the original training run instead of being rebuilt heuristically from the current dataset state.
-
-If you need an apples-to-apples check against the registry score, use the app action that recomputes validation MCC with the saved training parameters rather than comparing it to the best score from `Learned Embedding Classification`.
-
-### 3.2 Dataset Preprocessing (Config-Driven)
-Raw source datasets should be placed under:
-- `data/datasets/<dataset_name>/...`
-
-Preprocessing and dataset assembly are implemented in `src/otitenet/data/make_dataset2.py` and support a separate config file:
-- `configs/preprocessing_config.json`
-
-This config controls:
-- `source_root`: where raw datasets are read from.
-- `output_base`: processed dataset prefix (final folder becomes `output_base_<image_size>`).
-- `image_size`: resize target for all exported images.
-- `include_datasets`: explicit dataset names to consider.
-- `exclude_datasets`: dataset names to ignore even if included.
-
-Example use case:
-- include `Banque_Comert_Turquie_2020_jpg`
-- exclude `Banque_Comert_Turquie_2020`
-
-Build the processed dataset with:
 ```bash
 python scripts/preprocessing/build_dataset.py --config configs/preprocessing_config.json
 ```
 
-Output folder example:
-- `data/otite_ds_64/`
-  - images are resized as part of preprocessing
-  - `infos.csv` is generated with `dataset,name,label,group`
+Typical output:
 
-To build another size, change `image_size` in the config (for example `224`) and rerun.
-
-### 3.3 Quick Recipe (Recommended)
-Use this sequence for the standard production path with `otite_ds_64` and `GMFUNL_jan2023` as test set.
-
-1. Build processed dataset from config:
-```bash
-python scripts/preprocessing/build_dataset.py --config configs/preprocessing_config.json
+```text
+data/otite_ds_64/USA_Turquie_Chili_GMFUNL/
 ```
 
-2. Run training with explicit split control:
+The preprocessing config controls included/excluded datasets, output prefix, and image size.
+The output subfolder is derived from `include_datasets`, for example `USA_Turquie_Chili_GMFUNL`.
+Preprocessing preserves the original dataset class in `raw_label` and writes the canonical class in `label`.
+
+### 4. Train a Model
+
+Recommended deterministic split:
+
 ```bash
 python -m otitenet.train.train_triplet_new \
-  --path=./data/otite_ds_64 \
+  --path=./data/otite_ds_64/USA_Turquie_Chili_GMFUNL \
   --groupkfold=1 \
   --valid_dataset=Banque_Viscaino_Chili_2020 \
   --test_dataset=GMFUNL_jan2023 \
-  --train_datasets=Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM \
-  --task=notNormal
+  --train_datasets=Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM,GMFUNL_jan2023 \
+  --task=otite_four_class
 ```
 
-3. Confirm split in logs:
-- Look for `[SplitDebug]` lines showing:
-  - `test_dataset=GMFUNL_jan2023`
-  - `fallback_used=False`
+Use `--task=notNormal` for the old binary `Normal` / `NotNormal` labels.
+Use `--task=otite_four_class` for `Normal` / `NotNormal` / `Wax` / `Tube`.
 
-4. Generate paper analysis outputs:
+Check the logs for `[SplitDebug]` lines confirming the validation and test datasets. If `--test_dataset` is missing from the processed dataset, the loader falls back by splitting the validation dataset.
+
+Batch launchers:
+
 ```bash
-python scripts/analysis/generate_paper_analysis.py
+./launch.sh --test
+./launch.sh --jobs=4
+./launch_optimize.sh
 ```
 
-### 4. Running the Application
-Full admin/web app:
+### 5. Run the Online App
+
 ```bash
 streamlit run app.py --server.address 0.0.0.0 --server.port 8502
 ```
 
-### 4.1 Building the Offline Executable App on Ubuntu
-The offline desktop app is separate from the online Streamlit app.
+Use the online app to select the production model before building offline/mobile deployments.
 
-- Online app: `app.py`, with admin or client behavior depending on who logs in.
-- Offline app: `app_offline.py`, the minimal client-shaped app with only `New Analysis` and `Historics`.
+### 6. Export the Current Deployment
 
-The offline app packages whatever is in:
+Create or refresh the deployment used by Android and the offline desktop app:
+
+```bash
+/home/simon/otitenet/.conda/bin/python scripts/create_mobile_deployment.py --task otite_four_class
+```
+
+For the compact offline desktop runtime, export the current production embedding model to ONNX:
+
+```bash
+/home/simon/otitenet/.conda/bin/python scripts/export_offline_onnx_model.py --embedding-output --no-quantize --keep-pytorch
+```
+
+The active deployment lives in:
+
 ```text
 data/mobile_deployments/current/
-├── manifest.json
-└── model.onnx
 ```
 
-Before building, select the production model in the online app, then refresh the deployment folder:
-```bash
-python scripts/create_mobile_deployment.py
-```
+### 7. Build the Offline Desktop App
 
-Export that production deployment to quantized ONNX. This is the lightweight production format used by the offline app, so the desktop executable does not need to ship PyTorch:
-```bash
-python -m pip install -r requirements-export.txt
-python scripts/export_offline_onnx_model.py
-```
-
-By default this creates a dynamic UINT8 ONNX model. Use `--no-quantize` only if you need a full-precision ONNX file for comparison.
-
-Install the standalone desktop build dependencies:
-```bash
-python -m pip install -r requirements-desktop.txt
-```
-
-`requirements-desktop.txt` is intentionally separate from `requirements.txt`. It uses ONNX Runtime and avoids training, plotting, experiment tracking, tests, and PyTorch packages.
-
-Build the offline Streamlit sidecar executable:
-```bash
-python -m PyInstaller packaging/pyinstaller/otitenet_streamlit.spec --clean -y
-```
-
-The executable is created at:
-```bash
-dist/otitenet-streamlit/otitenet-streamlit
-```
-
-Smoke test it on a free port:
+Compact build, recommended:
 
 ```bash
-# Run the offline app (default entrypoint is app_offline.py):
-OTITENET_STREAMLIT_PORT=8502 ./dist/otitenet-streamlit/otitenet-streamlit
-# Or, explicitly specify the entrypoint (optional, for clarity):
-OTITENET_STREAMLIT_PORT=8502 OTITENET_STREAMLIT_APP=app_offline.py ./dist/otitenet-streamlit/otitenet-streamlit
+PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:prepare:compact
+PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:sidecar:compact
+PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:tauri:compact
 ```
 
-If you see an error about `streamlit_app.py` not existing, make sure:
-- You are running the `otitenet-streamlit` binary, not `streamlit run ...`
-- The file `dist/otitenet-streamlit/_internal/app_offline.py/app_offline.py` exists
-- The environment variable `OTITENET_STREAMLIT_APP` is not set to `streamlit_app.py`
-- You are not passing extra arguments to the binary
+Exact/full PyTorch build:
 
-To guarantee a clean run, you can unset the variable first:
 ```bash
-unset OTITENET_STREAMLIT_APP
-OTITENET_STREAMLIT_PORT=8502 ./dist/otitenet-streamlit/otitenet-streamlit
+PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:prepare:exact
+PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:sidecar:exact
+PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:tauri:exact
 ```
 
-Then open:
+Installer outputs:
+
 ```text
-http://127.0.0.1:8502
+desktop/src-tauri/target/release/bundle/deb/Otitenet_0.3.0_amd64_compact.deb
+desktop/src-tauri/target/release/bundle/deb/Otitenet_0.3.0_amd64_exact.deb
 ```
 
-To build the Ubuntu desktop window/installer with Tauri, install Rust first:
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-```
+Detailed desktop packaging notes are in [docs/OFFLINE_DESKTOP.md](docs/OFFLINE_DESKTOP.md).
 
-Copy the PyInstaller sidecar into Tauri using your Rust host triplet:
-```bash
-HOST_TRIPLET="$(rustc -Vv | sed -n 's/^host: //p')"
-mkdir -p desktop/src-tauri/binaries
-cp dist/otitenet-streamlit/otitenet-streamlit "desktop/src-tauri/binaries/otitenet-streamlit-${HOST_TRIPLET}"
-chmod +x "desktop/src-tauri/binaries/otitenet-streamlit-${HOST_TRIPLET}"
-```
+### 8. Generate Analysis Outputs
 
-Build the desktop app:
-```bash
-cd desktop
-npm install
-npm run tauri:build
-```
-
-The Ubuntu bundle is written under:
-```text
-desktop/src-tauri/target/release/bundle/
-```
-
-See `docs/OFFLINE_DESKTOP.md` for the detailed offline build notes.
-
-## 📂 Project Structure
-
-- **`scripts/`**: Core logic scripts.
-  - `analysis/`: SHAP, Grad-CAM, and final publication analysis scripts.
-  - `migrations/`: DB schema updates.
-  - `utils/`: DB init, model recovery, and common helpers.
-  - `debug/`: Tools for isolating Grad-CAM and heatmap issues.
-- **`src/otitenet/`**: Primary Python package containing training loops and model architectures.
-- **`docs/`**: Detailed documentation, implementation reports, and refactoring history.
-- **`output/`**: All generated artifacts.
-  - `analysis/`: Final CSV/MD reports (`PAPER_ANALYSIS.md`).
-  - `paper_figures/`: Publication-quality plots (`0_dataset_eda.png`, `1_architecture_mcc.png`, etc.).
-  - `images/`: General visualizations (PCA/UMAP).
-- **`data/storage/`**: persistent storage for `model.pth` and `results.db`.
-- **`logs/`**: Experiment logs and `.done` completion markers.
-
-## 📊 Paper Analysis & Results Summary
-After training, generate the full publication suite:
 ```bash
 python scripts/analysis/generate_paper_analysis.py
 ```
-Results are consolidated in `output/analysis/`. Key figures in the analysis include:
 
-- **Dataset Characteristics (`0_dataset_eda.png`)**: Overview of class distributions and dataset biases.
-- **Architectural Benchmarking (`1_architecture_mcc.png`)**: Performance comparison (MCC) across ResNet, VGG, EfficientNet, and ViT.
-- **Structural Regularization (`2_loss_ablation.png` & `3_prototype_ablation.png`)**: Impact of ArcFace vs. Triplet loss and sub-center prototype strategies.
-- **Domain Invariance (`4_mcc_vs_entropy.png`)**: Evaluation of model robustness against batch effects.
-- **Interpretability Matrix (`6_interpretability.png`)**: Side-by-side comparison of Grad-CAM and SHAP activations for clinical validation.
-- **Performance Leaderboard (`7_top_models_table.png`)**: Summary table of the highest-performing configurations.
+Outputs are written under:
 
-## 🛠 Internal Workflows
-
-### Streamlit App Logic
-```mermaid
-flowchart TD
-    A[Start: User opens app.py] --> B{User logged in?}
-    B -- No --> C[Show login form]
-    C -->|Login| B
-    B -- Yes --> D[Show sidebar: select person, add/remove person, delete account, remove result]
-    D --> E{Person selected?}
-    E -- No --> F[Show warning: select a family member]
-    E -- Yes --> G[Show results table for person]
-    G --> H{File uploaded or result selected?}
-    H -- No --> I[Wait for user action]
-    H -- Yes --> J[Show analysis UI]
-    J --> K{Run Analysis button pressed?}
-    K -- No --> I
-    K -- Yes --> L[Get model args from sidebar]
-    L --> M[Check if result exists in DB]
-    M -- Exists --> N[Show previous results, allow re-analysis]
-    M -- Not exists --> O[Load model, prototypes, data]
-    O --> P[Save uploaded file]
-    P --> Q[Run model inference, get predictions]
-    Q --> R[Log SHAP/gradient images]
-    R --> S[Insert results into DB]
-    S --> T[Show results, images, metrics]
-    T --> I
+```text
+output/analysis/
 ```
 
-### Training Pipeline
-```mermaid
-flowchart TD
-    A[Start: Script/Module Entry]
-    A --> B[Parse args, set up paths]
-    B --> C[Initialize TrainAE class]
-    C --> D[Load and preprocess data]
-    D --> E[Set up model, loss, optimizer]
-    E --> F[Repeat for n_repeats]
-    F --> G[Split data for train/valid/test]
-    G --> H[Epoch loop]
-    H --> I[Train model on train set]
-    I --> J[Validate on valid set]
-    J --> K{Early stopping?}
-    K -- Yes --> L[Break epoch loop]
-    K -- No --> H
-    J --> M{Best MCC?}
-    M -- Yes --> N[Save model, prototypes, weights]
-    M -- No --> H
-    N --> O[Update best metrics]
-    O --> H
-    F --> P[After training: clustering, visualization, logging]
-    P --> Q[Return best MCC]
+## Notes
+
+- GitHub Actions builds the Dockerfile and runs `bash scripts/test/unit.sh` plus `bash scripts/test/smoketest.sh` inside that image.
+- The app can keep a separate production model for each labeling scenario.
+- `best_models_registry.mcc` is the training-time best validation MCC.
+- The Streamlit learned-embedding section computes post-hoc validation scores with downstream classifiers. These scores are expected to differ from the registry MCC.
+- When split manifests exist in a selected model directory, the app reuses them so train/valid/test membership matches the original run.
+- `requirements-desktop.txt` is intentionally separate from `requirements.txt`; compact desktop builds avoid bundling PyTorch.
+
+## Project Structure
+
+```text
+app.py                         Online Streamlit app
+app_offline.py                 Offline desktop Streamlit app
+src/otitenet/                  Main Python package
+scripts/preprocessing/         Dataset build scripts
+scripts/analysis/              Paper/analysis generation scripts
+scripts/migrations/            Database migrations
+scripts/utils/                 Database and maintenance utilities
+desktop/                       Tauri desktop wrapper
+app/                           Android app
+docs/                          Detailed workflow documentation
+output/                        Generated reports and artifacts
+logs/                          Training logs and completion markers
 ```
+
+## More Documentation
+
+- [Offline desktop build](docs/OFFLINE_DESKTOP.md)
+- [Example commands](docs/EXAMPLE_COMMANDS.md)
+- [Parameters and classifiers](docs/PARAMETERS_AND_CLASSIFIERS.md)
+- [Technical summary](docs/TECHNICAL_SUMMARY.md)

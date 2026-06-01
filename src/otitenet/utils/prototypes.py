@@ -52,6 +52,14 @@ class Prototypes:
         encodings = np.concatenate(list1[group]['encoded_values'])
         labels = np.concatenate(list1[group]['labels'])
         batches = np.concatenate(list1[group]['domains'])
+        # Ensure labels and batches have the same length
+        min_len = min(len(labels), len(batches), len(encodings))
+        if len(labels) != len(batches) or len(labels) != len(encodings):
+            import sys
+            sys.stderr.write(f"[Prototypes] Warning: Length mismatch in {group} - labels={len(labels)}, batches={len(batches)}, encodings={len(encodings)}. Truncating to {min_len}.\n")
+            labels = labels[:min_len]
+            batches = batches[:min_len]
+            encodings = encodings[:min_len]
         prototypes = {}
         for label in self.unique_labels:
             for batch in self.unique_batches:
@@ -76,7 +84,12 @@ class Prototypes:
         prototypes = {}
         for batch in self.unique_batches:
             inds = np.where((batches == batch))[0]
-            prototypes[batch] = self._compute_prototype(encodings[inds])
+            try:
+                prototypes[batch] = self._compute_prototype(encodings[inds])
+            except Exception as e:
+                import sys
+                sys.stderr.write(f"[Prototypes] Error computing batch prototype for {group} batch {batch}: {e}\n")
+                prototypes[batch] = np.zeros((encodings.shape[1],))
         self.n_prototypes[group] = len(self.prototypes)
         self.batch_prototypes[group] = prototypes
 

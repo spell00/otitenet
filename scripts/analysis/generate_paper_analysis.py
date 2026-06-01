@@ -1990,7 +1990,7 @@ def generate_core_figures_and_tables(df, out_dir):
     plt.close()
 
     # Instead of using only the dataframe, rebuild all_models.csv from manifest and logs for completeness
-    manifest_path = 'logs/progresses/notNormal/PROD_notNormal_job_manifest.csv'
+    manifest_path = 'logs/progresses/notNormal/otite_ds_64/csv/PROD_notNormal_job_manifest.csv'
     all_csv_path = f"{out_dir}/all_models.csv"
     build_all_models_from_manifest_and_logs(manifest_path, all_csv_path)
 
@@ -2091,8 +2091,8 @@ def run_analysis():
     # Build all_models.csv from manifest and logs
     task = _get_target_task()
     tag = 'TEST_SMOKE' if args.test else 'PROD'
-    manifest_path = f'logs/progresses/{task}/{tag}_{task}_job_manifest.csv'
-    output_csv = f'logs/progresses/{task}/{tag}_{task}_all_models.csv'
+    manifest_path = f'logs/progresses/{task}/{args.dataset}/csv/{tag}_{task}_job_manifest.csv'
+    output_csv = f'logs/progresses/{task}/{args.dataset}/csv/{tag}_{task}_all_models.csv'
     build_all_models_from_manifest_and_logs(manifest_path, output_csv, tag=tag)
     df = pd.read_csv(output_csv)
     # Use the correct model column: prefer 'model_name', fallback to 'model'
@@ -2196,6 +2196,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Generate paper analysis from training outputs.')
     parser.add_argument('--task', type=str, default='notNormal', help='Target task directory under logs/ (e.g., notNormal, otitis, multi).')
     parser.add_argument('--test', action='store_true', help='Analyze only test/smoke runs (launch --test / run_tag containing test).')
+    parser.add_argument('--dataset', type=str, default='otite_ds_64', help='Dataset subdirectory under logs/progresses/{task}/ (e.g., otite_ds_64).')
+    
     args = parser.parse_args()
 
     if args.task:

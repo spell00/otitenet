@@ -1,9 +1,12 @@
-import pytest
-from fastapi.testclient import TestClient
-from otitenet.api.main import app
-import os
-from pathlib import Path
-import json
+import unittest
+
+try:
+    from fastapi.testclient import TestClient
+    from otitenet.api.main import app
+except RuntimeError as exc:
+    if "httpx" not in str(exc):
+        raise
+    raise unittest.SkipTest("fastapi TestClient requires httpx")
 
 client = TestClient(app)
 

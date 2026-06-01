@@ -55,8 +55,10 @@ def create_simple_torch_classifier_manifest(
     model_file: str,
     labels: list[str],
     input_size: tuple[int, int] = (224, 224),
-    normalize_mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
-    normalize_std: tuple[float, float, float] = (0.229, 0.224, 0.225),
+    normalize: str = "no",
+    normalize_mean: tuple[float, float, float] | None = None,
+    normalize_std: tuple[float, float, float] | None = None,
+    production_params: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
     First deployment type:
@@ -69,22 +71,37 @@ def create_simple_torch_classifier_manifest(
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found in deployment dir: {model_path}")
 
+    is_onnx = model_path.suffix.lower() == ".onnx"
+    normalize_value = str(normalize or "no").lower()
+    preprocessing: Dict[str, Any] = {
+        "resize": list(input_size),
+        "resize_mode": "app_64_then_size",
+        "color_mode": "RGB",
+        "normalize": normalize_value,
+    }
+    if normalize_value in {"yes", "true", "1", "per_image"}:
+        preprocessing["normalization"] = "per_image"
+    elif normalize_mean is not None and normalize_std is not None:
+        preprocessing["normalization"] = "channel_mean_std"
+        preprocessing["normalize_mean"] = list(normalize_mean)
+        preprocessing["normalize_std"] = list(normalize_std)
+    else:
+        preprocessing["normalization"] = "none"
+
     manifest = {
         "deployment_id": "current",
         "model_id": int(model_id),
         "model_name": model_name,
-        "model_type": "torch_classifier",
+        "model_type": "onnx_classifier" if is_onnx else "torch_classifier",
+        "runtime": "onnxruntime" if is_onnx else "torch",
         "head_type": "linear_classifier",
         "requires_reference_arrays": False,
         "input": {
             "image_size": list(input_size),
             "channels": 3,
         },
-        "preprocessing": {
-            "resize": list(input_size),
-            "normalize_mean": list(normalize_mean),
-            "normalize_std": list(normalize_std),
-        },
+        "preprocessing": preprocessing,
+        "production_params": production_params or {},
         "labels": labels,
         "files": {
             "model": model_path.name,
@@ -156,5 +173,127 @@ def create_knn_embedding_manifest(
         },
     }
 
+    write_current_manifest(manifest)
+    return manifest
+
+
+def create_torch_prototype_manifest(
+    model_id: int,
+    model_name: str,
+    model_file: str,
+    prototypes_file: str,
+    labels: list[str],
+    input_size: tuple[int, int],
+    normalize: str,
+    distance: str,
+    head_config: str,
+    production_params: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Create an exact web-compatible deployment for prototype-head inference."""
+    model_path = CURRENT_DIR / Path(model_file).name
+    prototypes_path = CURRENT_DIR / Path(prototypes_file).name
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model file not found in deployment dir: {model_path}")
+    if not prototypes_path.exists():
+        raise FileNotFoundError(f"Prototype file not found in deployment dir: {prototypes_path}")
+
+    normalize_value = str(normalize or "no").lower()
+    preprocessing: Dict[str, Any] = {
+        "resize": list(input_size),
+        "resize_mode": "app_64_then_size",
+        "color_mode": "RGB",
+        "normalize": normalize_value,
+        "normalization": "per_image" if normalize_value in {"yes", "true", "1", "per_image"} else "none",
+    }
+
+    manifest = {
+        "deployment_id": "current",
+        "model_id": int(model_id),
+        "model_name": model_name,
+        "model_type": "torch_prototype",
+        "runtime": "torch",
+        "head_type": "prototype",
+        "head_config": str(head_config),
+        "distance": str(distance or "euclidean"),
+        "requires_reference_arrays": True,
+        "input": {
+            "image_size": list(input_size),
+            "channels": 3,
+        },
+        "preprocessing": preprocessing,
+        "production_params": production_params or {},
+        "labels": labels,
+        "files": {
+            "model": model_path.name,
+            "prototypes": prototypes_path.name,
+            "manifest": "manifest.json",
+        },
+        "sha256": {
+            "model": sha256_file(model_path),
+            "prototypes": sha256_file(prototypes_path),
+        },
+    }
+    write_current_manifest(manifest)
+    return manifest
+
+
+def create_onnx_prototype_manifest(
+    model_id: int,
+    model_name: str,
+    model_file: str,
+    prototypes_file: str,
+    labels: list[str],
+    input_size: tuple[int, int],
+    normalize: str,
+    distance: str,
+    head_config: str,
+    quantization: str = "none",
+    production_params: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Create a compact deployment using ONNX embeddings plus the saved prototype head."""
+    model_path = CURRENT_DIR / Path(model_file).name
+    prototypes_path = CURRENT_DIR / Path(prototypes_file).name
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model file not found in deployment dir: {model_path}")
+    if not prototypes_path.exists():
+        raise FileNotFoundError(f"Prototype file not found in deployment dir: {prototypes_path}")
+
+    normalize_value = str(normalize or "no").lower()
+    preprocessing: Dict[str, Any] = {
+        "resize": list(input_size),
+        "resize_mode": "app_64_then_size",
+        "color_mode": "RGB",
+        "normalize": normalize_value,
+        "normalization": "per_image" if normalize_value in {"yes", "true", "1", "per_image"} else "none",
+    }
+
+    manifest = {
+        "deployment_id": "current",
+        "model_id": int(model_id),
+        "model_name": model_name,
+        "model_type": "onnx_embedding_prototype",
+        "runtime": "onnxruntime",
+        "head_type": "prototype",
+        "head_config": str(head_config),
+        "distance": str(distance or "euclidean"),
+        "quantization": str(quantization or "none"),
+        "requires_reference_arrays": True,
+        "input": {
+            "image_size": list(input_size),
+            "channels": 3,
+        },
+        "preprocessing": preprocessing,
+        "production_params": production_params or {},
+        "labels": labels,
+        "files": {
+            "model": model_path.name,
+            "prototypes": prototypes_path.name,
+            "manifest": "manifest.json",
+        },
+        "sha256": {
+            "model": sha256_file(model_path),
+            "prototypes": sha256_file(prototypes_path),
+        },
+    }
     write_current_manifest(manifest)
     return manifest

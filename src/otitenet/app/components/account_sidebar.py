@@ -1,7 +1,16 @@
 # /home/simon/otitenet/otitenet/app/components/account_sidebar.py
 
+import os
+
 import streamlit as st
 from mysql.connector import Error
+
+from otitenet.data.labels import (
+    DEFAULT_LABEL_TASK,
+    TASK_LABEL_SCHEMES,
+    label_scheme_for_task,
+    task_display_name,
+)
 
 
 ADMIN_EMAIL = "simonjpelletier@gmail.com"
@@ -295,6 +304,61 @@ def render_person_sidebar(conn, cursor):
     return st.session_state.person_id
 
 
+def render_labeling_task_sidebar():
+    """Select which task/labeling scenario is active for production inference."""
+    st.sidebar.markdown("### 🏷️ Labeling")
+
+    task_root = os.path.join("logs", "best_models")
+    if os.path.isdir(task_root):
+        tasks = [
+            name
+            for name in sorted(os.listdir(task_root))
+            if os.path.isdir(os.path.join(task_root, name)) and name in TASK_LABEL_SCHEMES
+        ]
+    else:
+        tasks = []
+    if not tasks:
+        tasks = list(TASK_LABEL_SCHEMES.keys())
+    current = st.session_state.get("production_task", DEFAULT_LABEL_TASK)
+    if current not in tasks:
+        current = DEFAULT_LABEL_TASK
+
+    selected = st.sidebar.selectbox(
+        "Task",
+        options=tasks,
+        index=tasks.index(current),
+        format_func=task_display_name,
+        key="production_task_selector",
+    )
+
+    if selected != st.session_state.get("production_task"):
+        st.session_state["production_task"] = selected
+        st.session_state["label_scheme"] = label_scheme_for_task(selected)
+        st.session_state["production_model"] = None
+        for key in [
+            "selected_model_params",
+            "selected_params_version",
+            "selected_params_last_sync",
+            "selected_model_log_path",
+            "selected_model_selection_key",
+            "selected_model_version",
+            "sidebar_best_model_key",
+            "sidebar_best_model_last_sync",
+            "sidebar_classification_head_config",
+            "sidebar_classification_head_model_key",
+            "optimized_k_value",
+            "k_opt_current_selection",
+            "model_number_map",
+            "best_models_table",
+        ]:
+            st.session_state.pop(key, None)
+        _rerun()
+
+    st.session_state["production_task"] = selected
+    st.session_state["label_scheme"] = label_scheme_for_task(selected)
+    return selected
+
+
 def render_current_optimization_sidebar(is_admin=False):
     """
     Render current optimization / selected model status.
@@ -352,7 +416,11 @@ def render_current_optimization_sidebar(is_admin=False):
                 )
 
                 if model_name or model_id:
-                    st.sidebar.info(f"Production model: {model_name} #{model_id}")
+                    task = production_model.get("label_task", st.session_state.get("production_task", DEFAULT_LABEL_TASK))
+                    st.sidebar.info(
+                        f"Production model: {model_name} #{model_id}\n\n"
+                        f"Task: {task_display_name(task)}"
+                    )
                 else:
                     st.sidebar.info("Production model loaded.")
             else:

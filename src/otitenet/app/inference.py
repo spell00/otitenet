@@ -108,17 +108,55 @@ def predict_with_prototype_distance_ratio(
                 dist = torch.cdist(emb, proto_t, p=2).mean().item()
                 distances[label] = dist
 
-        # Compute inverse distance probabilities
-        inv_distances = {label: 1.0 / (dist + 1e-8) for label, dist in distances.items()}
-        total_inv = sum(inv_distances.values())
-        probas = {label: inv_dist / total_inv for label, inv_dist in inv_distances.items()}
-        
-        # Return class with highest probability
-        best_label = max(probas, key=probas.get)
-        return best_label
+        probas = prototype_distance_probabilities_from_distances(distances)
+        return max(probas, key=probas.get)
     except Exception as e:
         print(f"Error in prototype distance ratio prediction: {e}")
         return None
+
+
+def prototype_distance_probabilities_from_distances(distances: dict) -> dict:
+    inv_distances = {label: 1.0 / (float(dist) + 1e-8) for label, dist in distances.items()}
+    total_inv = sum(inv_distances.values())
+    if total_inv <= 0:
+        return {label: 0.0 for label in distances}
+    return {label: inv_dist / total_inv for label, inv_dist in inv_distances.items()}
+
+
+def predict_with_prototype_distance_ratio_proba(
+    embedding_tensor: torch.Tensor,
+    class_prototypes: dict,
+    dist_fct_name: str = 'euclidean'
+):
+    """Return both predicted label and inverse-distance prototype probabilities."""
+    try:
+        emb = embedding_tensor.detach().cpu()
+        if emb.ndim == 1:
+            emb = emb.unsqueeze(0)
+
+        distances = {}
+        for label, proto in class_prototypes.items():
+            if proto is None:
+                continue
+            proto_t = torch.as_tensor(proto, dtype=emb.dtype)
+            if proto_t.ndim == 1:
+                proto_t = proto_t.unsqueeze(0)
+
+            if str(dist_fct_name).lower() == 'cosine':
+                emb_norm = torch.nn.functional.normalize(emb, p=2, dim=1)
+                proto_norm = torch.nn.functional.normalize(proto_t, p=2, dim=1)
+                sim = torch.mm(emb_norm, proto_norm.T).mean().item()
+                distances[label] = 1.0 - sim
+            else:
+                distances[label] = torch.cdist(emb, proto_t, p=2).mean().item()
+
+        probas = prototype_distance_probabilities_from_distances(distances)
+        if not probas:
+            return None, {}
+        return max(probas, key=probas.get), probas
+    except Exception as e:
+        print(f"Error in prototype distance ratio prediction: {e}")
+        return None, {}
 
 
 def predict_with_kde(

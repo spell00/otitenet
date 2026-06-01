@@ -21,6 +21,7 @@ from otitenet.app.bootstrap import (
     load_production_model,
 )
 from otitenet.app.components.account_sidebar import (
+    render_labeling_task_sidebar,
     render_current_optimization_sidebar,
     render_person_sidebar,
     require_login,
@@ -53,6 +54,7 @@ initialize_user_state()
 require_login(conn, cursor)
 
 is_admin = is_current_user_admin()
+render_labeling_task_sidebar()
 load_production_model(cursor)
 
 st.title("Ear Health Classifier with SHAP 👂")

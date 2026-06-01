@@ -21,14 +21,26 @@ import json
 import os
 import sys
 
+from otitenet.data.make_dataset2 import dataset_output_subdir
+
 cfg_path = sys.argv[1]
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
 output_base = str(cfg.get("output_base", "data/otite_ds"))
 image_size = int(cfg.get("image_size", 64))
+output_subdir = cfg.get("output_subdir")
+if output_subdir is None:
+    output_subdir = dataset_output_subdir(
+        cfg.get("include_datasets"),
+        cfg.get("exclude_datasets", []),
+    )
+output_subdir = str(output_subdir or "").strip("/")
 base_name = os.path.basename(output_base.rstrip("/"))
-print(f"{base_name}_{image_size}")
+dataset_name = f"{base_name}_{image_size}"
+if output_subdir:
+    dataset_name = f"{dataset_name}/{output_subdir}"
+print(dataset_name)
 PY
 }
 
@@ -53,3 +65,4 @@ if [ "$#" -gt 0 ]; then
     launch_args+=("$@")
 fi
 
+bash launch.sh "${launch_args[@]}"

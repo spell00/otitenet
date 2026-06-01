@@ -134,7 +134,8 @@ def load_model_parameters(model_dir: str) -> dict:
 def _load_model_and_prototypes_cached(
     model_name, task, new_size, fgsm, n_calibration, classif_loss, dloss,
     prototypes_to_use, n_positives, n_negatives, n_neighbors, normalize,
-    dist_fct, device, path, valid_dataset
+    dist_fct, device, path, valid_dataset, train_datasets="", test_dataset="",
+    split_config_in_path=False, log_path=""
 ):
     # Reconstruct namespace locally
     import argparse
@@ -143,7 +144,9 @@ def _load_model_and_prototypes_cached(
         n_calibration=str(n_calibration), classif_loss=str(classif_loss), dloss=str(dloss),
         prototypes_to_use=str(prototypes_to_use), n_positives=str(n_positives),
         n_negatives=str(n_negatives), n_neighbors=int(n_neighbors), normalize=str(normalize),
-        dist_fct=str(dist_fct), device=str(device), path=str(path), valid_dataset=str(valid_dataset)
+        dist_fct=str(dist_fct), device=str(device), path=str(path), valid_dataset=str(valid_dataset),
+        train_datasets=str(train_datasets or ""), test_dataset=str(test_dataset or ""),
+        split_config_in_path=bool(split_config_in_path), _split_config_in_path=bool(split_config_in_path)
     )
 
     # Ensure seeds are set for reproducible split
@@ -152,15 +155,48 @@ def _load_model_and_prototypes_cached(
     np.random.seed(1)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(1)
-    
+
+    candidates = []
+    if log_path:
+        direct_dir = str(log_path)
+        candidates.append((
+            os.path.join(direct_dir, "model.pth"),
+            os.path.join(direct_dir, "prototypes.pkl"),
+            int(_args.n_neighbors),
+        ))
+
     params = get_model_params_path(_args)
-    parts = params.split('/')
-    # remove the last three components: norm..., dist_..., knn...
-    base_params = '/'.join(parts[:-3])
-    base_dir = f'logs/best_models/{_args.task}/{_args.model_name}/{base_params}'
-    model_path, proto_path, resolved_k = resolve_model_paths(
-        base_dir, _args.normalize, _args.dist_fct, int(_args.n_neighbors)
+    parts = params.split("/")
+    base_params = "/".join(parts[:-3])
+    base_dir = f"logs/best_models/{_args.task}/{_args.model_name}/{base_params}"
+    candidates.append(
+        resolve_model_paths(
+            base_dir, _args.normalize, _args.dist_fct, int(_args.n_neighbors)
+        )
     )
+
+    if bool(split_config_in_path):
+        _args.split_config_in_path = False
+        _args._split_config_in_path = False
+        legacy_params = get_model_params_path(_args)
+        legacy_parts = legacy_params.split("/")
+        legacy_base_params = "/".join(legacy_parts[:-3])
+        legacy_base_dir = f"logs/best_models/{_args.task}/{_args.model_name}/{legacy_base_params}"
+        candidates.append(
+            resolve_model_paths(
+                legacy_base_dir, _args.normalize, _args.dist_fct, int(_args.n_neighbors)
+            )
+        )
+
+    model_path, proto_path, resolved_k = candidates[0]
+    for candidate_model_path, candidate_proto_path, candidate_k in candidates:
+        if os.path.exists(candidate_model_path) and os.path.exists(candidate_proto_path):
+            model_path, proto_path, resolved_k = candidate_model_path, candidate_proto_path, candidate_k
+            break
+
+    if not (os.path.exists(model_path) and os.path.exists(proto_path)):
+        checked = ", ".join([m for m, _p, _k in candidates])
+        raise FileNotFoundError(f"Model file not found. Checked: {checked}")
 
     model_dir = os.path.dirname(model_path)
 
@@ -169,9 +205,6 @@ def _load_model_and_prototypes_cached(
     n_cats = len(unique_labels)
     n_batches = len(unique_batches)
 
-    if not (os.path.exists(model_path) and os.path.exists(proto_path)):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
     # If we had to fall back, keep args in sync so downstream cache keys are correct
     try:
         _args.n_neighbors = resolved_k
@@ -179,17 +212,32 @@ def _load_model_and_prototypes_cached(
         pass
 
     try:
+        model_state = torch.load(model_path, map_location=_args.device)
+        checkpoint_n_cats = None
+        if isinstance(model_state, dict) and "subcenters" in model_state:
+            try:
+                checkpoint_n_cats = int(model_state["subcenters"].shape[0])
+            except Exception:
+                checkpoint_n_cats = None
+        if checkpoint_n_cats is not None and checkpoint_n_cats != int(n_cats):
+            raise RuntimeError(
+                "Model/task class-count mismatch while loading checkpoint. "
+                f"checkpoint_n_cats={checkpoint_n_cats}, dataset_n_cats={n_cats}, "
+                f"task={_args.task}, dataset={_args.path}, model_path={model_path}. "
+                "This usually means a model from another task/label scheme was selected."
+            )
+
         model = Net(_args.device, n_cats=n_cats, n_batches=n_batches,
                     model_name=_args.model_name, is_stn=0,
                     n_subcenters=n_batches)
-        model.load_state_dict(torch.load(model_path, map_location=_args.device))
+        model.load_state_dict(model_state)
         model.to(_args.device)
         model.eval()
 
         shap_model = Net_shap(_args.device, n_cats=n_cats, n_batches=n_batches,
                               model_name=_args.model_name, is_stn=0,
                               n_subcenters=n_batches)
-        shap_model.load_state_dict(torch.load(model_path, map_location=_args.device))
+        shap_model.load_state_dict(model_state)
         shap_model.to(_args.device)
         shap_model.eval()
     except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
@@ -245,7 +293,11 @@ def load_model_and_prototypes(_args):
         dist_fct=str(_args.dist_fct),
         device=str(_args.device),
         path=str(_args.path),
-        valid_dataset=str(_args.valid_dataset)
+        valid_dataset=str(_args.valid_dataset),
+        train_datasets=str(getattr(_args, "train_datasets", "")),
+        test_dataset=str(getattr(_args, "test_dataset", "")),
+        split_config_in_path=bool(getattr(_args, "split_config_in_path", False) or getattr(_args, "_split_config_in_path", False)),
+        log_path=str(getattr(_args, "log_path", "") or getattr(_args, "Log Path", ""))
     )
     
     # Sync resolved_k back to _args
@@ -305,12 +357,11 @@ def load_model_for_log_path(log_path: str, model_name: str, device: str = 'cpu')
 
 def clear_cached_model():
     """Clear cached model resources."""
-    try:
-        load_model_and_prototypes.clear()
-        resolve_model_paths.clear()
-        load_model_for_log_path.clear()
-    except Exception:
-        pass
+    for obj in (_load_model_and_prototypes_cached, resolve_model_paths, load_model_for_log_path):
+        try:
+            obj.clear()
+        except Exception:
+            pass
 
 def resolve_model_id(model_name=None, complete_log_path=None, model_id=None):
     """

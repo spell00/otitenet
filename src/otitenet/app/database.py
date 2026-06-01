@@ -12,7 +12,15 @@ This module handles all MySQL database interactions including:
 import streamlit as st
 import mysql.connector
 from mysql.connector import Error
-from otitenet.app.utils import extract_params_from_log_path, _unique_preserve_order
+import os
+import json
+from otitenet.app.utils import (
+    LEGACY_TRAIN_DATASETS,
+    LEGACY_VALID_DATASET,
+    extract_params_from_log_path,
+    split_config_key,
+    _unique_preserve_order,
+)
 import numpy as np
 
 def _mysql_value(x):
@@ -114,9 +122,42 @@ def ensure_results_model_id(conn, cursor):
         conn.rollback()
 
 
+def ensure_results_class_scores(conn, cursor):
+    """Ensure `results.class_scores` exists for per-class inference probabilities."""
+    try:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'results'
+              AND COLUMN_NAME = 'class_scores'
+            """
+        )
+        has_col = cursor.fetchone()[0] > 0
+        if not has_col:
+            cursor.execute("ALTER TABLE results ADD COLUMN class_scores TEXT NULL AFTER confidence")
+            conn.commit()
+    except Exception:
+        # Soft-fail: preserve app availability if migration cannot run.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
 def ensure_registry_metrics_columns(conn, cursor):
-    """Ensure `best_models_registry` has test_mcc, valid_auc, and test_auc columns."""
-    for col in ['test_mcc', 'valid_auc', 'test_auc']:
+    """Ensure `best_models_registry` has optional metrics and dataset split columns."""
+    columns = {
+        'test_mcc': 'FLOAT NULL',
+        'valid_auc': 'FLOAT NULL',
+        'test_auc': 'FLOAT NULL',
+        'train_datasets': 'TEXT NULL',
+        'valid_dataset': 'VARCHAR(255) NULL',
+        'test_dataset': 'VARCHAR(255) NULL',
+        'split_config_key': 'VARCHAR(1024) NULL',
+    }
+    for col, col_type in columns.items():
         try:
             cursor.execute(
                 f"""
@@ -129,10 +170,33 @@ def ensure_registry_metrics_columns(conn, cursor):
             )
             has_col = cursor.fetchone()[0] > 0
             if not has_col:
-                cursor.execute(f"ALTER TABLE best_models_registry ADD COLUMN {col} FLOAT NULL")
+                cursor.execute(f"ALTER TABLE best_models_registry ADD COLUMN {col} {col_type}")
                 conn.commit()
         except Exception as e:
             print(f"Migration error for {col}: {e}")
+
+    try:
+        legacy_train = LEGACY_TRAIN_DATASETS
+        legacy_valid = LEGACY_VALID_DATASET
+        legacy_key = split_config_key(legacy_train, legacy_valid, legacy_valid)
+        cursor.execute(
+            """
+            UPDATE best_models_registry
+            SET
+                train_datasets = COALESCE(NULLIF(train_datasets, ''), %s),
+                valid_dataset = COALESCE(NULLIF(valid_dataset, ''), %s),
+                test_dataset = COALESCE(NULLIF(test_dataset, ''), COALESCE(NULLIF(valid_dataset, ''), %s)),
+                split_config_key = COALESCE(NULLIF(split_config_key, ''), %s)
+            WHERE train_datasets IS NULL OR train_datasets = ''
+               OR valid_dataset IS NULL OR valid_dataset = ''
+               OR test_dataset IS NULL OR test_dataset = ''
+               OR split_config_key IS NULL OR split_config_key = ''
+            """,
+            (legacy_train, legacy_valid, legacy_valid, legacy_key),
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"Migration error while backfilling legacy split config: {e}")
 
 
 def ensure_best_models_registry_nsize(conn, cursor):
@@ -324,7 +388,7 @@ def resolve_model_id(cursor, args, log_path: str):
     return None
 
 
-def insert_score(cursor, conn, filename, args, pred_label, confidence, log_path):
+def insert_score(cursor, conn, filename, args, pred_label, confidence, log_path, class_scores=None):
     """Upsert the result row (respecting unique constraint) and upsert usage summary.
     
     Args:
@@ -342,14 +406,23 @@ def insert_score(cursor, conn, filename, args, pred_label, confidence, log_path)
     confidence = float(confidence)
     log_path = str(log_path) if log_path is not None else None
     model_id = int(model_id) if model_id is not None else None
+    class_scores_json = None
+    if isinstance(class_scores, dict):
+        try:
+            normalized_scores = {str(k): float(v) for k, v in class_scores.items()}
+            class_scores_json = json.dumps(normalized_scores, ensure_ascii=True)
+        except Exception:
+            class_scores_json = None
+
     query = '''
         INSERT INTO results (
             filename, model_name, task, path, n_neighbors, nsize, fgsm, normalize, n_calibration, classif_loss,
-            dloss, dist_fct, prototypes, npos, nneg, pred_label, confidence, log_path, person_id, model_id
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            dloss, dist_fct, prototypes, npos, nneg, pred_label, confidence, class_scores, log_path, person_id, model_id
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
             pred_label = VALUES(pred_label),
             confidence = VALUES(confidence),
+            class_scores = VALUES(class_scores),
             log_path = VALUES(log_path),
             person_id = VALUES(person_id),
             model_id = VALUES(model_id),
@@ -358,27 +431,69 @@ def insert_score(cursor, conn, filename, args, pred_label, confidence, log_path)
     values = (
         filename, args.model_name, args.task, args.path, str(args.n_neighbors), str(args.new_size), str(args.fgsm),
         args.normalize, str(args.n_calibration), args.classif_loss, args.dloss, args.dist_fct, args.prototypes_to_use,
-        str(args.n_positives), str(args.n_negatives), pred_label, confidence, log_path,
+        str(args.n_positives), str(args.n_negatives), pred_label, confidence, class_scores_json, log_path,
         st.session_state.person_id, model_id
     )
     try:
         cursor.execute(query, _mysql_values(values))
+    except mysql.connector.errors.ProgrammingError as e:
+        # Backward-compatible fallback when class_scores column is not yet present.
+        if "class_scores" not in str(e):
+            raise
+        query_legacy = '''
+            INSERT INTO results (
+                filename, model_name, task, path, n_neighbors, nsize, fgsm, normalize, n_calibration, classif_loss,
+                dloss, dist_fct, prototypes, npos, nneg, pred_label, confidence, log_path, person_id, model_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                pred_label = VALUES(pred_label),
+                confidence = VALUES(confidence),
+                log_path = VALUES(log_path),
+                person_id = VALUES(person_id),
+                model_id = VALUES(model_id),
+                timestamp = CURRENT_TIMESTAMP
+        '''
+        legacy_values = (
+            filename, args.model_name, args.task, args.path, str(args.n_neighbors), str(args.new_size), str(args.fgsm),
+            args.normalize, str(args.n_calibration), args.classif_loss, args.dloss, args.dist_fct, args.prototypes_to_use,
+            str(args.n_positives), str(args.n_negatives), pred_label, confidence, log_path,
+            st.session_state.person_id, model_id
+        )
+        cursor.execute(query_legacy, _mysql_values(legacy_values))
     except mysql.connector.errors.IntegrityError:
         # If the unique key blocks insertion, perform an explicit update to refresh timestamp and values
         update_q = '''
             UPDATE results
-            SET pred_label=%s, confidence=%s, log_path=%s, person_id=%s, model_id=%s, timestamp=CURRENT_TIMESTAMP
+            SET pred_label=%s, confidence=%s, class_scores=%s, log_path=%s, person_id=%s, model_id=%s, timestamp=CURRENT_TIMESTAMP
             WHERE filename=%s AND model_name=%s AND task=%s AND path=%s AND n_neighbors=%s AND nsize=%s AND fgsm=%s
                   AND normalize=%s AND n_calibration=%s AND classif_loss=%s AND dloss=%s AND dist_fct=%s AND prototypes=%s
                   AND npos=%s AND nneg=%s
         '''
         update_vals = (
-            pred_label, confidence, log_path, st.session_state.person_id, model_id,
+            pred_label, confidence, class_scores_json, log_path, st.session_state.person_id, model_id,
             filename, args.model_name, args.task, args.path, str(args.n_neighbors), str(args.new_size), str(args.fgsm),
             args.normalize, str(args.n_calibration), args.classif_loss, args.dloss, args.dist_fct, args.prototypes_to_use,
             str(args.n_positives), str(args.n_negatives)
         )
-        cursor.execute(update_q, _mysql_values(update_vals))
+        try:
+            cursor.execute(update_q, _mysql_values(update_vals))
+        except mysql.connector.errors.ProgrammingError as e:
+            if "class_scores" not in str(e):
+                raise
+            update_q_legacy = '''
+                UPDATE results
+                SET pred_label=%s, confidence=%s, log_path=%s, person_id=%s, model_id=%s, timestamp=CURRENT_TIMESTAMP
+                WHERE filename=%s AND model_name=%s AND task=%s AND path=%s AND n_neighbors=%s AND nsize=%s AND fgsm=%s
+                      AND normalize=%s AND n_calibration=%s AND classif_loss=%s AND dloss=%s AND dist_fct=%s AND prototypes=%s
+                      AND npos=%s AND nneg=%s
+            '''
+            update_vals_legacy = (
+                pred_label, confidence, log_path, st.session_state.person_id, model_id,
+                filename, args.model_name, args.task, args.path, str(args.n_neighbors), str(args.new_size), str(args.fgsm),
+                args.normalize, str(args.n_calibration), args.classif_loss, args.dloss, args.dist_fct, args.prototypes_to_use,
+                str(args.n_positives), str(args.n_negatives)
+            )
+            cursor.execute(update_q_legacy, _mysql_values(update_vals_legacy))
 
     summary_query = '''
         INSERT INTO model_usage_summary (
@@ -399,6 +514,21 @@ def insert_score(cursor, conn, filename, args, pred_label, confidence, log_path)
 
 def ensure_production_model_table(conn, cursor):
     """Ensure production_model table exists for storing the global production model."""
+    def _ensure_column(column_name: str, ddl: str):
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'production_model'
+              AND COLUMN_NAME = %s
+            """,
+            (column_name,),
+        )
+        if cursor.fetchone()[0] == 0:
+            cursor.execute(f"ALTER TABLE production_model ADD COLUMN {ddl}")
+            conn.commit()
+
     try:
         # First check if table exists
         cursor.execute(
@@ -416,10 +546,17 @@ def ensure_production_model_table(conn, cursor):
                 """
                 CREATE TABLE production_model (
                     id INT AUTO_INCREMENT PRIMARY KEY,
+                    label_scheme VARCHAR(50) NOT NULL DEFAULT 'four_class',
                     model_id INT NOT NULL,
                     model_name VARCHAR(255) NOT NULL,
                     model_number VARCHAR(50),
                     log_path TEXT,
+                    head_config VARCHAR(255),
+                    head_name VARCHAR(255),
+                    head_family VARCHAR(64),
+                    head_n_aug INT,
+                    prototype_strategy VARCHAR(64),
+                    prototype_components INT,
                     set_by VARCHAR(255),
                     set_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (model_id) REFERENCES best_models_registry(id) ON DELETE CASCADE
@@ -430,6 +567,13 @@ def ensure_production_model_table(conn, cursor):
             print("Created production_model table")
         else:
             print("production_model table already exists")
+            _ensure_column("label_scheme", "label_scheme VARCHAR(50) NOT NULL DEFAULT 'binary' AFTER id")
+            _ensure_column("head_config", "head_config VARCHAR(255) NULL AFTER log_path")
+            _ensure_column("head_name", "head_name VARCHAR(255) NULL AFTER head_config")
+            _ensure_column("head_family", "head_family VARCHAR(64) NULL AFTER head_name")
+            _ensure_column("head_n_aug", "head_n_aug INT NULL AFTER head_family")
+            _ensure_column("prototype_strategy", "prototype_strategy VARCHAR(64) NULL AFTER head_n_aug")
+            _ensure_column("prototype_components", "prototype_components INT NULL AFTER prototype_strategy")
     except Exception as e:
         print(f"Error creating production_model table: {e}")
         try:
@@ -438,23 +582,33 @@ def ensure_production_model_table(conn, cursor):
             pass
 
 
-def get_production_model(cursor):
+def get_production_model(cursor, label_scheme: str | None = None):
     """Get the current production model from database."""
+    label_scheme = label_scheme or "four_class"
     try:
         cursor.execute(
             """
             SELECT pm.model_id, pm.model_name, pm.model_number, pm.log_path, pm.set_by, pm.set_at,
+                   pm.label_scheme,
+                   pm.head_config, pm.head_name, pm.head_family, pm.head_n_aug,
+                   pm.prototype_strategy, pm.prototype_components,
                    bmr.model_name, bmr.nsize, bmr.fgsm, bmr.prototypes, bmr.npos, bmr.nneg,
                    bmr.dloss, bmr.dist_fct, bmr.classif_loss, bmr.n_calibration, bmr.accuracy,
-                   bmr.mcc, bmr.normalize, bmr.n_neighbors, bmr.prototype_strategy, bmr.prototype_components
+                   bmr.mcc, bmr.normalize, bmr.n_neighbors, bmr.prototype_strategy, bmr.prototype_components,
+                   bmr.train_datasets, bmr.valid_dataset, bmr.test_dataset, bmr.split_config_key
             FROM production_model pm
             LEFT JOIN best_models_registry bmr ON pm.model_id = bmr.id
+            WHERE pm.label_scheme=%s
             ORDER BY pm.set_at DESC
             LIMIT 1
-            """
+            """,
+            (label_scheme,),
         )
         row = cursor.fetchone()
         if row:
+            if row[3] and not os.path.exists(os.path.join(str(row[3]), "model.pth")):
+                print(f"Production model artifact missing, ignoring stale production row: {row[3]}")
+                return None
             return {
                 'model_id': row[0],
                 'model_name': row[1],
@@ -462,22 +616,37 @@ def get_production_model(cursor):
                 'log_path': row[3],
                 'set_by': row[4],
                 'set_at': row[5],
-                'Model Name': row[6],
-                'NSize': row[7],
-                'FGSM': row[8],
-                'Prototypes': row[9],
-                'NPos': row[10],
-                'NNeg': row[11],
-                'DLoss': row[12],
-                'Dist_Fct': row[13],
-                'Classif_Loss': row[14],
-                'N_Calibration': row[15],
-                'Accuracy': row[16],
-                'MCC': row[17],
-                'Normalize': row[18],
-                'N_Neighbors': row[19],
-                'prototype_strategy': row[20],
-                'prototype_components': row[21],
+                'label_scheme': row[6],
+                'Head Config': row[7],
+                'head_config': row[7],
+                'classification_head_config': row[7],
+                'best_classifier_config': row[7],
+                'Head': row[8],
+                'head_name': row[8],
+                'learned_classifier_label': row[8],
+                'head_family': row[9],
+                'head_n_aug': row[10],
+                'n_aug': row[10],
+                'prototype_strategy': row[11] if row[11] is not None else row[27],
+                'prototype_components': row[12] if row[12] is not None else row[28],
+                'Model Name': row[13],
+                'NSize': row[14],
+                'FGSM': row[15],
+                'Prototypes': row[16],
+                'NPos': row[17],
+                'NNeg': row[18],
+                'DLoss': row[19],
+                'Dist_Fct': row[20],
+                'Classif_Loss': row[21],
+                'N_Calibration': row[22],
+                'Accuracy': row[23],
+                'MCC': row[24],
+                'Normalize': row[25],
+                'N_Neighbors': row[26],
+                'train_datasets': row[29],
+                'valid_dataset': row[30],
+                'test_dataset': row[31],
+                'split_config_key': row[32],
             }
         return None
     except Exception as e:
@@ -488,20 +657,31 @@ def get_production_model(cursor):
 def set_production_model(cursor, conn, model_dict, set_by_email):
     """Set the production model in database."""
     try:
-        # First, clear any existing production model
-        cursor.execute("DELETE FROM production_model")
+        label_scheme = model_dict.get("label_scheme") or "four_class"
+        cursor.execute("DELETE FROM production_model WHERE label_scheme=%s", (label_scheme,))
         
         # Insert new production model
         cursor.execute(
             """
-            INSERT INTO production_model (model_id, model_name, model_number, log_path, set_by)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO production_model (
+                label_scheme, model_id, model_name, model_number, log_path,
+                head_config, head_name, head_family, head_n_aug,
+                prototype_strategy, prototype_components, set_by
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
+                label_scheme,
                 model_dict.get('model_id'),
                 model_dict.get('Model Name'),
                 model_dict.get('model_number'),
                 model_dict.get('Log Path'),
+                model_dict.get('Head Config') or model_dict.get('head_config') or model_dict.get('classification_head_config') or model_dict.get('best_classifier_config'),
+                model_dict.get('Head') or model_dict.get('head_name') or model_dict.get('learned_classifier_label'),
+                model_dict.get('head_family'),
+                model_dict.get('head_n_aug') or model_dict.get('n_aug') or model_dict.get('N Aug'),
+                model_dict.get('prototype_strategy') or model_dict.get('Proto_Strat'),
+                model_dict.get('prototype_components') or model_dict.get('Proto_Comp'),
                 set_by_email
             )
         )

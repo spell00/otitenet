@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 n_epochs=1000
-task=notNormal
-num_jobs=12
+task=otitis_four_class
+num_jobs=1
 new_size=224
 early_stop=10
 n_trials=3
 log_file=""
-auto_select_k=1
+auto_select_k=0
 run_cnn_mlp=1
 cnn_compare_all=0
 verbose=0
@@ -21,8 +21,8 @@ bs=32
 num_workers=8
 dataset_name="otite_ds_64"
 valid_dataset="Banque_Viscaino_Chili_2020"
-test_dataset="Banque_Viscaino_Chili_2020"
-train_datasets="Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM"
+test_dataset="inference"
+train_datasets="Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM,GMFUNL_jan2023"
 user_set_num_jobs=0
 user_set_bs=0
 min_free_mb=2048
@@ -30,7 +30,7 @@ mem_per_job_mb=6000
 max_oom_retries=3
 poll_interval=5
 show_progress_bar=1
-siamese_inference="logisticregression" # knn, linearsvc, logisticregression
+siamese_inference="linearsvc" # knn, linearsvc, logisticregression
 
 # DANN/FGSM params shared with CNN/MLP.
 gamma=1.0
@@ -96,7 +96,115 @@ for arg in "$@"; do
     esac
 done
 
+if [ "$siamese_inference" != "knn" ]; then
+    auto_select_k=0
+fi
+
+infer_dataset_name_from_split_config() {
+    local current_dataset_name="$1"
+    local train_value="$2"
+    local valid_value="$3"
+    local test_value="$4"
+    python - "$current_dataset_name" "$train_value" "$valid_value" "$test_value" <<'PY'
+import sys
+from otitenet.data.dataset_paths import infer_output_subdir_from_split_datasets
+
+dataset_name, train_datasets, valid_dataset, test_dataset = sys.argv[1:5]
+if "/" in dataset_name.strip("/"):
+    print(dataset_name)
+    raise SystemExit(0)
+
+subdir = infer_output_subdir_from_split_datasets(
+    train_datasets=train_datasets,
+    valid_dataset=valid_dataset,
+    test_dataset=test_dataset,
+)
+print(f"{dataset_name.rstrip('/')}/{subdir}" if subdir else dataset_name)
+PY
+}
+
+resolve_dataset_path() {
+    local requested_path="$1"
+    python - "$requested_path" <<'PY'
+import sys
+from otitenet.data.dataset_paths import resolve_processed_dataset_path
+
+print(resolve_processed_dataset_path(sys.argv[1]))
+PY
+}
+
+dataset_name="$(PYTHONPATH="/home/simon/otitenet" infer_dataset_name_from_split_config "$dataset_name" "$train_datasets" "$valid_dataset" "$test_dataset")"
 dataset_path="./data/${dataset_name}"
+resolved_dataset_path="$(PYTHONPATH="/home/simon/otitenet" resolve_dataset_path "$dataset_path")"
+if [ "$resolved_dataset_path" != "$dataset_path" ]; then
+    dataset_path="$resolved_dataset_path"
+    dataset_name="${dataset_path#./data/}"
+    dataset_name="${dataset_name#data/}"
+fi
+
+validate_requested_split_against_infos() {
+    local infos_path="${dataset_path}/infos.csv"
+    if [ ! -f "$infos_path" ] || [ -z "$train_datasets" ]; then
+        return
+    fi
+
+    python - "$infos_path" "$train_datasets" "$valid_dataset" "$test_dataset" <<'PY'
+import csv
+import sys
+
+infos_path, requested_train, requested_valid, requested_test = sys.argv[1:5]
+requested_train_set = {x.strip() for x in requested_train.split(",") if x.strip()}
+train_set = set()
+valid_set = set()
+test_set = set()
+
+try:
+    with open(infos_path, newline="") as handle:
+        reader = csv.DictReader(handle)
+        if "group" not in (reader.fieldnames or []) or "dataset" not in (reader.fieldnames or []):
+            raise SystemExit(0)
+        for row in reader:
+            group = str(row.get("group", "")).strip().lower()
+            dataset = str(row.get("dataset", "")).strip()
+            if not dataset:
+                continue
+            if group == "train":
+                train_set.add(dataset)
+            elif group == "valid":
+                valid_set.add(dataset)
+            elif group == "test":
+                test_set.add(dataset)
+except Exception as exc:
+    print(f"[SplitWarning] Could not inspect {infos_path}: {exc}")
+    raise SystemExit(0)
+
+if not (train_set or valid_set or test_set):
+    raise SystemExit(0)
+
+missing_train = sorted(requested_train_set - train_set)
+if missing_train:
+    print(
+        "[SplitWarning] infos.csv defines explicit split groups, so it overrides "
+        "--train_datasets. Requested train dataset(s) missing from group=train: "
+        + ",".join(missing_train)
+    )
+    print("[SplitWarning] Effective train_datasets from infos.csv: " + ",".join(sorted(train_set)))
+
+if requested_valid and requested_valid not in valid_set:
+    print(
+        f"[SplitWarning] Requested valid_dataset={requested_valid} is not present in infos.csv group=valid. "
+        f"Effective valid datasets: {','.join(sorted(valid_set))}"
+    )
+
+if requested_test and requested_test not in test_set:
+    print(
+        f"[SplitWarning] Requested test_dataset={requested_test} is not present in infos.csv group=test. "
+        f"Effective test datasets: {','.join(sorted(test_set))}"
+    )
+PY
+}
+
+validate_requested_split_against_infos
 
 # Use a filesystem-safe key for logs/markers/experiment ids.
 # Keep dataset_name unchanged for the actual data path and CLI metadata.
@@ -1672,7 +1780,7 @@ generate_jobs() {
     local n_calibration normalize model fgsm dloss loss prototype classif_loss n_negatives exp_id
     for n_calibration in 0 4; do
         for normalize in yes no; do
-            for model in resnet50 vit_b_16 vit_b_16_384 densenet161 vgg16 efficientnet_b0 resnet18 densenet121; do
+            for model in resnet18 resnet50 vit_b_16 vit_b_16_384 densenet161 vgg16 efficientnet_b0 densenet121; do
                 for fgsm in 0 1; do
                     for dloss in no inverseTriplet; do
                         # 1) Siamese jobs first for this shared parameter set

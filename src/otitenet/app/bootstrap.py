@@ -19,6 +19,7 @@ from .database import (
     create_db,
     get_db_connection,
     ensure_results_model_id,
+    ensure_results_class_scores,
     ensure_best_models_registry_nsize,
     check_ds_exists,
     list_image_results,
@@ -31,7 +32,9 @@ def initialize_database():
     from .database import (
         create_db,
         ensure_results_model_id,
+        ensure_results_class_scores,
         ensure_best_models_registry_nsize,
+        ensure_registry_metrics_columns,
     )
 
     conn, cursor = create_db()
@@ -42,9 +45,19 @@ def initialize_database():
         print(f"[bootstrap] Warning: ensure_results_model_id failed: {e}")
 
     try:
+        ensure_results_class_scores(conn, cursor)
+    except Exception as e:
+        print(f"[bootstrap] Warning: ensure_results_class_scores failed: {e}")
+
+    try:
         ensure_best_models_registry_nsize(conn, cursor)
     except Exception as e:
         print(f"[bootstrap] Warning: ensure_best_models_registry_nsize failed: {e}")
+
+    try:
+        ensure_registry_metrics_columns(conn, cursor)
+    except Exception as e:
+        print(f"[bootstrap] Warning: ensure_registry_metrics_columns failed: {e}")
 
     try:
         from .database import ensure_production_model_table
@@ -84,6 +97,8 @@ def initialize_user_state():
         "person_name": None,
         "selected_person": None,
         "production_model": None,
+        "production_task": "notNormal",
+        "label_scheme": "binary",
         "current_model_id": None,
     }
 
@@ -101,9 +116,9 @@ def is_current_user_admin():
 def load_production_model(cursor):
     """Load the current production model into session_state."""
     from .services.production_model_service import get_production_model, set_production_model
+    import streamlit as st
 
-    model_info = get_production_model(cursor)
+    model_info = get_production_model(cursor, task=st.session_state.get("production_task", "notNormal"))
     if model_info:
-        import streamlit as st
         st.session_state["production_model"] = model_info
     return model_info

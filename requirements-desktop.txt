@@ -7,6 +7,8 @@ streamlit>=1.43,<2
 
 # Runtime for exported offline production models.
 onnxruntime>=1.18,<1.19
+torch
+torchvision
 
 pyinstaller>=6.6,<7
 

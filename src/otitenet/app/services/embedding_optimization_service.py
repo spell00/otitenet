@@ -33,7 +33,28 @@ def _extract_params_from_log_path(log_path: str) -> dict:
 
     out = {}
 
-    parts = str(log_path).replace("\\", "/").split("/")
+    parts = str(log_path).strip("/").replace("\\", "/").split("/")
+
+    try:
+        base_idx = parts.index("best_models")
+    except ValueError:
+        base_idx = None
+
+    if base_idx is not None:
+        if len(parts) > base_idx + 1:
+            out["Task"] = parts[base_idx + 1]
+        if len(parts) > base_idx + 2:
+            out["Model Name"] = parts[base_idx + 2]
+        if len(parts) > base_idx + 3:
+            out["Dataset"] = parts[base_idx + 3]
+        if len(parts) > base_idx + 4 and str(parts[base_idx + 4]).startswith("split_"):
+            out["Split Segment"] = parts[base_idx + 4]
+            out["_split_config_in_path"] = True
+        offset = 1 if out.get("_split_config_in_path") else 0
+        if len(parts) > base_idx + 7 + offset:
+            out["Classif_Loss"] = parts[base_idx + 7 + offset]
+        if len(parts) > base_idx + 8 + offset:
+            out["DLoss"] = parts[base_idx + 8 + offset]
 
     for p in parts:
         low = p.lower()
@@ -42,6 +63,32 @@ def _extract_params_from_log_path(log_path: str) -> dict:
             digits = "".join(ch for ch in p if ch.isdigit())
             if digits:
                 out["NSize"] = int(digits)
+        elif low.startswith("fgsm"):
+            digits = "".join(ch for ch in p if ch.isdigit())
+            if digits:
+                out["FGSM"] = int(digits)
+        elif low.startswith("ncal"):
+            digits = "".join(ch for ch in p if ch.isdigit())
+            if digits:
+                out["N_Calibration"] = int(digits)
+        elif low.startswith("prototypes_"):
+            out["Prototypes"] = p[len("prototypes_"):]
+        elif low.startswith("norm"):
+            out["Normalize"] = p[len("norm"):]
+        elif low.startswith("dist_"):
+            out["Dist_Fct"] = p[len("dist_"):]
+        elif low.startswith("knn"):
+            digits = "".join(ch for ch in p if ch.isdigit())
+            if digits:
+                out["N_Neighbors"] = int(digits)
+        elif low.startswith("protoagg_"):
+            agg_parts = p.split("_")
+            if len(agg_parts) >= 2 and agg_parts[1]:
+                out["Proto_Strat"] = agg_parts[1]
+                out["prototype_strategy"] = agg_parts[1]
+            if len(agg_parts) >= 3 and agg_parts[2]:
+                out["Proto_Comp"] = agg_parts[2]
+                out["prototype_components"] = agg_parts[2]
 
         if low.startswith("npos"):
             digits = "".join(ch for ch in p if ch.isdigit())
@@ -77,6 +124,8 @@ def args_from_model_row(base_args, row_dict: dict):
     row.update({k: v for k, v in parsed.items() if v is not None})
 
     string_mapping = {
+        "Task": "task",
+        "task": "task",
         "Model Name": "model_name",
         "model_name": "model_name",
         "FGSM": "fgsm",
@@ -91,6 +140,8 @@ def args_from_model_row(base_args, row_dict: dict):
         "dist_fct": "dist_fct",
         "Prototypes": "prototypes_to_use",
         "prototypes": "prototypes_to_use",
+        "Proto_Strat": "prototype_strategy",
+        "prototype_strategy": "prototype_strategy",
     }
 
     for src, dst in string_mapping.items():
@@ -110,6 +161,8 @@ def args_from_model_row(base_args, row_dict: dict):
         "n_calibration": "n_calibration",
         "N_Neighbors": "n_neighbors",
         "n_neighbors": "n_neighbors",
+        "Proto_Comp": "prototype_components",
+        "prototype_components": "prototype_components",
     }
 
     for src, dst in int_mapping.items():
@@ -117,6 +170,21 @@ def args_from_model_row(base_args, row_dict: dict):
             val = _ensure_int(row.get(src), getattr(local_args, dst, None))
             if val is not None:
                 setattr(local_args, dst, val)
+
+    for src, dst in {
+        "train_datasets": "train_datasets",
+        "Train Datasets": "train_datasets",
+        "valid_dataset": "valid_dataset",
+        "Valid Dataset": "valid_dataset",
+        "test_dataset": "test_dataset",
+        "Test Dataset": "test_dataset",
+    }.items():
+        if row.get(src) is not None:
+            setattr(local_args, dst, row.get(src))
+
+    if row.get("_split_config_in_path") or row.get("Split Segment") or row.get("split_config_key"):
+        setattr(local_args, "split_config_in_path", True)
+        setattr(local_args, "_split_config_in_path", True)
 
     if log_path:
         local_args.log_path = log_path
@@ -141,6 +209,7 @@ def fetch_best_model_rows(cursor, limit: int = 10) -> pd.DataFrame:
     preferred_query = """
         SELECT
             id AS `Model ID`,
+            task AS `Task`,
             model_name AS `Model Name`,
             nsize AS `NSize`,
             fgsm AS `FGSM`,
@@ -155,6 +224,10 @@ def fetch_best_model_rows(cursor, limit: int = 10) -> pd.DataFrame:
             mcc AS `MCC`,
             normalize AS `Normalize`,
             n_neighbors AS `N_Neighbors`,
+            train_datasets AS `train_datasets`,
+            valid_dataset AS `valid_dataset`,
+            test_dataset AS `test_dataset`,
+            split_config_key AS `split_config_key`,
             log_path AS `Log Path`
         FROM best_models_registry
         ORDER BY mcc DESC
@@ -167,6 +240,7 @@ def fetch_best_model_rows(cursor, limit: int = 10) -> pd.DataFrame:
 
         columns = [
             "Model ID",
+            "Task",
             "Model Name",
             "NSize",
             "FGSM",
@@ -181,6 +255,10 @@ def fetch_best_model_rows(cursor, limit: int = 10) -> pd.DataFrame:
             "MCC",
             "Normalize",
             "N_Neighbors",
+            "train_datasets",
+            "valid_dataset",
+            "test_dataset",
+            "split_config_key",
             "Log Path",
         ]
 

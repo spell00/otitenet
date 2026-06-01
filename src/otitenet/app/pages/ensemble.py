@@ -171,21 +171,23 @@ def _run_ensemble(ctx, uploaded_files, selected_rows: pd.DataFrame, method: str,
                     quiet=True,
                 )
                 pred, conf, log_path, existing, gradcam_path = normalize_analysis_result(analysis_result)
+                class_scores = analysis_result[5] if isinstance(analysis_result, (tuple, list)) and len(analysis_result) > 5 and isinstance(analysis_result[5], dict) else {}
 
-                all_rows.append(
-                    {
-                        "Filename": filename,
-                        "Model ID": model_id,
-                        "Model": model_dict.get("Model Name"),
-                        "Rank": model_dict.get("#"),
-                        "Head": _head_config_label_global(head_config),
-                        "Head Config": head_config,
-                        "Prediction": pred,
-                        "Confidence": conf,
-                        "Existing": existing,
-                        "Log Path": log_path,
-                    }
-                )
+                result_row = {
+                    "Filename": filename,
+                    "Model ID": model_id,
+                    "Model": model_dict.get("Model Name"),
+                    "Rank": model_dict.get("#"),
+                    "Head": _head_config_label_global(head_config),
+                    "Head Config": head_config,
+                    "Prediction": pred,
+                    "Confidence": conf,
+                    "Existing": existing,
+                    "Log Path": log_path,
+                }
+                for label, score in class_scores.items():
+                    result_row[f"Score {label}"] = score
+                all_rows.append(result_row)
             except Exception as exc:
                 all_rows.append(
                     {
@@ -318,4 +320,6 @@ def render(ctx: Any) -> None:
     display_raw = raw_df.copy()
     if "Confidence" in display_raw.columns:
         display_raw["Confidence"] = display_raw["Confidence"].apply(fmt_confidence)
+    for col in [c for c in display_raw.columns if str(c).startswith("Score ")]:
+        display_raw[col] = display_raw[col].apply(fmt_confidence)
     st.dataframe(_arrow_safe_dataframe(display_raw.drop(columns=["Log Path"], errors="ignore")), use_container_width=True)
