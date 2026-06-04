@@ -1,0 +1,10 @@
+stages:
+  dvclive_latest:
+    # Runtime training writes these files; this stage exists so dvc exp show can render columns.
+    cmd: "mkdir -p logs/dvc_exp && (test -f logs/dvc_exp/latest_metrics.json || echo '{}' > logs/dvc_exp/latest_metrics.json) && (test -f logs/dvc_exp/latest_params.yaml || echo '{}' > logs/dvc_exp/latest_params.yaml)"
+    deps:
+      - src/otitenet/logging/dvclive_tracking.py
+    params:
+      - logs/dvc_exp/latest_params.yaml:
+    metrics:
+      - logs/dvc_exp/latest_metrics.json

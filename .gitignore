@@ -91,3 +91,4 @@ otitenet/utils/__pycache__/*
 otitenet/__pycache__/*
 otitenet/train/old/*
 otitenet/models/*
+/data
