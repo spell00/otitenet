@@ -7,14 +7,19 @@ import copy
 import os
 import time
 import traceback
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
 from otitenet.app.analysis import run_analysis_on_file
-from otitenet.app.display_metrics import _arrow_safe_dataframe
+from otitenet.app.display_metrics import _arrow_safe_dataframe, _best_head_config_for_args_global
+from otitenet.app.services.inference_results_service import args_from_inference_row
 from otitenet.app.utils import (
+    _ensure_model_number_map,
+    _make_model_selection_key,
     format_classifier_config,
     parse_classifier_config,
     resolve_best_classifier_config,
@@ -136,6 +141,69 @@ def _prepare_analysis_args(ctx, infer_method: str, dist_metric: str):
     _set_head_on_args(args, head_config)
 
     return args, head_config
+
+
+def _load_ranked_models(cursor, top_n: int) -> pd.DataFrame:
+    _, best_models_table = _ensure_model_number_map(cursor)
+    if best_models_table is None or best_models_table.empty:
+        return pd.DataFrame()
+    df = best_models_table.copy().reset_index(drop=True)
+    if "#" not in df.columns:
+        df["#"] = range(1, len(df) + 1)
+    df["_selection_key"] = df.apply(lambda r: _make_model_selection_key(r.to_dict()), axis=1)
+    return df.head(int(top_n)).copy()
+
+
+def _prepare_model_args_from_row(ctx, row: Dict[str, Any], infer_method: str, dist_metric: str):
+    args = args_from_inference_row(ctx.args, row)
+    args.infer_method = infer_method
+    args.dist_metric = dist_metric
+    head_config = _best_head_config_for_args_global(args)
+    _set_head_on_args(args, str(head_config))
+    return args, str(head_config)
+
+
+def _vote_decision(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    valid_rows = [r for r in rows if str(r.get("Prediction")) != "ERROR"]
+    if not valid_rows:
+        return {
+            "Ensemble Prediction": "Unknown",
+            "Ensemble Raw Prediction": "Unknown",
+            "Ensemble Vote %": np.nan,
+            "Models Voted": 0,
+            "Votes": "",
+        }
+    counts = Counter(str(r.get("Prediction") or "Unknown") for r in valid_rows)
+    consensus, count = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0]
+    vote_pct = 100.0 * float(count) / float(len(valid_rows)) if valid_rows else np.nan
+    return {
+        "Ensemble Prediction": consensus,
+        "Ensemble Raw Prediction": consensus,
+        "Ensemble Vote %": vote_pct,
+        "Models Voted": len(valid_rows),
+        "Votes": ", ".join(f"{label}:{n}" for label, n in counts.most_common()),
+    }
+
+
+def _threshold_decision(selected_prediction, selected_confidence, ensemble_prediction, ensemble_vote_pct):
+    conf_threshold = float(st.session_state.get("production_selected_confidence_threshold", 0.50))
+    vote_threshold = float(st.session_state.get("production_ensemble_vote_threshold_pct", 80.0))
+    require_both = bool(st.session_state.get("production_require_both_thresholds", False))
+    try:
+        conf = float(selected_confidence)
+    except Exception:
+        conf = np.nan
+    try:
+        vote_pct = float(ensemble_vote_pct)
+    except Exception:
+        vote_pct = np.nan
+    selected_passes = pd.notna(conf) and conf >= conf_threshold
+    ensemble_passes = pd.notna(vote_pct) and vote_pct >= vote_threshold
+    if require_both:
+        return selected_prediction if selected_passes and ensemble_passes else "Unknown"
+    if selected_passes:
+        return selected_prediction
+    return ensemble_prediction if ensemble_passes else "Unknown"
 
 
 def _delete_existing_results_for_files(ctx, filenames: List[str]) -> None:
@@ -376,7 +444,14 @@ def _render_results_table(results: List[Dict[str, Any]]) -> None:
     score_cols = sorted([c for c in df.columns if c.startswith("Score ")])
     display_cols = [
         "Filename",
+        "Decision",
         "Prediction",
+        "Selected Model Prediction",
+        "Selected Model Confidence",
+        "Ensemble Prediction",
+        "Ensemble Vote %",
+        "Models Voted",
+        "Votes",
         "Confidence",
         *score_cols,
         "Existing",
@@ -390,6 +465,12 @@ def _render_results_table(results: List[Dict[str, Any]]) -> None:
 
     if "Confidence" in table.columns:
         table["Confidence"] = table["Confidence"].apply(_fmt_confidence)
+    if "Selected Model Confidence" in table.columns:
+        table["Selected Model Confidence"] = table["Selected Model Confidence"].apply(_fmt_confidence)
+    if "Ensemble Vote %" in table.columns:
+        table["Ensemble Vote %"] = table["Ensemble Vote %"].apply(
+            lambda v: "" if pd.isna(v) else f"{float(v):.1f}"
+        )
     for col in score_cols:
         if col in table.columns:
             table[col] = table[col].apply(_fmt_confidence)
@@ -410,7 +491,7 @@ def _render_single_result_observer(results: List[Dict[str, Any]], n_layers: int 
 
     def option_label(i):
         r = results[i]
-        return f"{r.get('Filename')} | pred={r.get('Prediction')} | conf={_fmt_confidence(r.get('Confidence'))}"
+        return f"{r.get('Filename')} | decision={r.get('Decision', r.get('Prediction'))} | conf={_fmt_confidence(r.get('Confidence'))}"
 
     selected = st.selectbox(
         "Select analyzed image",
@@ -429,7 +510,11 @@ def _render_single_result_observer(results: List[Dict[str, Any]], n_layers: int 
             st.image(file_bytes, caption=f"Input: {row.get('Filename')}", use_container_width=True)
 
     with c2:
-        st.markdown(f"**Prediction:** {row.get('Prediction')}")
+        st.markdown(f"**Decision:** {row.get('Decision', row.get('Prediction'))}")
+        if row.get("Selected Model Prediction") is not None:
+            st.markdown(f"**Selected model:** {row.get('Selected Model Prediction')}")
+        if row.get("Ensemble Prediction") is not None:
+            st.markdown(f"**Top-N ensemble:** {row.get('Ensemble Prediction')}")
         st.markdown(f"**Confidence:** {_fmt_confidence(row.get('Confidence'))}")
         score_items = [
             (str(k[len("Score "):]), row.get(k))
@@ -445,6 +530,17 @@ def _render_single_result_observer(results: List[Dict[str, Any]], n_layers: int 
         if row.get("Log Path"):
             with st.expander("Log path"):
                 st.code(str(row.get("Log Path")))
+        per_model_rows = row.get("Per-Model Predictions")
+        if per_model_rows:
+            with st.expander("Per-model Top-N predictions", expanded=False):
+                per_model_df = pd.DataFrame(per_model_rows)
+                for conf_col in [c for c in ["Confidence"] if c in per_model_df.columns]:
+                    per_model_df[conf_col] = per_model_df[conf_col].apply(_fmt_confidence)
+                st.dataframe(
+                    _arrow_safe_dataframe(per_model_df.drop(columns=["Log Path"], errors="ignore")),
+                    hide_index=True,
+                    use_container_width=True,
+                )
 
     gradcam_images = _find_gradcam_images(row.get("Log Path"), row.get("Filename"), n_layers=n_layers)
 
@@ -596,8 +692,66 @@ def render(ctx):
             "If the production model changed, a new result is computed; otherwise the saved result may be loaded."
         )
 
+    use_topn_ensemble = bool(st.session_state.get("production_use_topn_ensemble", False))
+    top_n_models = int(st.session_state.get("production_top_n_models", 5))
+    if is_admin:
+        with st.expander("Production decision thresholds", expanded=False):
+            use_topn_ensemble = st.checkbox(
+                "Use Top-N ensemble for this analysis",
+                value=use_topn_ensemble,
+                key="new_analysis_use_topn_ensemble",
+            )
+            top_n_models = st.number_input(
+                "Top-N models to run",
+                min_value=1,
+                max_value=25,
+                value=top_n_models,
+                step=1,
+                key="new_analysis_top_n_models",
+            )
+            st.session_state["production_use_topn_ensemble"] = bool(use_topn_ensemble)
+            st.session_state["production_top_n_models"] = int(top_n_models)
+            st.session_state["production_selected_confidence_threshold"] = st.slider(
+                "Selected model confidence threshold",
+                0.0,
+                1.0,
+                float(st.session_state.get("production_selected_confidence_threshold", 0.50)),
+                0.01,
+                key="new_analysis_selected_conf_threshold",
+            )
+            st.session_state["production_ensemble_vote_threshold_pct"] = st.slider(
+                "Top-N ensemble vote threshold (%)",
+                0.0,
+                100.0,
+                float(st.session_state.get("production_ensemble_vote_threshold_pct", 80.0)),
+                1.0,
+                key="new_analysis_ensemble_vote_threshold",
+            )
+            st.session_state["production_require_both_thresholds"] = st.checkbox(
+                "Require both thresholds",
+                value=bool(st.session_state.get("production_require_both_thresholds", False)),
+                key="new_analysis_require_both_thresholds",
+            )
+    elif use_topn_ensemble:
+        st.info(
+            f"Top-{top_n_models} ensemble mode is active. "
+            f"Confidence threshold={float(st.session_state.get('production_selected_confidence_threshold', 0.50)):.2f}; "
+            f"vote threshold={float(st.session_state.get('production_ensemble_vote_threshold_pct', 80.0)):.0f}%."
+        )
+
     analysis_args, head_config = _prepare_analysis_args(ctx, infer_method, dist_metric)
     _render_current_model_summary(analysis_args, head_config, is_admin=is_admin)
+
+    topn_models_df = pd.DataFrame()
+    if use_topn_ensemble:
+        topn_models_df = _load_ranked_models(ctx.cursor, top_n_models)
+        if topn_models_df.empty:
+            st.warning("Top-N ensemble is enabled, but no ranked models were found. Falling back to the selected model.")
+            use_topn_ensemble = False
+        else:
+            st.markdown("**Top-N models that will run**")
+            topn_cols = [c for c in ["#", "Model ID", "Model Name", "Valid MCC", "Test MCC", "Valid AUC", "Test AUC", "Head", "Head Config"] if c in topn_models_df.columns]
+            st.dataframe(_arrow_safe_dataframe(topn_models_df[topn_cols]), use_container_width=True)
 
     images_for_run, run_batch = _select_images_for_current_run(uploaded_images, is_admin=is_admin)
 
@@ -634,6 +788,9 @@ def render(ctx):
     start_time = time.time()
 
     run_total = len(images_for_run)
+    model_total = int(len(topn_models_df)) if use_topn_ensemble and not topn_models_df.empty else 1
+    total_jobs = max(1, run_total * model_total)
+    completed_jobs = 0
 
     for idx, image_info in enumerate(images_for_run):
         file_start = time.time()
@@ -649,45 +806,138 @@ def render(ctx):
         try:
             file_bytes = image_info["Bytes"]
 
-            result = run_analysis_on_file(
-                filename,
-                file_bytes,
-                analysis_args,
-                ctx.cursor,
-                ctx.conn,
-                force_reanalyze=force_reanalyze,
-                show_validation_metrics=not skip_validation,
-                fast_infer=fast_infer,
-                quiet=True,
-            )
+            if use_topn_ensemble and not topn_models_df.empty:
+                per_model_rows = []
+                for model_i, (_, model_row) in enumerate(topn_models_df.iterrows(), start=1):
+                    model_dict = model_row.drop(labels=["_selection_key"], errors="ignore").to_dict()
+                    try:
+                        model_args, model_head_config = _prepare_model_args_from_row(ctx, model_dict, infer_method, dist_metric)
+                        status_text.write(
+                            f"Processing {filename}: model {model_i}/{model_total} "
+                            f"(ID {model_dict.get('Model ID', '?')})"
+                        )
+                        result = run_analysis_on_file(
+                            filename,
+                            file_bytes,
+                            model_args,
+                            ctx.cursor,
+                            ctx.conn,
+                            force_reanalyze=force_reanalyze,
+                            show_validation_metrics=not skip_validation,
+                            fast_infer=fast_infer,
+                            quiet=True,
+                        )
+                        pred_label, confidence, complete_log_path, existing, gradcam_path, class_scores = _normalize_analysis_result(result)
+                        per_model_row = {
+                            "Filename": filename,
+                            "Model ID": model_dict.get("Model ID"),
+                            "Model": model_dict.get("Model Name"),
+                            "Rank": model_dict.get("#"),
+                            "Head": format_classifier_config(model_head_config),
+                            "Head Config": model_head_config,
+                            "Prediction": pred_label,
+                            "Confidence": confidence,
+                            "Existing": bool(existing),
+                            "Log Path": complete_log_path,
+                        }
+                        for label, score in (class_scores or {}).items():
+                            per_model_row[f"Score {label}"] = score
+                    except Exception as model_exc:
+                        per_model_row = {
+                            "Filename": filename,
+                            "Model ID": model_dict.get("Model ID"),
+                            "Model": model_dict.get("Model Name"),
+                            "Rank": model_dict.get("#"),
+                            "Prediction": "ERROR",
+                            "Confidence": np.nan,
+                            "Existing": False,
+                            "Error": str(model_exc),
+                        }
+                    per_model_rows.append(per_model_row)
+                    completed_jobs += 1
+                    progress_bar.progress(min(1.0, completed_jobs / total_jobs))
 
-            pred_label, confidence, complete_log_path, existing, gradcam_path, class_scores = _normalize_analysis_result(result)
+                selected_row = per_model_rows[0] if per_model_rows else {}
+                vote_info = _vote_decision(per_model_rows)
+                decision = _threshold_decision(
+                    selected_row.get("Prediction", "Unknown"),
+                    selected_row.get("Confidence"),
+                    vote_info.get("Ensemble Raw Prediction", "Unknown"),
+                    vote_info.get("Ensemble Vote %"),
+                )
+                complete_log_path = selected_row.get("Log Path")
+                gradcam_images = _find_gradcam_images(
+                    complete_log_path,
+                    filename,
+                    n_layers=int(n_gradcam_layers),
+                )
+                row = {
+                    "Filename": filename,
+                    "Decision": decision,
+                    "Prediction": decision,
+                    "Selected Model Prediction": selected_row.get("Prediction", "Unknown"),
+                    "Selected Model Confidence": selected_row.get("Confidence"),
+                    "Selected Model ID": selected_row.get("Model ID"),
+                    "Ensemble Prediction": vote_info.get("Ensemble Prediction"),
+                    "Ensemble Raw Prediction": vote_info.get("Ensemble Raw Prediction"),
+                    "Ensemble Vote %": vote_info.get("Ensemble Vote %"),
+                    "Models Voted": vote_info.get("Models Voted"),
+                    "Votes": vote_info.get("Votes"),
+                    "Confidence": selected_row.get("Confidence"),
+                    "Existing": any(bool(r.get("Existing")) for r in per_model_rows),
+                    "Log Path": complete_log_path,
+                    "Grad-CAM Path": None,
+                    "Grad-CAM": len(gradcam_images),
+                    "Elapsed (s)": round(time.time() - file_start, 2),
+                    "Bytes": file_bytes,
+                    "Per-Model Predictions": per_model_rows,
+                }
+                for key, value in selected_row.items():
+                    if str(key).startswith("Score "):
+                        row[key] = value
+                results.append(row)
+            else:
+                result = run_analysis_on_file(
+                    filename,
+                    file_bytes,
+                    analysis_args,
+                    ctx.cursor,
+                    ctx.conn,
+                    force_reanalyze=force_reanalyze,
+                    show_validation_metrics=not skip_validation,
+                    fast_infer=fast_infer,
+                    quiet=True,
+                )
 
-            gradcam_images = _find_gradcam_images(
-                complete_log_path,
-                filename,
-                n_layers=int(n_gradcam_layers),
-            )
+                pred_label, confidence, complete_log_path, existing, gradcam_path, class_scores = _normalize_analysis_result(result)
 
-            row = {
-                "Filename": filename,
-                "Prediction": pred_label,
-                "Confidence": confidence,
-                "Existing": bool(existing),
-                "Log Path": complete_log_path,
-                "Grad-CAM Path": gradcam_path,
-                "Grad-CAM": len(gradcam_images),
-                "Elapsed (s)": round(time.time() - file_start, 2),
-                "Bytes": file_bytes,
-            }
-            for label, score in (class_scores or {}).items():
-                row[f"Score {label}"] = score
-            results.append(row)
+                gradcam_images = _find_gradcam_images(
+                    complete_log_path,
+                    filename,
+                    n_layers=int(n_gradcam_layers),
+                )
+
+                row = {
+                    "Filename": filename,
+                    "Decision": pred_label,
+                    "Prediction": pred_label,
+                    "Confidence": confidence,
+                    "Existing": bool(existing),
+                    "Log Path": complete_log_path,
+                    "Grad-CAM Path": gradcam_path,
+                    "Grad-CAM": len(gradcam_images),
+                    "Elapsed (s)": round(time.time() - file_start, 2),
+                    "Bytes": file_bytes,
+                }
+                for label, score in (class_scores or {}).items():
+                    row[f"Score {label}"] = score
+                results.append(row)
+                completed_jobs += 1
 
             st.session_state["last_uploaded_name"] = filename
-            st.session_state["last_complete_log_path"] = complete_log_path
-            st.session_state["last_prediction"] = pred_label
-            st.session_state["last_confidence"] = confidence
+            st.session_state["last_complete_log_path"] = results[-1].get("Log Path")
+            st.session_state["last_prediction"] = results[-1].get("Decision", results[-1].get("Prediction"))
+            st.session_state["last_confidence"] = results[-1].get("Confidence")
 
         except Exception as e:
             results.append(
@@ -707,7 +957,7 @@ def render(ctx):
             with st.expander(f"Error details for {filename}"):
                 st.code(traceback.format_exc())
 
-        progress_bar.progress((idx + 1) / max(run_total, 1))
+        progress_bar.progress(min(1.0, completed_jobs / total_jobs))
 
     status_text.success(f"Finished {run_total} file(s) in {time.time() - start_time:.1f}s.")
 

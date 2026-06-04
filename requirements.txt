@@ -35,9 +35,10 @@ transformers
 opencv-python
 mysql-connector-python
 streamlit
-comet-ml
 debugpy
 optuna
 pytest
 pytest-asyncio
 httpx
+dvc
+dvclive

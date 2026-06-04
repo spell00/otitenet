@@ -48,10 +48,13 @@ def get_batch_metrics(lists, n_neighbors=5, random_state=42):
         batch_group = _safe_concat(lists[group]['domains'])
         if enc_group is not None and batch_group is not None:
             if len(enc_group) != len(batch_group):
-                raise ValueError(
-                    f"Batch metric input mismatch in group={group}: "
-                    f"encoded_values={len(enc_group)} domains={len(batch_group)}"
+                min_len = min(len(enc_group), len(batch_group))
+                print(
+                    f"[BatchMetrics] input mismatch in group={group}: "
+                    f"encoded_values={len(enc_group)} domains={len(batch_group)}; using {min_len}"
                 )
+                enc_group = enc_group[:min_len]
+                batch_group = batch_group[:min_len]
             if len(enc_group) > 0:
                 encs.append(enc_group)
                 batches.append(batch_group)

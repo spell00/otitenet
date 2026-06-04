@@ -1,4 +1,3 @@
-import comet_ml
 from otitenet.logging.metrics import compute_batch_effect_metrics
 import logging
 import os
@@ -32,7 +31,10 @@ import time
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from umap.umap_ import UMAP
+try:
+    from umap.umap_ import UMAP
+except ModuleNotFoundError:
+    UMAP = None
 from sklearn.manifold import Isomap
 from sklearn.manifold import MDS
 from sklearn.neural_network import MLPClassifier
@@ -47,7 +49,6 @@ from otitenet.ml import (
     fit_kde_classifier,
 )
 from sklearn import metrics
-from tensorboardX import SummaryWriter
 from sklearn.metrics import matthews_corrcoef as MCC
 import optuna
 from optuna.samplers import TPESampler
@@ -62,7 +63,8 @@ matplotlib.use('Agg')
 CUDA_VISIBLE_DEVICES = ""
 
 from ..logging.loggings import LogConfusionMatrix, add_to_tracking, add_to_mlflow, create_tracking_run, log_mlflow, \
-    TRACKING_API_TOKEN, TRACKING_PROJECT_NAME, TRACKING_MODEL_NAME, add_to_logger, add_to_comet, make_comet_logger
+    TRACKING_API_TOKEN, TRACKING_PROJECT_NAME, TRACKING_MODEL_NAME, add_to_logger
+from ..logging.dvclive_tracking import DVCLiveTracker
 from ..data.data_getters import GetData, get_distance_fct, get_images_loaders, get_n_features
 from ..data.dataset_paths import resolve_processed_dataset_path
 from ..utils.utils import get_optimizer, to_categorical, get_empty_dicts, get_empty_traces, \
@@ -85,6 +87,30 @@ from .batch_effects import get_batch_metrics
 from .completed_runs_metrics import append_completed_run_metrics
 
 warnings.filterwarnings("ignore")
+
+
+class _NullSummaryWriter:
+    def __init__(self, *args, **kwargs):
+        self.disabled = True
+
+    def add_scalar(self, *args, **kwargs):
+        return None
+
+    def add_figure(self, *args, **kwargs):
+        return None
+
+    def close(self):
+        return None
+
+
+def _make_summary_writer(path, enabled=True):
+    if not enabled:
+        return _NullSummaryWriter(path)
+    try:
+        from tensorboardX import SummaryWriter
+    except ModuleNotFoundError:
+        return _NullSummaryWriter(path)
+    return SummaryWriter(path)
 
 
 def _normalize_train_datasets(value):
@@ -165,10 +191,21 @@ def _split_config_from_args(args):
 
 def _ensure_registry_split_columns(cursor, conn):
     columns = {
+        "task": "VARCHAR(128) NULL",
+        "dataset_path": "VARCHAR(512) NULL",
+        "siamese_inference": "VARCHAR(64) NULL",
+        "run_tag": "VARCHAR(128) NULL",
+        "config_key": "VARCHAR(64) NULL",
         "train_datasets": "TEXT NULL",
         "valid_dataset": "VARCHAR(255) NULL",
         "test_dataset": "VARCHAR(255) NULL",
         "split_config_key": "VARCHAR(1024) NULL",
+        "artifact_id": "VARCHAR(32) NULL",
+        "best_model_dir": "TEXT NULL",
+        "source_run_log_path": "TEXT NULL",
+        "batch_entropy_norm": "DOUBLE NULL",
+        "batch_nmi": "DOUBLE NULL",
+        "batch_ari": "DOUBLE NULL",
     }
     for col, col_type in columns.items():
         try:
@@ -189,6 +226,70 @@ def _ensure_registry_split_columns(cursor, conn):
         except Exception as e:
             print(f"Warning: could not ensure best_models_registry.{col}: {e}")
 
+    # New uniqueness model: one best row per full configuration key.
+    try:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM INFORMATION_SCHEMA.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'best_models_registry'
+              AND INDEX_NAME = 'uniq_config_key'
+            """
+        )
+        has_idx = cursor.fetchone()[0] > 0
+        if not has_idx:
+            cursor.execute("CREATE UNIQUE INDEX uniq_config_key ON best_models_registry(config_key)")
+            conn.commit()
+    except Exception as e:
+        print(f"Warning: could not ensure best_models_registry.uniq_config_key: {e}")
+
+    # Legacy unique_combo is too coarse (collides across task/dataset/split/head method).
+    try:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM INFORMATION_SCHEMA.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'best_models_registry'
+              AND INDEX_NAME = 'unique_combo'
+            """
+        )
+        has_legacy_idx = cursor.fetchone()[0] > 0
+        if has_legacy_idx:
+            cursor.execute("DROP INDEX unique_combo ON best_models_registry")
+            conn.commit()
+    except Exception as e:
+        print(f"Warning: could not drop legacy best_models_registry.unique_combo index: {e}")
+
+
+def _best_registry_config_key(params):
+    """Stable key for best-model grouping across full run-defining config."""
+    key_fields = [
+        str(params.get('task', '') or '').strip(),
+        str(params.get('model_name', '') or '').strip(),
+        str(params.get('dataset_path', '') or '').strip().replace('\\', '/'),
+        str(params.get('train_datasets', '') or '').strip(),
+        str(params.get('valid_dataset', '') or '').strip(),
+        str(params.get('test_dataset', '') or '').strip(),
+        str(params.get('split_config_key', '') or '').strip(),
+        str(params.get('siamese_inference', '') or '').strip(),
+        str(params.get('classif_loss', '') or '').strip(),
+        str(params.get('dloss', '') or '').strip(),
+        str(params.get('prototypes', '') or '').strip(),
+        str(params.get('prototype_strategy', '') or '').strip(),
+        str(params.get('prototype_components', '') or '').strip(),
+        str(params.get('fgsm', '') or '').strip(),
+        str(params.get('n_calibration', '') or '').strip(),
+        str(params.get('normalize', '') or '').strip(),
+        str(params.get('nsize', '') or '').strip(),
+        str(params.get('dist_fct', '') or '').strip(),
+        str(params.get('n_neighbors', '') or '').strip(),
+        str(params.get('npos', '') or '').strip(),
+        str(params.get('nneg', '') or '').strip(),
+    ]
+    return hashlib.sha1("|".join(key_fields).encode("utf-8")).hexdigest()
+
 # Ax emits noisy kwargs type-check warnings in this environment even for valid runtime values.
 # Keep actual training errors visible while silencing that specific logger.
 logging.getLogger("ax.utils.common.kwargs").setLevel(logging.ERROR)
@@ -205,7 +306,19 @@ from ..logging.shap import log_shap_images_gradients
 from ..logging.grad_cam import log_grad_cam_similarity
 from ..utils.prototypes import Prototypes
 
-def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=None):
+
+def _make_comet_experiment(api_key, project_name):
+    from ..logging.loggings import prepare_comet_lazy_import
+
+    prepare_comet_lazy_import()
+    try:
+        import comet_ml
+    except ModuleNotFoundError:
+        print("[Comet] comet_ml is not installed: skipping Comet logging.")
+        return None
+    return comet_ml.Experiment(api_key=api_key, project_name=project_name)
+
+def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=None, source_run_log_path=None):
     """Update best_models_registry table with model performance metrics.
     
     Args:
@@ -232,30 +345,15 @@ def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=No
         valid_dataset = params.get('valid_dataset', '')
         test_dataset = params.get('test_dataset', '')
         split_key = params.get('split_config_key', '|'.join([str(train_datasets or ''), str(valid_dataset or ''), str(test_dataset or '')]))
+        config_key = params.get('config_key') or _best_registry_config_key(params)
+        artifact_id = hashlib.sha1(str(log_path).replace("\\", "/").strip("/").encode("utf-8")).hexdigest()[:12]
 
         try:
             cursor.execute("""
                 SELECT mcc FROM best_models_registry
-                WHERE model_name=%s AND nsize=%s AND fgsm=%s AND prototypes=%s AND npos=%s AND nneg=%s 
-                      AND dloss=%s AND dist_fct=%s AND classif_loss=%s AND n_calibration=%s AND normalize=%s AND n_neighbors=%s
-                      AND prototype_strategy=%s AND prototype_components=%s
-                      AND COALESCE(split_config_key, '')=%s
+                WHERE config_key=%s
             """, (
-                params['model_name'], 
-                str(params.get('nsize', 224)), 
-                params['fgsm'], 
-                params['prototypes'], 
-                params['npos'], 
-                params['nneg'], 
-                params['dloss'], 
-                params.get('dist_fct', 'euclidean'),
-                params.get('classif_loss', 'triplet'),
-                params['n_calibration'], 
-                params['normalize'],
-                str(params.get('n_neighbors', 1)),
-                proto_strat,
-                proto_comp,
-                split_key
+                config_key,
             ))
             row = cursor.fetchone()
         except mysql.connector.Error:
@@ -288,14 +386,52 @@ def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=No
             
             try:
                 cursor.execute("""
-                    REPLACE INTO best_models_registry
-                    (model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss, n_calibration, 
-                     accuracy, mcc, batch_entropy_norm, batch_nmi, batch_ari, normalize, n_neighbors, 
+                    INSERT INTO best_models_registry
+                    (config_key, task, model_name, dataset_path, siamese_inference, run_tag,
+                     nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss, n_calibration,
+                     accuracy, mcc, batch_entropy_norm, batch_nmi, batch_ari, normalize, n_neighbors,
                      prototype_strategy, prototype_components, train_datasets, valid_dataset, test_dataset,
-                     split_config_key, log_path)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     split_config_key, log_path, artifact_id, best_model_dir, source_run_log_path)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        accuracy = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(accuracy), accuracy),
+                        mcc = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(mcc), mcc),
+                        batch_entropy_norm = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(batch_entropy_norm), batch_entropy_norm),
+                        batch_nmi = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(batch_nmi), batch_nmi),
+                        batch_ari = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(batch_ari), batch_ari),
+                        log_path = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(log_path), log_path),
+                        artifact_id = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(artifact_id), artifact_id),
+                        best_model_dir = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(best_model_dir), best_model_dir),
+                        source_run_log_path = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(source_run_log_path), source_run_log_path),
+                        task = VALUES(task),
+                        model_name = VALUES(model_name),
+                        dataset_path = VALUES(dataset_path),
+                        siamese_inference = VALUES(siamese_inference),
+                        run_tag = VALUES(run_tag),
+                        nsize = VALUES(nsize),
+                        fgsm = VALUES(fgsm),
+                        prototypes = VALUES(prototypes),
+                        npos = VALUES(npos),
+                        nneg = VALUES(nneg),
+                        dloss = VALUES(dloss),
+                        dist_fct = VALUES(dist_fct),
+                        classif_loss = VALUES(classif_loss),
+                        n_calibration = VALUES(n_calibration),
+                        normalize = VALUES(normalize),
+                        n_neighbors = VALUES(n_neighbors),
+                        prototype_strategy = VALUES(prototype_strategy),
+                        prototype_components = VALUES(prototype_components),
+                        train_datasets = VALUES(train_datasets),
+                        valid_dataset = VALUES(valid_dataset),
+                        test_dataset = VALUES(test_dataset),
+                        split_config_key = VALUES(split_config_key)
                 """, (
+                    config_key,
+                    params.get('task', ''),
                     params['model_name'],
+                    params.get('dataset_path', ''),
+                    params.get('siamese_inference', ''),
+                    params.get('run_tag', ''),
                     str(params.get('nsize', 224)),
                     params['fgsm'],
                     params['prototypes'],
@@ -318,7 +454,10 @@ def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=No
                     valid_dataset,
                     test_dataset,
                     split_key,
-                    log_path
+                    log_path,
+                    artifact_id,
+                    log_path,
+                    source_run_log_path,
                 ))
             except mysql.connector.Error as e:
                 # Backward-compatibility for legacy DB schemas.
@@ -350,6 +489,108 @@ def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=No
         conn.close()
     except mysql.connector.Error as e:
         print(f"❌ Registry DB error: {e}")
+
+
+def append_run_metrics_db(row, run_log_path=""):
+    """Append every run into DB history table (never overwrite)."""
+    try:
+        conn = mysql.connector.connect(
+            host="localhost",
+            user="y_user",
+            password="password",
+            database="results_db"
+        )
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_runs_registry (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                exp_id VARCHAR(255) NULL,
+                trial_index VARCHAR(64) NULL,
+                uuid VARCHAR(128) NULL,
+                status VARCHAR(64) NULL,
+                error TEXT NULL,
+                task VARCHAR(128) NULL,
+                run_tag VARCHAR(128) NULL,
+                model_name VARCHAR(128) NULL,
+                kind VARCHAR(64) NULL,
+                variant VARCHAR(64) NULL,
+                classif_loss VARCHAR(64) NULL,
+                dloss VARCHAR(64) NULL,
+                prototypes VARCHAR(64) NULL,
+                fgsm VARCHAR(32) NULL,
+                normalize VARCHAR(32) NULL,
+                n_calibration VARCHAR(32) NULL,
+                dist_fct VARCHAR(32) NULL,
+                n_neighbors VARCHAR(32) NULL,
+                n_negatives VARCHAR(32) NULL,
+                train_datasets TEXT NULL,
+                valid_dataset VARCHAR(255) NULL,
+                test_dataset VARCHAR(255) NULL,
+                split_config_key VARCHAR(1024) NULL,
+                valid_mcc DOUBLE NULL,
+                test_mcc DOUBLE NULL,
+                valid_accuracy DOUBLE NULL,
+                test_accuracy DOUBLE NULL,
+                batch_entropy_norm DOUBLE NULL,
+                batch_nmi DOUBLE NULL,
+                batch_ari DOUBLE NULL,
+                run_log_path TEXT NULL,
+                INDEX idx_model_runs_lookup (task, model_name, classif_loss, dloss, fgsm, n_calibration)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO model_runs_registry
+            (exp_id, trial_index, uuid, status, error, task, run_tag, model_name, kind, variant,
+             classif_loss, dloss, prototypes, fgsm, normalize, n_calibration, dist_fct, n_neighbors,
+             n_negatives, train_datasets, valid_dataset, test_dataset, split_config_key,
+             valid_mcc, test_mcc, valid_accuracy, test_accuracy, batch_entropy_norm, batch_nmi, batch_ari,
+             run_log_path)
+            VALUES
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                row.get('exp_id', ''),
+                str(row.get('trial_index', '') or ''),
+                row.get('uuid', ''),
+                row.get('status', ''),
+                row.get('error', ''),
+                row.get('task', ''),
+                row.get('run_tag', ''),
+                row.get('model_name', ''),
+                row.get('kind', ''),
+                row.get('variant', ''),
+                row.get('classif_loss', ''),
+                row.get('dloss', ''),
+                row.get('prototypes', ''),
+                str(row.get('fgsm', '') or ''),
+                row.get('normalize', ''),
+                str(row.get('n_calibration', '') or ''),
+                row.get('dist_fct', ''),
+                str(row.get('knn', '') or ''),
+                str(row.get('n_negatives', '') or ''),
+                row.get('train_datasets', ''),
+                row.get('valid_dataset', ''),
+                row.get('test_dataset', ''),
+                row.get('split_config_key', ''),
+                row.get('valid_mcc', None),
+                row.get('test_mcc', None),
+                row.get('valid_accuracy', None),
+                row.get('test_accuracy', None),
+                row.get('batch_entropy_norm', None),
+                row.get('batch_nmi', None),
+                row.get('batch_ari', None),
+                run_log_path,
+            ),
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except mysql.connector.Error as e:
+        print(f"[Warning] Could not append run into model_runs_registry: {e}")
 
 def register_all_params_to_tracking(run, args, params):
     """Register all hyperparameters (both fixed and optimized) to Tracking.
@@ -567,6 +808,8 @@ class TrainAE:
             'uuid': run_uuid,
             'status': final_status,
             'error': final_error,
+            'task': task,
+            'run_tag': run_tag,
             'model': run_id['model_name'],
             'model_name': run_id['model_name'],
             'kind': run_id['kind'],
@@ -617,8 +860,12 @@ class TrainAE:
         except Exception as e:
             print(f"[Warning] Could not write to global completed_runs_metrics.csv: {e}")
 
+        # Persist every run in DB history (append-only).
+        append_run_metrics_db(row, run_log_path=str(getattr(self, 'complete_log_path', '') or ''))
+
     def __init__(self, args, path, load_tb=False, log_metrics=False, keep_models=True, log_inputs=True,
-                 log_plots=False, log_tb=False, log_tracking=False, log_comet=True, log_mlflow=True, groupkfold=True):
+                 log_plots=False, log_tb=False, log_tracking=False, log_comet=False,
+                 log_mlflow=True, log_dvclive=True, groupkfold=True):
         """
 
         Args:
@@ -651,6 +898,8 @@ class TrainAE:
         self.log_tracking = log_tracking
         self.log_comet = log_comet
         self.log_mlflow = log_mlflow
+        self.log_dvclive = log_dvclive
+        self.dvclive_tracker = None
         self.args = args
         self.path = resolve_processed_dataset_path(path, 
                                                    getattr(args, 'train_datasets', None),
@@ -925,6 +1174,7 @@ class TrainAE:
                     _extract_best_values_as_scalars(best_vals)
                 ),
                 'split_config': self._json_safe(_split_config_from_args(self.args)),
+                'calibration_manifest_path': self._json_safe(getattr(self.args, 'calibration_manifest_path', '')),
                 'batch_metrics': self._json_safe(getattr(self, 'batch_metrics', {})),
                 'params': {k: self._json_safe(v) for k, v in (params or {}).items()},
                 'artifacts': {
@@ -1175,6 +1425,38 @@ class TrainAE:
         self.n_prototypes = self.prototypes.n_prototypes
         self.means = self.prototypes.means
 
+    def _append_batch_outputs(self, lists, group, domain_np, label_np, enc_np, names, old_labels, dpreds_np=None, add_preds=False):
+        enc_np = np.asarray(enc_np)
+        label_np = np.asarray(label_np).reshape(-1)
+        domain_idx = np.asarray([np.argmax(d) for d in np.asarray(domain_np)]).reshape(-1)
+        names_np = np.asarray(list(names) if isinstance(names, (list, tuple)) else names, dtype=object).reshape(-1)
+        old_labels_np = np.asarray(_tensor_to_numpy(old_labels) if torch.is_tensor(old_labels) else old_labels, dtype=object).reshape(-1)
+
+        n = min(len(enc_np), len(label_np), len(domain_idx), len(names_np), len(old_labels_np))
+        if len(enc_np) != len(label_np) or len(enc_np) != len(domain_idx):
+            print(
+                f"[BatchAlign] group={group} encodings={len(enc_np)} labels={len(label_np)} "
+                f"domains={len(domain_idx)} names={len(names_np)} old_labels={len(old_labels_np)}; using {n}"
+            )
+        if n <= 0:
+            return
+
+        enc_np = enc_np[:n]
+        label_np = label_np[:n]
+        domain_idx = domain_idx[:n].astype(int)
+        names_np = names_np[:n]
+        old_labels_np = old_labels_np[:n]
+
+        lists[group]['domains'] += [self._batch_encoder.inverse_transform(domain_idx)]
+        lists[group]['classes'] += [label_np]
+        if add_preds and dpreds_np is not None:
+            lists[group]['preds'] += [np.asarray(dpreds_np)[:n]]
+        lists[group]['encoded_values'] += [enc_np]
+        lists[group]['names'] += [names_np]
+        lists[group]['cats'] += [label_np]
+        lists[group]['labels'] += [np.array([self.unique_labels[int(x)] for x in label_np])]
+        lists[group]['old_labels'] += [old_labels_np]
+
     def make_samples_weights(self):
         self.n_batches = len(
             set(np.concatenate((
@@ -1282,18 +1564,27 @@ class TrainAE:
 
             # Persist run configuration and metadata early
             self._save_run_metadata(params)
+            self.dvclive_tracker = DVCLiveTracker(
+                self.args,
+                params,
+                self.complete_log_path,
+                self.foldername,
+                enabled=self.log_dvclive,
+            )
 
             if self.log_tracking:
                 run = create_tracking_run(self.args, params, self.complete_log_path, self.foldername)
             else:
                 run = None
             if self.log_comet:
+                from ..logging.loggings import make_comet_logger
+
                 comet_logger = make_comet_logger(self.args, self.params, self.complete_log_path, self.foldername)
             else:
                 comet_logger = None
 
-            loggers['logger_cm'] = SummaryWriter(f'{self.complete_log_path}/cm')
-            loggers['logger'] = SummaryWriter(f'{self.complete_log_path}/traces')
+            loggers['logger_cm'] = _make_summary_writer(f'{self.complete_log_path}/cm', enabled=self.log_tb)
+            loggers['logger'] = _make_summary_writer(f'{self.complete_log_path}/traces', enabled=self.log_tb)
             # sceloss = nn.CrossEntropyLoss(label_smoothing=params['smoothing'])
             optimizer_model = get_optimizer(self.model, params['lr'], params['wd'], params['optimizer_type'])
             self.scheduler = ReduceLROnPlateau(optimizer_model, mode='max', factor=0.1, patience=10)  # Reduce on plateau
@@ -1427,7 +1718,22 @@ class TrainAE:
                 if self.log_mlflow:
                     add_to_mlflow(values, epoch)
                 if self.log_comet:
+                    from ..logging.loggings import add_to_comet
+
                     add_to_comet(values, comet_logger, epoch)
+                if self.log_dvclive and self.dvclive_tracker is not None:
+                    self.dvclive_tracker.log_epoch(
+                        values,
+                        epoch,
+                        {
+                            "timing/deep_train_s": train_s,
+                            "timing/classifier_fit_s": classifier_fit_s,
+                            "timing/eval_s": eval_s,
+                            "timing/prototypes_s": prototypes_s,
+                            "timing/loader_refresh_s": loader_refresh_s,
+                            "timing/logging_s": logging_s,
+                        },
+                    )
                 if values['valid']['mcc'][-1] > self.best_mcc:
                     t_best_start = time.perf_counter()
                     print(f"Best Classification Mcc Epoch {epoch}, "
@@ -1531,7 +1837,6 @@ class TrainAE:
                             print('EARLY STOPPING.', epoch)
                         break
                     lists, traces = get_empty_traces()
-                    lists['calibration'] = lists['all']
                     self.model.train()
                     self.model.to(self.args.device)
                     
@@ -1598,6 +1903,8 @@ class TrainAE:
                     if self.log_mlflow:
                         add_to_mlflow(values, epoch)
                     if self.log_comet:
+                        from ..logging.loggings import add_to_comet
+
                         add_to_comet(values, comet_logger, epoch)
                     if values['valid_calibration']['mcc'][-1] > self.best_mcc:
                         print(f"Best Classification Mcc Epoch {epoch}, "
@@ -1643,6 +1950,9 @@ class TrainAE:
         except optuna.TrialPruned as e:
             train_exception = e
             print(f"Training pruned: {e}")
+            if self.log_dvclive and self.dvclive_tracker is not None:
+                self.dvclive_tracker.log_final({"run/pruned": 1})
+                self.dvclive_tracker.end()
             if self.log_tracking and run is not None:
                 try:
                     run.stop()
@@ -1653,6 +1963,9 @@ class TrainAE:
         except Exception as e:
             train_exception = e
             print(f"Training failed: {e}")
+            if self.log_dvclive and self.dvclive_tracker is not None:
+                self.dvclive_tracker.log_final({"run/failed": 1})
+                self.dvclive_tracker.end()
             import traceback
             traceback.print_exc()
             if torch.cuda.is_available() and str(self.args.device).startswith('cuda'):
@@ -1746,6 +2059,25 @@ class TrainAE:
         self._save_run_summary(params, best_vals, start_time, run_status=final_status, error_message=final_error)
         # Append to completed_runs CSV for robust manifest/metrics tracking
         self._append_completed_run_csv(params, best_vals, getattr(self, 'batch_metrics', None), run_uuid, final_status, final_error)
+        if self.log_dvclive and self.dvclive_tracker is not None:
+            final_metrics = {
+                "best_mcc": self.best_mcc,
+                "best_acc": self.best_acc,
+                "best_closs": self.best_closs,
+                "duration_seconds": float((datetime.now() - start_time).total_seconds()),
+            }
+            for key, value in (getattr(self, "batch_metrics", {}) or {}).items():
+                final_metrics[f"batch/{key}"] = value
+            self.dvclive_tracker.log_final(
+                final_metrics,
+                [
+                    os.path.join(self.complete_log_path, "model.pth"),
+                    os.path.join(self.complete_log_path, "run_metadata.json"),
+                    os.path.join(self.complete_log_path, "run_summary.json"),
+                    os.path.join(self.complete_log_path, "epoch_metrics.csv"),
+                ],
+            )
+            self.dvclive_tracker.end()
         return self.best_mcc
 
     def save_best_run(self, run, comet_logger, params, best_vals, best_lists=None):
@@ -1911,7 +2243,11 @@ class TrainAE:
 
         # --- Update best model registry in MySQL ---
         registry_params = {
+            'task': self.args.task,
             'model_name': self.args.model_name,
+            'dataset_path': _dataset_path_segment(self.path),
+            'siamese_inference': getattr(self.args, 'siamese_inference', ''),
+            'run_tag': getattr(self.args, 'run_tag', ''),
             'nsize': self.args.new_size,
             'fgsm': self.args.fgsm,
             'prototypes': self.args.prototypes_to_use,
@@ -1923,6 +2259,8 @@ class TrainAE:
             'n_calibration': self.args.n_calibration,
             'normalize': self.args.normalize,
             'n_neighbors': params.get('n_neighbors', getattr(self.args, 'n_neighbors', 5)),
+            'prototype_strategy': params.get('prototype_strategy', getattr(self.args, 'prototype_strategy', 'mean')),
+            'prototype_components': params.get('prototype_components', getattr(self.args, 'prototype_components', 1)),
             'train_datasets': split_config['train_datasets'],
             'valid_dataset': split_config['valid_dataset'],
             'test_dataset': split_config['test_dataset'],
@@ -1944,7 +2282,8 @@ class TrainAE:
             accuracy=best_vals.get('valid_acc', self.best_acc),
             mcc=self.best_mcc,
             log_path=model_dir,
-            batch_metrics=batch_metrics_dict
+            batch_metrics=batch_metrics_dict,
+            source_run_log_path=self.complete_log_path,
         )
 
     # TODO Decide if valuable class method
@@ -2246,6 +2585,15 @@ class TrainAE:
                 except ValueError as exc:
                     print(f"Warning: skipped {group} ROC curve plot: {exc}")
     
+    def _ensure_embedding(self, tensor):
+        """Return a 2D embedding tensor from either encoded prototypes or image tensors."""
+        if tensor.dim() > 2:
+            embedding, _ = self.model(tensor)
+            return embedding
+        if tensor.dim() == 1:
+            tensor = tensor.unsqueeze(0)
+        return tensor
+
     def get_losses(self, enc, to_rec, not_to_rec, pos_batch_sample, neg_batch_sample, dpreds, domains, labels, group):
         if self.args.classif_loss == 'cosine':
             classif_loss = 1 - torch.nn.functional.cosine_similarity(enc, self.model(to_rec)).mean()
@@ -2259,20 +2607,8 @@ class TrainAE:
                     pass
                 neg_enc, _ = self.model(not_to_rec)
             else:
-                # Prototypes are expected to be encoded vectors; if not, encode or flatten them
-                def _ensure_embedding(t):
-                    if t.dim() > 2:
-                        try:
-                            emb, _ = self.model(t)
-                            return emb
-                        except Exception:
-                            return t.view(t.size(0), -1)
-                    if t.dim() == 1:
-                        return t.unsqueeze(0)
-                    return t
-
-                pos_enc = _ensure_embedding(to_rec)
-                neg_enc = _ensure_embedding(not_to_rec)
+                pos_enc = self._ensure_embedding(to_rec)
+                neg_enc = self._ensure_embedding(not_to_rec)
             classif_loss = self.triplet_loss(enc, pos_enc, neg_enc)
         elif self.args.classif_loss in ['ce', 'hinge']:
             if enc.dim() != 2:
@@ -2309,12 +2645,8 @@ class TrainAE:
             pos_batch_sample, neg_batch_sample = pos_batch_sample.to(
                 self.args.device).float(), neg_batch_sample.to(self.args.device).float()
             pos_batch_sample, neg_batch_sample = pos_batch_sample.requires_grad_(True), neg_batch_sample.requires_grad_(True)
-            if self.args.prototypes_to_use in ['both', 'batch'] and self.epoch > 0:
-                pos_enc = pos_batch_sample
-                neg_enc = neg_batch_sample
-            else:
-                pos_enc, _ = self.model(pos_batch_sample)
-                neg_enc, _ = self.model(neg_batch_sample)
+            pos_enc = self._ensure_embedding(pos_batch_sample)
+            neg_enc = self._ensure_embedding(neg_batch_sample)
             dloss = self.triplet_dloss(enc, neg_enc, pos_enc)
             # domain = domain.argmax(1)
         else:
@@ -2372,21 +2704,20 @@ class TrainAE:
             dpreds_np = _tensor_to_numpy(dpreds)
             enc_np = _tensor_to_numpy(enc.view(enc.shape[0], -1))
 
-            # Use LabelEncoder to decode domain indices back to original batch values
-            lists[group]['domains'] += [self._batch_encoder.inverse_transform([np.argmax(d) for d in domain_np])]
-            lists[group]['classes'] += [label_np]
-            if group == 'train':
-                lists[group]['preds'] += [dpreds_np]
-            lists[group]['encoded_values'] += [enc_np]
-            lists[group]['names'] += [names]
-            # lists[group]['inputs'] += [data.view(data.shape[0], -1).detach().cpu().numpy()]
-            lists[group]['labels'] += [np.array(
-                [self.unique_labels[x] for x in label_np])]
-            lists[group]['old_labels'] += [np.array(old_labels)]
+            self._append_batch_outputs(
+                lists,
+                group,
+                domain_np,
+                label_np,
+                enc_np,
+                names,
+                old_labels,
+                dpreds_np=dpreds_np,
+                add_preds=(group == 'train'),
+            )
             traces[group]['dom_acc'] += [np.mean([0 if pred != dom else 1 for pred, dom in
                                                 zip(dpreds_np.argmax(1),
                                                     _tensor_to_numpy(domains.argmax(1)))])]
-            lists[group]['cats'] += [label_np]
             if self.model.training:
                 with self._autocast_context():
                     classif_loss, dloss = self.get_losses(enc, to_rec, not_to_rec, pos_batch_sample,
@@ -2485,6 +2816,19 @@ class TrainAE:
         # If group is train and nu = 0, then it is not training. valid can also have sampling = True
         # model, classifier, dann = models['model'], models['classifier'], models['dann']
         # triplet_loss = nn.TripletMarginLoss(margin, p=2)
+        if group not in lists:
+            lists[group] = {
+                'set': [], 'preds': [], 'domain_preds': [], 'probs': [], 'lows': [],
+                'cats': [], 'times': [], 'classes': [], 'domains': [], 'dloss': [],
+                'dom_acc': [], 'labels': [], 'old_labels': [], 'encoded_values': [],
+                'enc_values': [], 'age': [], 'gender': [], 'atn': [], 'names': [],
+                'inputs': [], 'rec_values': [], 'subcenters': [],
+            }
+        if group not in traces:
+            traces[group] = {
+                'dloss': [], 'closs': [], 'dom_acc': [], 'acc': [], 'top3': [],
+                'mcc': [], 'tpr': [], 'tnr': [], 'ppv': [], 'npv': [],
+            }
         classif_loss = None
         total_batches = len(loader)
         # with tqdm(total=len(loader), position=0, leave=True) as pbar:
@@ -2532,16 +2876,15 @@ class TrainAE:
             dpreds_np = _tensor_to_numpy(dpreds)
             enc_np = _tensor_to_numpy(enc.view(enc.shape[0], -1))
 
-            lists[group]['domains'] += [self._batch_encoder.inverse_transform([np.argmax(d) for d in domain_np])]
-            lists[group]['classes'] += [label_np]
-            lists[group]['encoded_values'] += [enc_np]
-
-            lists[group]['names'] += [names]
-            lists[group]['cats'] += [label_np]
-            # lists[group]['inputs'] += [data.view(data.shape[0], -1).detach().cpu().numpy()]
-            lists[group]['labels'] += [np.array(
-                [self.unique_labels[x] for x in label_np])]
-            lists[group]['old_labels'] += [np.array(old_labels)]
+            self._append_batch_outputs(
+                lists,
+                group,
+                domain_np,
+                label_np,
+                enc_np,
+                names,
+                old_labels,
+            )
             traces[group]['acc'] += [np.mean([0 if pred != dom else 1 for pred, dom in
                                                 zip(dpreds_np.argmax(1),
                                                     _tensor_to_numpy(domains.argmax(1)))])]
@@ -2550,7 +2893,6 @@ class TrainAE:
                                                     _tensor_to_numpy(domains.argmax(1)))])]
             traces[group]['closs'] += [0]
             traces[group]['dloss'] += [dloss.item()]
-            lists[group]['cats'] += [label_np]
             if self.model.training:
                 if group in ['calibration', 'train']:
                     # total_loss = classif_loss + gamma * dloss
@@ -2986,16 +3328,15 @@ class TrainAE:
             dpreds_np = _tensor_to_numpy(dpreds)
             enc_np = _tensor_to_numpy(enc.view(enc.shape[0], -1))
 
-            lists[group]['domains'] += [self._batch_encoder.inverse_transform([np.argmax(d) for d in domain_np])]
-            lists[group]['classes'] += [label_np]
-            lists[group]['encoded_values'] += [enc_np]
-
-            lists[group]['names'] += [names]
-            lists[group]['cats'] += [label_np]
-            # lists[group]['inputs'] += [data.view(data.shape[0], -1).detach().cpu().numpy()]
-            lists[group]['labels'] += [np.array(
-                [self.unique_labels[x] for x in label_np])]
-            lists[group]['old_labels'] += [np.array(old_labels)]
+            self._append_batch_outputs(
+                lists,
+                group,
+                domain_np,
+                label_np,
+                enc_np,
+                names,
+                old_labels,
+            )
             labels_t = labels.to(self.args.device).long().view(-1)
             preds_t = torch.as_tensor(preds, device=self.args.device).long().view(-1)
             if preds_t.numel() != labels_t.numel():
@@ -3211,16 +3552,15 @@ class TrainAE:
             dpreds_np = _tensor_to_numpy(dpreds)
             enc_np = _tensor_to_numpy(enc.view(enc.shape[0], -1))
 
-            lists[group]['domains'] += [self._batch_encoder.inverse_transform([np.argmax(d) for d in domain_np])]
-            lists[group]['classes'] += [label_np]
-            lists[group]['encoded_values'] += [enc_np]
-
-            lists[group]['names'] += [names]
-            lists[group]['cats'] += [label_np]
-            # lists[group]['inputs'] += [data.view(data.shape[0], -1).detach().cpu().numpy()]
-            lists[group]['labels'] += [np.array(
-                [self.unique_labels[x] for x in label_np])]
-            lists[group]['old_labels'] += [np.array(old_labels)]
+            self._append_batch_outputs(
+                lists,
+                group,
+                domain_np,
+                label_np,
+                enc_np,
+                names,
+                old_labels,
+            )
             traces[group]['acc'] += [np.mean([0 if pred != dom else 1 for pred, dom in
                                                 zip(preds,
                                                     label_np)])]
@@ -3332,6 +3672,9 @@ class TrainAE:
             elif ordin == "MDS":
                 pca = MDS(n_components=3)
             elif ordin == "UMAP":
+                if UMAP is None:
+                    print("[INFO] umap is not installed: skipping UMAP ordination.")
+                    continue
                 pca = UMAP(n_components=3)
             else:
                 raise ValueError("Invalid ordination method")
@@ -3606,9 +3949,129 @@ class TrainAE:
                 f"Missing train labels by split: {problems}"
             )
 
+    def _calibration_manifest_path(self, data_getter):
+        explicit = str(getattr(self.args, 'calibration_manifest_path', '') or '').strip()
+        if explicit:
+            return explicit
+        if data_getter is not None and getattr(data_getter, 'manifest_dir', None) is not None:
+            path = os.path.join(data_getter.manifest_dir, 'splits', 'calibration.csv')
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _write_calibration_manifest(self, data_getter, selected_records=None):
+        if data_getter is None or getattr(data_getter, 'manifest_dir', None) is None:
+            return
+        calibration_manifest = os.path.join(data_getter.manifest_dir, 'splits', 'calibration.csv')
+        os.makedirs(os.path.dirname(calibration_manifest), exist_ok=True)
+        df = pd.DataFrame({
+            'name': self.data['names']['calibration'],
+            'label': self.data['labels']['calibration'],
+            'batch': self.data['batches']['calibration'],
+        })
+        if selected_records:
+            by_name = {str(item.get('name')): item for item in selected_records}
+            df['source_group'] = [by_name.get(str(name), {}).get('source_group', '') for name in df['name']]
+            df['source_index'] = [by_name.get(str(name), {}).get('source_index', '') for name in df['name']]
+        df.to_csv(calibration_manifest, index=False)
+        try:
+            self.args.calibration_manifest_path = calibration_manifest
+        except Exception:
+            pass
+
+    def _apply_calibration_manifest(self, manifest_path, data_getter, n_calibration):
+        if not manifest_path or not os.path.exists(manifest_path):
+            return False
+        try:
+            manifest = pd.read_csv(manifest_path)
+        except Exception as exc:
+            print(f"[CalibrationSplit] could not read calibration manifest {manifest_path}: {exc}")
+            return False
+        if 'name' not in manifest.columns or manifest.empty:
+            return False
+
+        requested_names = [str(name) for name in manifest['name'].dropna().tolist()]
+        if n_calibration and len(requested_names) != int(n_calibration):
+            print(
+                f"[CalibrationSplit] manifest count {len(requested_names)} does not match "
+                f"n_calibration={n_calibration}; drawing a new split."
+            )
+            return False
+
+        source_groups = ['valid', 'test', 'train']
+        name_to_source = {}
+        for group in source_groups:
+            for idx, name in enumerate(np.asarray(self.data['names'][group]).tolist()):
+                name_to_source.setdefault(str(name), (group, int(idx)))
+
+        missing = [name for name in requested_names if name not in name_to_source]
+        if missing:
+            print(
+                f"[CalibrationSplit] manifest {manifest_path} could not be reused; "
+                f"{len(missing)} sample(s) are missing from current train/valid/test splits."
+            )
+            return False
+
+        selected_by_group = {group: [] for group in source_groups}
+        for name in requested_names:
+            group, idx = name_to_source[name]
+            selected_by_group[group].append(idx)
+
+        calibration_values = {key: [] for key in ['inputs', 'labels', 'old_labels', 'names', 'cats', 'batches']}
+        train_append_values = {key: [] for key in ['inputs', 'labels', 'old_labels', 'names', 'cats', 'batches']}
+        selected_records = []
+        for group in source_groups:
+            selected = np.array(sorted(set(selected_by_group[group])), dtype=int)
+            if selected.size == 0:
+                continue
+            for key in calibration_values:
+                selected_values = self.data[key][group][selected]
+                calibration_values[key].append(selected_values)
+                if group != 'train':
+                    train_append_values[key].append(selected_values)
+            for idx in selected:
+                selected_records.append({
+                    'name': str(self.data['names'][group][idx]),
+                    'source_group': group,
+                    'source_index': int(idx),
+                })
+            if group in ['valid', 'test']:
+                keep_mask = np.ones(len(self.data['labels'][group]), dtype=bool)
+                keep_mask[selected] = False
+                for key in calibration_values:
+                    self.data[key][group] = self.data[key][group][keep_mask]
+
+        self._append_to_group('calibration', calibration_values)
+        self._append_to_group('train', train_append_values)
+
+        actual = len(self.data['labels']['calibration'])
+        if actual != len(requested_names):
+            raise RuntimeError(
+                f"Calibration manifest reuse mismatch: requested {len(requested_names)}, built {actual}."
+            )
+
+        if data_getter is not None and getattr(data_getter, 'manifest_dir', None) is not None:
+            data_getter.data = self.data
+            data_getter.save_split_manifests(data_getter.manifest_dir)
+            self._write_calibration_manifest(data_getter, selected_records=selected_records)
+
+        counts = {
+            str(label): int(np.sum(np.asarray(self.data['labels']['calibration']) == label))
+            for label in np.unique(self.data['labels']['calibration'])
+        }
+        sources = {group: int(len(set(selected_by_group[group]))) for group in source_groups}
+        print(
+            f"[CalibrationSplit] reused manifest={manifest_path} "
+            f"n_calibration={actual} counts={counts} sources={sources}"
+        )
+        return True
+
     def _apply_calibration_split(self, data_getter):
         n_calibration = int(getattr(self.args, 'n_calibration', 0) or 0)
         if n_calibration == 0:
+            return
+
+        if self._apply_calibration_manifest(self._calibration_manifest_path(data_getter), data_getter, n_calibration):
             return
 
         source_groups = ['valid', 'test']
@@ -3670,6 +4133,7 @@ class TrainAE:
 
         calibration_values = {key: [] for key in ['inputs', 'labels', 'old_labels', 'names', 'cats', 'batches']}
         train_append_values = {key: [] for key in ['inputs', 'labels', 'old_labels', 'names', 'cats', 'batches']}
+        selected_records = []
         for group in source_groups:
             selected = np.array(sorted(set(selected_by_group[group])), dtype=int)
             if selected.size == 0:
@@ -3679,6 +4143,12 @@ class TrainAE:
                 calibration_values[key].append(selected_values)
                 if group != 'train':
                     train_append_values[key].append(selected_values)
+            for idx in selected:
+                selected_records.append({
+                    'name': str(self.data['names'][group][idx]),
+                    'source_group': group,
+                    'source_index': int(idx),
+                })
             if group != 'train':
                 keep_mask = np.ones(len(self.data['labels'][group]), dtype=bool)
                 keep_mask[selected] = False
@@ -3697,12 +4167,7 @@ class TrainAE:
         if data_getter is not None and getattr(data_getter, 'manifest_dir', None) is not None:
             data_getter.data = self.data
             data_getter.save_split_manifests(data_getter.manifest_dir)
-            calibration_manifest = os.path.join(data_getter.manifest_dir, 'splits', 'calibration.csv')
-            pd.DataFrame({
-                'name': self.data['names']['calibration'],
-                'label': self.data['labels']['calibration'],
-                'batch': self.data['batches']['calibration'],
-            }).to_csv(calibration_manifest, index=False)
+            self._write_calibration_manifest(data_getter, selected_records=selected_records)
 
         counts = {
             str(label): int(np.sum(np.asarray(self.data['labels']['calibration']) == label))
@@ -3879,6 +4344,7 @@ if __name__ == "__main__":
     parser.add_argument('--is_stn', type=int, default=1, help='Transform train data?')
     parser.add_argument('--weighted_sampler', type=int, default=1, help='Weighted sampler?')
     parser.add_argument('--n_calibration', type=int, default=0, help='Number of balanced calibration samples to draw from valid/test (0 disables calibration)')
+    parser.add_argument('--calibration_manifest_path', type=str, default='', help='Optional splits/calibration.csv to reuse exact calibration samples during retraining')
     parser.add_argument('--remove_noisy_samples', type=int, default=0, help='Remove noisy samples?')
     parser.add_argument('--noisy_cluster_limit', type=int, default=10, help='Noisy cluster limit?')
     parser.add_argument('--prototypes_to_use', type=str, default=None, help='Which prototypes - if None, will optimize')
@@ -3909,8 +4375,13 @@ if __name__ == "__main__":
     parser.add_argument('--trial_index', type=int, default=0, help='Current trial index when launched by an external scheduler')
     parser.add_argument('--reset_opt_state', type=int, default=0, help='Reset Bayesian optimization state and start from scratch (0/1)')
     parser.add_argument('--force_retrain', type=int, default=0, help='Force fresh training from best parameters in resume final-pass, skipping checkpoint reuse (0/1)')
-    parser.add_argument('--log_tracking', type=int, default=0, help='Enable Tracking logging (0/1)')
-    parser.add_argument('--log_comet', type=int, default=1, help='Enable Comet logging (0/1)')
+    parser.add_argument('--log_tracking', type=int, default=0, help='Enable legacy Tracking logging (0/1)')
+    parser.add_argument('--log_dvclive', type=int, default=1, help='Enable DVCLive logging (0/1)')
+    parser.add_argument('--dvclive_save_dvc_exp', type=int, default=1, help='Ask DVCLive to save a DVC experiment snapshot (0/1)')
+    parser.add_argument('--dvclive_branch_exp', type=int, default=1, help='Promote saved DVC experiment to dvc-exp/<current-branch>/<experiment> (0/1)')
+    parser.add_argument('--dvclive_monitor_system', type=int, default=1, help='Enable DVCLive system metrics monitoring (0/1)')
+    parser.add_argument('--dvclive_dvcyaml', type=str, default='auto', help='DVCLive dvc.yaml mode: none|auto|<custom_path>')
+    parser.add_argument('--log_comet', type=int, default=0, help='Enable legacy Comet logging (0/1). Default off; comet_ml is imported only when enabled.')
     parser.add_argument('--log_mlflow', type=int, default=0, help='Enable MLflow logging (0/1)')
     parser.add_argument('--verbose', type=int, default=1, help='Verbosity level')
     parser.add_argument('--epoch_progress', type=int, default=1, help='Show per-epoch batch progress bar (0/1)')
@@ -3936,6 +4407,9 @@ if __name__ == "__main__":
 
     _set_global_seeds(getattr(args, 'seed', 1), deterministic=True)
     args.exp_id = f'{args.exp_id}_{args.task}_{args.run_tag}'
+    if str(getattr(args, "device", "")).startswith("cuda") and not torch.cuda.is_available():
+        print(f"[Config] CUDA device requested ({args.device}) but torch.cuda.is_available() is false; using CPU.")
+        args.device = "cpu"
     
     # Track which parameters were originally None (to optimize them)
     optimize_params = {}
@@ -4002,6 +4476,7 @@ if __name__ == "__main__":
                     log_tracking=bool(int(args.log_tracking)),
                     log_comet=bool(int(args.log_comet)),
                     log_mlflow=bool(int(args.log_mlflow)),
+                    log_dvclive=bool(int(args.log_dvclive)),
                     groupkfold=args.groupkfold)
     train.verbose = int(getattr(args, 'verbose', 1))
 
@@ -4320,6 +4795,14 @@ if __name__ == "__main__":
     trial_counter['counter'] = already_evaluated
 
     print(f"[Optuna Resume] Scheduling {trials_to_run} additional trials (successful={already_evaluated}, target={getattr(args, 'n_trials', 0)}).")
+    if trials_to_run == 0:
+        print(
+            "[Optuna Resume] No new trials scheduled. Existing DB/cache state already satisfies --n_trials. "
+            "No fresh training loop will run, so DVCLive may not create a new run for this launch. "
+            "To force a new run, use one of: --reset_opt_state=1, a different --run_tag/--exp_id, or a larger --n_trials."
+        )
+        print(f"[Optuna Resume] Reused DB: {db_path}")
+        print(f"[Optuna Resume] Reused cache: {trial_cache_path}")
 
     # Enqueue trials from local cache to Optuna if missing
     enqueued_count = 0
@@ -4399,7 +4882,7 @@ if __name__ == "__main__":
     # Prefer Optuna-recorded best trial path if available.
     if best_trial:
         best_log_path = best_trial.user_attrs.get("complete_log_path")
-        if best_log_path:
+        if best_log_path and str(best_log_path).strip().lower() not in {"none", "null", "nan", ""}:
             candidate_paths.append(os.path.join(best_log_path, "model.pth"))
 
     # Also consider all completed Optuna trials (highest score first), because older studies
@@ -4412,7 +4895,7 @@ if __name__ == "__main__":
         complete_trials.sort(key=lambda t: float(t.value), reverse=True)
         for t in complete_trials:
             t_log_path = t.user_attrs.get("complete_log_path")
-            if t_log_path:
+            if t_log_path and str(t_log_path).strip().lower() not in {"none", "null", "nan", ""}:
                 candidate_paths.append(os.path.join(str(t_log_path), "model.pth"))
     except Exception:
         pass
@@ -4423,7 +4906,7 @@ if __name__ == "__main__":
         cached_completed.sort(key=lambda r: float(r.get('score', -1e9)), reverse=True)
         for r in cached_completed:
             cached_log_path = r.get('complete_log_path')
-            if cached_log_path:
+            if cached_log_path and str(cached_log_path).strip().lower() not in {"none", "null", "nan", ""}:
                 candidate_paths.append(os.path.join(str(cached_log_path), "model.pth"))
     except Exception:
         pass
@@ -4479,16 +4962,8 @@ if __name__ == "__main__":
             return True
         return all(checks)
 
-    expected_split_segment = (_split_config_from_args(train.args) or {}).get('split_segment', '')
-
-    def _path_matches_expected_split(model_path):
-        if not expected_split_segment:
-            return True
-        normalized = os.path.abspath(str(model_path)).replace('\\', '/')
-        return f"/{expected_split_segment}/" in f"/{normalized}/"
-
     def _path_matches_checkpoint_filters(model_path):
-        return _path_matches_expected_split(model_path)
+        return True
 
     if int(getattr(train.args, 'force_retrain', 0) or 0):
         print(
@@ -4563,14 +5038,24 @@ if __name__ == "__main__":
                         weak_model_path = candidate
     if found_model_path is None and weak_model_path is not None:
         found_model_path = weak_model_path
-    # Last resort: use current training run's complete path
-    if found_model_path is None:
+    # Last resort: use current training run's complete path, if a trial ran in this process.
+    if found_model_path is None and getattr(train, "complete_log_path", None):
         found_model_path = f"{train.complete_log_path}/model.pth"
 
     if found_model_path is None or not os.path.exists(found_model_path):
-        print(f"Warning: No trained checkpoint found at '{found_model_path}'.")
-        print("Optimization finished, but skipping final evaluation pass as the model weights are unavailable.")
-        sys.exit(0)
+        print("[CheckpointLoad] No compatible trained checkpoint was found for the requested dataset split.")
+        print(f"[CheckpointLoad] Requested path: {getattr(train.args, 'path', '')}")
+        print(f"[CheckpointLoad] Requested train_datasets: {getattr(train.args, 'train_datasets', '')}")
+        print(f"[CheckpointLoad] Requested valid_dataset: {getattr(train.args, 'valid_dataset', '')}")
+        print(f"[CheckpointLoad] Requested test_dataset: {getattr(train.args, 'test_dataset', '')}")
+        print(f"[CheckpointLoad] Candidate count checked: {len(candidate_paths)}")
+        if isinstance(best_parameters, dict) and best_parameters:
+            print("[CheckpointLoad] Retraining once from Optuna best parameters to create a compatible checkpoint.")
+            train.train(dict(best_parameters))
+            print("[CheckpointLoad] Retraining completed. Exiting resume final-pass path.")
+            sys.exit(0)
+        print("[CheckpointLoad] No best parameters are available; run with --reset_opt_state=1 or check Optuna/cache state.")
+        sys.exit(1)
 
     if not hasattr(train, "model") or not hasattr(train, "shap_model"):
         print("[Optuna Resume] Model attributes missing (all trials reused). Initializing minimal state for final evaluation...")
@@ -4648,20 +5133,18 @@ if __name__ == "__main__":
     if train.log_comet:
         COMET_API_KEY = os.environ.get("COMET_API_KEY", "")
         COMET_PROJECT_NAME = os.environ.get("COMET_PROJECT_NAME", "otitenet")
-        experiment = comet_ml.Experiment(
-            api_key=COMET_API_KEY,
-            project_name=COMET_PROJECT_NAME,
-        )
-        experiment = set_run(experiment, train.best_params)
-        # Register all parameters (fixed and optimized) to Comet
-        register_all_params_to_comet(experiment, train.args, train.best_params)
-        train.log_predictions(best_lists, None, experiment, 0)
-        # Ensure classifier is defined by running predict for 'test' group
-        _, _, _, classifier = train.predict('test', loaders['test'], lists, traces)
-        if train.run_explainability and train.shap_model is not None:
-            train.save_wrong_classif_imgs(experiment, {'cnn': train.shap_model, 'knn': classifier}, best_lists, best_lists['test']['preds'], 
-                                        best_lists['test']['names'], 'test')
-        else:
-            print('[INFO] Explainability disabled (run_explainability=0): skipping SHAP/Grad-CAM artifact generation.')
-        
-        experiment.end()
+        experiment = _make_comet_experiment(COMET_API_KEY, COMET_PROJECT_NAME)
+        if experiment is not None:
+            experiment = set_run(experiment, train.best_params)
+            # Register all parameters (fixed and optimized) to Comet
+            register_all_params_to_comet(experiment, train.args, train.best_params)
+            train.log_predictions(best_lists, None, experiment, 0)
+            # Ensure classifier is defined by running predict for 'test' group
+            _, _, _, classifier = train.predict('test', loaders['test'], lists, traces)
+            if train.run_explainability and train.shap_model is not None:
+                train.save_wrong_classif_imgs(experiment, {'cnn': train.shap_model, 'knn': classifier}, best_lists, best_lists['test']['preds'], 
+                                            best_lists['test']['names'], 'test')
+            else:
+                print('[INFO] Explainability disabled (run_explainability=0): skipping SHAP/Grad-CAM artifact generation.')
+            
+            experiment.end()

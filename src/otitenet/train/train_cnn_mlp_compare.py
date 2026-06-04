@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import traceback
@@ -43,6 +44,11 @@ from otitenet.utils.utils import set_random_seeds as _set_global_seeds
 from .completed_runs_metrics import append_completed_run_metrics
 
 try:
+    import mysql.connector
+except Exception:
+    mysql = None
+
+try:
     import mlflow
 except Exception:  # Optional dependency in some environments.
     mlflow = None
@@ -65,6 +71,338 @@ def _csv_escape(value):
     text = "" if value in [None, ""] else str(value)
     text = text.replace('"', '""')
     return f'"{text}"'
+
+
+def _normalize_train_datasets(value):
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        parts = [str(x).strip() for x in value]
+    else:
+        parts = [x.strip() for x in str(value).replace(";", ",").split(",")]
+    clean = [x for x in parts if x and x.lower() not in {"none", "nan", "null"}]
+    return ",".join(list(dict.fromkeys(clean)))
+
+
+def _normalize_single_dataset(value):
+    if isinstance(value, (list, tuple, set, np.ndarray)):
+        return _normalize_train_datasets(value)
+    return str(value or "").strip()
+
+
+def _dataset_path_segment(path):
+    text = str(path or "").strip().replace("\\", "/").strip("/")
+    for prefix in ("./data/", "data/"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return text or "otite_ds_64"
+
+
+def _split_config_from_args(args):
+    train_datasets = _normalize_train_datasets(getattr(args, "train_datasets", ""))
+    valid_dataset = _normalize_single_dataset(getattr(args, "valid_dataset", ""))
+    test_dataset = _normalize_single_dataset(getattr(args, "test_dataset", ""))
+    split_key = "|".join([train_datasets, valid_dataset, test_dataset])
+    return {
+        "train_datasets": train_datasets,
+        "valid_dataset": valid_dataset,
+        "test_dataset": test_dataset,
+        "split_config_key": split_key,
+    }
+
+
+def _ensure_best_registry_columns(cursor, conn):
+    columns = {
+        "task": "VARCHAR(128) NULL",
+        "dataset_path": "VARCHAR(512) NULL",
+        "siamese_inference": "VARCHAR(64) NULL",
+        "run_tag": "VARCHAR(128) NULL",
+        "config_key": "VARCHAR(64) NULL",
+        "train_datasets": "TEXT NULL",
+        "valid_dataset": "VARCHAR(255) NULL",
+        "test_dataset": "VARCHAR(255) NULL",
+        "split_config_key": "VARCHAR(1024) NULL",
+        "artifact_id": "VARCHAR(32) NULL",
+        "best_model_dir": "TEXT NULL",
+        "source_run_log_path": "TEXT NULL",
+        "batch_entropy_norm": "DOUBLE NULL",
+        "batch_nmi": "DOUBLE NULL",
+        "batch_ari": "DOUBLE NULL",
+    }
+    for col, col_type in columns.items():
+        try:
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'best_models_registry'
+                  AND COLUMN_NAME = %s
+                """,
+                (col,),
+            )
+            has_col = cursor.fetchone()[0] > 0
+            if not has_col:
+                cursor.execute(f"ALTER TABLE best_models_registry ADD COLUMN {col} {col_type}")
+                conn.commit()
+        except Exception as e:
+            print(f"Warning: could not ensure best_models_registry.{col}: {e}")
+
+    try:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM INFORMATION_SCHEMA.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'best_models_registry'
+              AND INDEX_NAME = 'uniq_config_key'
+            """
+        )
+        has_idx = cursor.fetchone()[0] > 0
+        if not has_idx:
+            cursor.execute("CREATE UNIQUE INDEX uniq_config_key ON best_models_registry(config_key)")
+            conn.commit()
+    except Exception as e:
+        print(f"Warning: could not ensure best_models_registry.uniq_config_key: {e}")
+
+    try:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM INFORMATION_SCHEMA.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'best_models_registry'
+              AND INDEX_NAME = 'unique_combo'
+            """
+        )
+        has_legacy_idx = cursor.fetchone()[0] > 0
+        if has_legacy_idx:
+            cursor.execute("DROP INDEX unique_combo ON best_models_registry")
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _best_registry_config_key(params):
+    key_fields = [
+        str(params.get('task', '') or '').strip(),
+        str(params.get('model_name', '') or '').strip(),
+        str(params.get('dataset_path', '') or '').strip().replace('\\', '/'),
+        str(params.get('train_datasets', '') or '').strip(),
+        str(params.get('valid_dataset', '') or '').strip(),
+        str(params.get('test_dataset', '') or '').strip(),
+        str(params.get('split_config_key', '') or '').strip(),
+        str(params.get('variant', '') or '').strip(),
+        str(params.get('classif_loss', '') or '').strip(),
+        str(params.get('dloss', '') or '').strip(),
+        str(params.get('fgsm', '') or '').strip(),
+        str(params.get('n_calibration', '') or '').strip(),
+        str(params.get('normalize', '') or '').strip(),
+        str(params.get('nsize', '') or '').strip(),
+    ]
+    return hashlib.sha1("|".join(key_fields).encode("utf-8")).hexdigest()
+
+
+def append_run_metrics_db(row, run_log_path=""):
+    if mysql is None:
+        return
+    try:
+        conn = mysql.connector.connect(
+            host="localhost",
+            user="y_user",
+            password="password",
+            database="results_db"
+        )
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_runs_registry (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                exp_id VARCHAR(255) NULL,
+                trial_index VARCHAR(64) NULL,
+                uuid VARCHAR(128) NULL,
+                status VARCHAR(64) NULL,
+                error TEXT NULL,
+                task VARCHAR(128) NULL,
+                run_tag VARCHAR(128) NULL,
+                model_name VARCHAR(128) NULL,
+                kind VARCHAR(64) NULL,
+                variant VARCHAR(64) NULL,
+                classif_loss VARCHAR(64) NULL,
+                dloss VARCHAR(64) NULL,
+                prototypes VARCHAR(64) NULL,
+                fgsm VARCHAR(32) NULL,
+                normalize VARCHAR(32) NULL,
+                n_calibration VARCHAR(32) NULL,
+                dist_fct VARCHAR(32) NULL,
+                n_neighbors VARCHAR(32) NULL,
+                n_negatives VARCHAR(32) NULL,
+                train_datasets TEXT NULL,
+                valid_dataset VARCHAR(255) NULL,
+                test_dataset VARCHAR(255) NULL,
+                split_config_key VARCHAR(1024) NULL,
+                valid_mcc DOUBLE NULL,
+                test_mcc DOUBLE NULL,
+                valid_accuracy DOUBLE NULL,
+                test_accuracy DOUBLE NULL,
+                batch_entropy_norm DOUBLE NULL,
+                batch_nmi DOUBLE NULL,
+                batch_ari DOUBLE NULL,
+                run_log_path TEXT NULL,
+                INDEX idx_model_runs_lookup (task, model_name, classif_loss, dloss, fgsm, n_calibration)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO model_runs_registry
+            (exp_id, trial_index, uuid, status, error, task, run_tag, model_name, kind, variant,
+             classif_loss, dloss, prototypes, fgsm, normalize, n_calibration, dist_fct, n_neighbors,
+             n_negatives, train_datasets, valid_dataset, test_dataset, split_config_key,
+             valid_mcc, test_mcc, valid_accuracy, test_accuracy, batch_entropy_norm, batch_nmi, batch_ari,
+             run_log_path)
+            VALUES
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                row.get('exp_id', ''),
+                str(row.get('trial_index', '') or ''),
+                row.get('uuid', ''),
+                row.get('status', ''),
+                row.get('error', ''),
+                row.get('task', ''),
+                row.get('run_tag', ''),
+                row.get('model_name', ''),
+                row.get('kind', ''),
+                row.get('variant', ''),
+                row.get('classif_loss', ''),
+                row.get('dloss', ''),
+                row.get('prototypes', ''),
+                str(row.get('fgsm', '') or ''),
+                row.get('normalize', ''),
+                str(row.get('n_calibration', '') or ''),
+                row.get('dist_fct', ''),
+                str(row.get('knn', '') or ''),
+                str(row.get('n_negatives', '') or ''),
+                row.get('train_datasets', ''),
+                row.get('valid_dataset', ''),
+                row.get('test_dataset', ''),
+                row.get('split_config_key', ''),
+                row.get('valid_mcc', None),
+                row.get('test_mcc', None),
+                row.get('valid_accuracy', None),
+                row.get('test_accuracy', None),
+                row.get('batch_entropy_norm', None),
+                row.get('batch_nmi', None),
+                row.get('batch_ari', None),
+                run_log_path,
+            ),
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"[Warning] Could not append run into model_runs_registry: {e}")
+
+
+def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=None, source_run_log_path=None):
+    if mysql is None:
+        return
+    try:
+        conn = mysql.connector.connect(
+            host="localhost",
+            user="y_user",
+            password="password",
+            database="results_db"
+        )
+        cursor = conn.cursor()
+        _ensure_best_registry_columns(cursor, conn)
+
+        split_key = params.get('split_config_key', '')
+        config_key = params.get('config_key') or _best_registry_config_key(params)
+        artifact_id = hashlib.sha1(str(log_path).replace("\\", "/").strip("/").encode("utf-8")).hexdigest()[:12]
+        batch_entropy = batch_metrics.get('batch_entropy_norm') if batch_metrics else None
+        batch_nmi = batch_metrics.get('batch_nmi') if batch_metrics else None
+        batch_ari = batch_metrics.get('batch_ari') if batch_metrics else None
+
+        cursor.execute(
+            """
+            INSERT INTO best_models_registry
+            (config_key, task, model_name, dataset_path, siamese_inference, run_tag,
+             nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss, n_calibration,
+             accuracy, mcc, batch_entropy_norm, batch_nmi, batch_ari, normalize, n_neighbors,
+             prototype_strategy, prototype_components, train_datasets, valid_dataset, test_dataset,
+             split_config_key, log_path, artifact_id, best_model_dir, source_run_log_path)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                accuracy = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(accuracy), accuracy),
+                mcc = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(mcc), mcc),
+                batch_entropy_norm = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(batch_entropy_norm), batch_entropy_norm),
+                batch_nmi = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(batch_nmi), batch_nmi),
+                batch_ari = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(batch_ari), batch_ari),
+                log_path = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(log_path), log_path),
+                artifact_id = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(artifact_id), artifact_id),
+                best_model_dir = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(best_model_dir), best_model_dir),
+                source_run_log_path = IF(VALUES(mcc) >= COALESCE(mcc, -9999), VALUES(source_run_log_path), source_run_log_path),
+                task = VALUES(task),
+                model_name = VALUES(model_name),
+                dataset_path = VALUES(dataset_path),
+                siamese_inference = VALUES(siamese_inference),
+                run_tag = VALUES(run_tag),
+                nsize = VALUES(nsize),
+                fgsm = VALUES(fgsm),
+                prototypes = VALUES(prototypes),
+                dloss = VALUES(dloss),
+                classif_loss = VALUES(classif_loss),
+                n_calibration = VALUES(n_calibration),
+                normalize = VALUES(normalize),
+                train_datasets = VALUES(train_datasets),
+                valid_dataset = VALUES(valid_dataset),
+                test_dataset = VALUES(test_dataset),
+                split_config_key = VALUES(split_config_key)
+            """,
+            (
+                config_key,
+                params.get('task', ''),
+                params.get('model_name', ''),
+                params.get('dataset_path', ''),
+                params.get('siamese_inference', ''),
+                params.get('run_tag', ''),
+                str(params.get('nsize', '')),
+                str(params.get('fgsm', '')),
+                str(params.get('prototypes', 'no')),
+                str(params.get('npos', 1)),
+                str(params.get('nneg', 1)),
+                str(params.get('dloss', '')),
+                str(params.get('dist_fct', 'none')),
+                str(params.get('classif_loss', '')),
+                str(params.get('n_calibration', '')),
+                float(accuracy),
+                float(mcc),
+                batch_entropy,
+                batch_nmi,
+                batch_ari,
+                str(params.get('normalize', '')),
+                str(params.get('n_neighbors', 0)),
+                str(params.get('prototype_strategy', 'mean')),
+                int(params.get('prototype_components', 1)),
+                str(params.get('train_datasets', '')),
+                str(params.get('valid_dataset', '')),
+                str(params.get('test_dataset', '')),
+                split_key,
+                log_path,
+                artifact_id,
+                log_path,
+                source_run_log_path,
+            ),
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"[Warning] Could not update best_models_registry from cnn/mlp run: {e}")
 
 
 
@@ -362,6 +700,7 @@ class CNNSupervisedCompare:
         from datetime import datetime
         run_tag = getattr(self.args, 'run_tag', 'PROD')
         task = getattr(self.args, 'task', 'notNormal')
+        split_config = _split_config_from_args(self.args)
         completed_csv = f'logs/progresses/{task}/{run_tag}_{task}_completed_runs_metrics.csv'
         global_csv = 'completed_runs_metrics.csv'
         source_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -376,6 +715,8 @@ class CNNSupervisedCompare:
             'uuid': run_uuid,
             'status': final_status,
             'error': final_error,
+            'task': task,
+            'run_tag': run_tag,
             'model': model_name,
             'model_name': getattr(self.args, 'model_name', ''),
             'kind': 'cnn_mlp',
@@ -392,6 +733,10 @@ class CNNSupervisedCompare:
             'dist_fct': '',
             'knn': knn_value,
             'n_negatives': '',
+            'train_datasets': split_config['train_datasets'],
+            'valid_dataset': split_config['valid_dataset'],
+            'test_dataset': split_config['test_dataset'],
+            'split_config_key': split_config['split_config_key'],
             'retry_count': getattr(self.args, 'retry_count', ''),
             'valid_mcc': best_vals.get('valid_mcc', ''),
             'test_mcc': best_vals.get('test_mcc', ''),
@@ -417,6 +762,8 @@ class CNNSupervisedCompare:
             append_completed_run_metrics(global_csv, row)
         except Exception as e:
             print(f"[Warning] Could not write to global completed_runs_metrics.csv: {e}")
+
+        append_run_metrics_db(row, run_log_path=str(best_vals.get('run_dir', '') or ''))
 
     def __init__(self, args):
         self.args = args
@@ -813,6 +1160,40 @@ class CNNSupervisedCompare:
                     print(f"\n=== Training {variant} ===")
                 result = self.run_variant(variant)
                 all_results.append(result)
+                split_config = _split_config_from_args(self.args)
+                best_registry_params = {
+                    'task': getattr(self.args, 'task', ''),
+                    'model_name': getattr(self.args, 'model_name', ''),
+                    'dataset_path': _dataset_path_segment(getattr(self.args, 'path', '')),
+                    'siamese_inference': '',
+                    'run_tag': getattr(self.args, 'run_tag', ''),
+                    'variant': variant,
+                    'classif_loss': getattr(self.args, 'classif_loss', ''),
+                    'dloss': getattr(self.args, 'dloss', ''),
+                    'fgsm': getattr(self.args, 'fgsm', ''),
+                    'n_calibration': getattr(self.args, 'n_calibration', ''),
+                    'normalize': getattr(self.args, 'normalize', ''),
+                    'nsize': getattr(self.args, 'new_size', ''),
+                    'prototypes': 'no',
+                    'npos': 1,
+                    'nneg': 1,
+                    'dist_fct': 'none',
+                    'n_neighbors': 0,
+                    'prototype_strategy': 'mean',
+                    'prototype_components': 1,
+                    'train_datasets': split_config['train_datasets'],
+                    'valid_dataset': split_config['valid_dataset'],
+                    'test_dataset': split_config['test_dataset'],
+                    'split_config_key': split_config['split_config_key'],
+                }
+                update_best_model_registry(
+                    best_registry_params,
+                    accuracy=result.get('valid_acc', 0.0),
+                    mcc=result.get('valid_mcc', -1.0),
+                    log_path=result.get('run_dir', ''),
+                    batch_metrics=result.get('batch_metrics') or {},
+                    source_run_log_path=self.run_root,
+                )
                 # Write to completed_runs CSV for each successful variant
                 self._append_completed_run_csv(
                     params={"variant": variant},

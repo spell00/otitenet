@@ -17,7 +17,7 @@ import torch
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression, RidgeClassifier
-from sklearn.metrics import matthews_corrcoef, roc_auc_score
+from sklearn.metrics import accuracy_score, matthews_corrcoef, precision_recall_fscore_support, roc_auc_score
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import LinearSVC, SVC
@@ -33,6 +33,9 @@ from otitenet.app.utils import (
     format_classifier_config,
     get_model_params_path,
     get_optimization_cache_file_path,
+    split_config_key,
+    split_combo_key_from_row,
+    split_combo_key_to_values,
 )
 from otitenet.app.services.embedding_optimization_service import (
     args_from_model_row,
@@ -40,7 +43,6 @@ from otitenet.app.services.embedding_optimization_service import (
 )
 from otitenet.logging.metrics import MCC
 from otitenet.data.labels import labels_for_task
-from otitenet.train.train_triplet_new import TrainAE
 from otitenet.utils.encoding_utils import (
     compute_prototypes_by_strategy,
     flatten_prototype_dict,
@@ -151,6 +153,7 @@ def _normalize_head_entry(entry, model_row, model_args=None):
         or model_row.get("model_name")
         or model_row.get("model")
     )
+    task = model_row.get("Task") or model_row.get("task") or getattr(model_args, "task", None)
     model_train_mcc = model_row.get("Train MCC") or model_row.get("train_mcc")
     model_valid_mcc = model_row.get("Valid MCC") or model_row.get("valid_mcc") or model_row.get("MCC") or model_row.get("mcc")
     model_test_mcc = model_row.get("Test MCC") or model_row.get("test_mcc")
@@ -178,6 +181,7 @@ def _normalize_head_entry(entry, model_row, model_args=None):
         family = _infer_head_family(cfg)
         return {
             "Model ID": model_id,
+            "Task": task,
             "Model": model_name,
             "Log Path": log_path,
             "train_datasets": train_datasets,
@@ -236,8 +240,9 @@ def _normalize_head_entry(entry, model_row, model_args=None):
     valid_mcc = entry.get("valid_mcc", entry.get("Valid MCC", entry.get("mcc", entry.get("MCC"))))
     valid_auc = entry.get("valid_auc", entry.get("Valid AUC", entry.get("auc", entry.get("AUC"))))
 
-    return {
+    row = {
         "Model ID": model_id,
+        "Task": task,
         "Model": model_name,
         "Log Path": log_path,
         "train_datasets": train_datasets,
@@ -266,6 +271,20 @@ def _normalize_head_entry(entry, model_row, model_args=None):
         "Model Test MCC": _safe_float(model_test_mcc),
         "Details": entry.get("details", entry.get("source", entry.get("path", ""))),
     }
+    for key, value in entry.items():
+        if (
+            key in {"ece", "brier", "valid_ece", "valid_brier", "train_accuracy", "valid_accuracy", "test_accuracy", "all_mcc", "all_auc"}
+            or " F1 " in str(key)
+            or " Recall " in str(key)
+            or " Precision " in str(key)
+            or " Support " in str(key)
+        ):
+            row[key] = value
+    if row.get("ECE") is None and entry.get("ece") is not None:
+        row["ECE"] = entry.get("ece")
+    if row.get("Brier") is None and entry.get("brier") is not None:
+        row["Brier"] = entry.get("brier")
+    return row
 
 
 def _best_display_heads(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -318,6 +337,17 @@ def _has_usable_model_log_paths(df: pd.DataFrame) -> bool:
     return bool((df["Log Path"].notna() & ~log_paths.isin({"", "none", "nan", "null"})).any())
 
 
+def _apply_sidebar_split_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """Filter a models dataframe to only rows matching the active sidebar split combo."""
+    if df is None or df.empty:
+        return df
+    selected_split_key = st.session_state.get("sidebar_split_combo_key")
+    if not selected_split_key:
+        return df
+    filtered = df[df.apply(split_combo_key_from_row, axis=1) == str(selected_split_key)]
+    return filtered.reset_index(drop=True)
+
+
 def _load_top_models(ctx, top_n):
     active_task = st.session_state.get("production_task") or getattr(ctx.args, "task", None)
     table = st.session_state.get("best_models_table")
@@ -326,6 +356,7 @@ def _load_top_models(ctx, top_n):
         try:
             df = attach_task_column(pd.DataFrame(table))
             df = filter_models_df_by_task(df, active_task)
+            df = _apply_sidebar_split_filter(df)
             if len(df) > 0 and _has_usable_model_log_paths(df):
                 if int(top_n) >= 99999:
                     return df
@@ -339,13 +370,16 @@ def _load_top_models(ctx, top_n):
         df = load_best_models_table(ctx.cursor, task=active_task)
         df = attach_task_column(df)
         df = filter_models_df_by_task(df, active_task)
+        df = _apply_sidebar_split_filter(df)
         if int(top_n) >= 99999:
             return df
         return df.head(int(top_n))
     except Exception:
-        df = fetch_best_model_rows(ctx.cursor, limit=int(top_n))
+        fetch_limit = 100000 if st.session_state.get("sidebar_split_combo_key") else int(top_n)
+        df = fetch_best_model_rows(ctx.cursor, limit=fetch_limit)
         df = attach_task_column(df)
         df = filter_models_df_by_task(df, active_task)
+        df = _apply_sidebar_split_filter(df)
         if int(top_n) >= 99999:
             return df
         return df.head(int(top_n))
@@ -615,43 +649,51 @@ def _render_training_dataset_filter(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty or "train_datasets" not in df.columns:
         return df
 
-    combo_keys = []
+    combo_keys = list(st.session_state.get("sidebar_split_combo_options") or [])
     labels = {}
-    for _, row in df.iterrows():
-        train_value = str(row.get("train_datasets") or "").strip()
-        if not train_value or train_value.lower() in {"none", "nan", "null"}:
-            continue
-        valid_value = str(row.get("valid_dataset") or "").strip()
-        test_value = str(row.get("test_dataset") or "").strip()
-        key = (train_value, valid_value, test_value)
-        if key not in labels:
-            valid_label = get_short_dataset_name(valid_value) if valid_value else "valid: n/a"
-            test_label = get_short_dataset_name(test_value) if test_value else "test: n/a"
-            labels[key] = f"{get_short_dataset_names(train_value)} | valid: {valid_label} | test: {test_label}"
-            combo_keys.append(key)
+    sidebar_labels = st.session_state.get("sidebar_split_combo_labels") or {}
+    if not combo_keys:
+        for _, row in df.iterrows():
+            combo_key = split_combo_key_from_row(row)
+            if not combo_key.replace("|", "").strip():
+                continue
+            if combo_key not in combo_keys:
+                combo_keys.append(combo_key)
 
     if not combo_keys:
         return df
 
+    for combo_key in combo_keys:
+        train_value, valid_value, test_value = split_combo_key_to_values(combo_key)
+        valid_label = get_short_dataset_name(valid_value) if valid_value else "n/a"
+        test_label = get_short_dataset_name(test_value) if test_value else "n/a"
+        labels[combo_key] = sidebar_labels.get(
+            combo_key,
+            f"train: {get_short_dataset_names(train_value)} | valid: {valid_label} | test: {test_label}",
+        )
+
+    sidebar_split_key = st.session_state.get("sidebar_split_combo_key")
+    default_value = str(sidebar_split_key) if sidebar_split_key in combo_keys else combo_keys[0]
+    if st.session_state.get("learned_filter_train_dataset_combo") not in combo_keys:
+        st.session_state["learned_filter_train_dataset_combo"] = default_value
+
     selected = st.selectbox(
         "Train / valid / test dataset combination",
         options=combo_keys,
-        index=0,
+        index=combo_keys.index(default_value),
         format_func=lambda x: labels.get(x, x),
         key="learned_filter_train_dataset_combo",
-        help="Only combinations already present in saved model results are shown.",
+        help="Available train/valid/test combinations from the registry.",
     )
     if selected:
-        train_value, valid_value, test_value = selected
+        if sidebar_split_key and selected != str(sidebar_split_key):
+            st.session_state["pending_sidebar_split_combo_key"] = selected
+            st.rerun()
+        train_value, valid_value, test_value = split_combo_key_to_values(selected)
         st.session_state["selected_train_datasets"] = train_value
         st.session_state["selected_valid_dataset"] = valid_value
         st.session_state["selected_test_dataset"] = test_value
-        mask = df["train_datasets"].astype(str) == train_value
-        if "valid_dataset" in df.columns:
-            mask = mask & (df["valid_dataset"].fillna("").astype(str) == valid_value)
-        if "test_dataset" in df.columns:
-            mask = mask & (df["test_dataset"].fillna("").astype(str) == test_value)
-        df = df[mask]
+        df = df[df.apply(split_combo_key_from_row, axis=1) == selected]
     return df
 
 
@@ -743,6 +785,104 @@ def _normalize_auc_scores(score_arr: np.ndarray) -> np.ndarray:
     return score_arr / np.where(row_sums[:, None] == 0, 1.0, row_sums[:, None])
 
 
+def _score_probabilities(scores) -> np.ndarray | None:
+    if scores is None:
+        return None
+    try:
+        score_arr = np.asarray(scores, dtype=float)
+        if score_arr.size == 0:
+            return None
+        if score_arr.ndim == 1:
+            prob_pos = 1.0 / (1.0 + np.exp(-score_arr.reshape(-1)))
+            return np.vstack([1.0 - prob_pos, prob_pos]).T
+        return _normalize_auc_scores(score_arr)
+    except Exception:
+        return None
+
+
+def _calibration_metrics(y_true, y_pred, probabilities, classes=None) -> Dict[str, float]:
+    try:
+        prob_arr = np.asarray(probabilities, dtype=float)
+        if prob_arr.ndim != 2 or prob_arr.shape[0] == 0:
+            return {"ece": np.nan, "brier": np.nan}
+        y_arr = np.asarray(y_true)
+        pred_arr = np.asarray(y_pred)
+        if classes is None or len(classes) != prob_arr.shape[1]:
+            class_arr = np.arange(prob_arr.shape[1])
+        else:
+            class_arr = np.asarray(classes)
+
+        confidence = np.nanmax(prob_arr, axis=1)
+        correct = (pred_arr == y_arr).astype(float)
+        ece = 0.0
+        for lo, hi in zip(np.linspace(0.0, 1.0, 11)[:-1], np.linspace(0.0, 1.0, 11)[1:]):
+            mask = (confidence >= lo) & (confidence < hi if hi < 1.0 else confidence <= hi)
+            if np.any(mask):
+                ece += float(mask.mean()) * abs(float(correct[mask].mean()) - float(confidence[mask].mean()))
+
+        one_hot = np.zeros_like(prob_arr, dtype=float)
+        class_to_idx = {label: i for i, label in enumerate(class_arr.tolist())}
+        for i, label in enumerate(y_arr):
+            j = class_to_idx.get(label)
+            if j is not None:
+                one_hot[i, j] = 1.0
+        brier = float(np.mean(np.sum((prob_arr - one_hot) ** 2, axis=1)))
+        return {"ece": float(ece), "brier": brier}
+    except Exception:
+        return {"ece": np.nan, "brier": np.nan}
+
+
+def _per_class_metrics(y_true, y_pred, class_names=None, prefix: str | None = None) -> Dict[str, float]:
+    if not prefix:
+        return {}
+    try:
+        y_arr = np.asarray(y_true)
+        pred_arr = np.asarray(y_pred)
+        labels = np.asarray(sorted(np.unique(np.concatenate([y_arr, pred_arr])).tolist()))
+        precision, recall, f1, support = precision_recall_fscore_support(
+            y_arr,
+            pred_arr,
+            labels=labels,
+            zero_division=0,
+        )
+        out = {}
+        title = str(prefix).title()
+        for label, p_val, r_val, f_val, s_val in zip(labels, precision, recall, f1, support):
+            if class_names is not None and int(label) < len(class_names):
+                label_name = str(class_names[int(label)])
+            else:
+                label_name = str(label)
+            out[f"{title} F1 {label_name}"] = float(f_val)
+            out[f"{title} Precision {label_name}"] = float(p_val)
+            out[f"{title} Recall {label_name}"] = float(r_val)
+            out[f"{title} Support {label_name}"] = int(s_val)
+        return out
+    except Exception:
+        return {}
+
+
+def _prediction_metrics(y_true, y_pred, scores=None, classes=None, class_names=None, prefix: str | None = None) -> Dict[str, float]:
+    try:
+        mcc = _evaluate_mcc(y_true, y_pred)
+        accuracy = float(accuracy_score(y_true, y_pred))
+    except Exception:
+        mcc = np.nan
+        accuracy = np.nan
+
+    auc = _evaluate_auc_from_scores(y_true, scores, classes=classes) if scores is not None else np.nan
+    probabilities = _score_probabilities(scores)
+    cal = _calibration_metrics(y_true, y_pred, probabilities, classes=classes) if probabilities is not None else {"ece": np.nan, "brier": np.nan}
+    out = {
+        "mcc": float(mcc) if not pd.isna(mcc) else np.nan,
+        "accuracy": float(accuracy) if not pd.isna(accuracy) else np.nan,
+        "auc": float(auc) if not pd.isna(auc) else np.nan,
+        "ece": cal.get("ece", np.nan),
+        "brier": cal.get("brier", np.nan),
+    }
+    out.update(_per_class_metrics(y_true, y_pred, class_names=class_names, prefix=prefix))
+    return out
+
+
 def _evaluate_auc_from_scores(y_true, scores, classes=None) -> float:
     try:
         y_arr = np.asarray(y_true)
@@ -798,26 +938,25 @@ def _evaluate_auc_from_scores(y_true, scores, classes=None) -> float:
         return np.nan
 
 
-def _evaluate_classifier_metrics(clf, X, y) -> Dict[str, float]:
+def _evaluate_classifier_metrics(clf, X, y, class_names=None, prefix: str | None = None) -> Dict[str, float]:
     try:
         pred = clf.predict(X)
-        mcc = _evaluate_mcc(y, pred)
     except Exception:
-        return {"mcc": np.nan, "auc": np.nan}
+        return {"mcc": np.nan, "accuracy": np.nan, "auc": np.nan, "ece": np.nan, "brier": np.nan}
 
-    auc = np.nan
+    scores = None
     try:
         if hasattr(clf, "predict_proba"):
-            auc = _evaluate_auc_from_scores(y, clf.predict_proba(X), classes=getattr(clf, "classes_", None))
+            scores = clf.predict_proba(X)
         elif hasattr(clf, "decision_function"):
-            auc = _evaluate_auc_from_scores(y, clf.decision_function(X), classes=getattr(clf, "classes_", None))
+            scores = clf.decision_function(X)
     except Exception:
-        auc = np.nan
+        scores = None
 
-    return {"mcc": float(mcc), "auc": float(auc) if not pd.isna(auc) else np.nan}
+    return _prediction_metrics(y, pred, scores=scores, classes=getattr(clf, "classes_", None), class_names=class_names, prefix=prefix)
 
 
-def _prototype_metrics(proto_vecs, proto_labels, X, y) -> Dict[str, float]:
+def _prototype_metrics(proto_vecs, proto_labels, X, y, class_names=None, prefix: str | None = None) -> Dict[str, float]:
     try:
         dists = np.linalg.norm(X[:, None, :] - proto_vecs[None, :, :], axis=2)
         pred = proto_labels[np.argmin(dists, axis=1)]
@@ -828,12 +967,9 @@ def _prototype_metrics(proto_vecs, proto_labels, X, y) -> Dict[str, float]:
             label_dist = np.min(dists[:, mask], axis=1) if np.any(mask) else np.full(X.shape[0], np.inf)
             scores.append(-label_dist)
         score_arr = np.vstack(scores).T if scores else np.empty((X.shape[0], 0))
-        return {
-            "mcc": _evaluate_mcc(y, pred),
-            "auc": _evaluate_auc_from_scores(y, score_arr, classes=labels),
-        }
+        return _prediction_metrics(y, pred, scores=score_arr, classes=labels, class_names=class_names, prefix=prefix)
     except Exception:
-        return {"mcc": np.nan, "auc": np.nan}
+        return {"mcc": np.nan, "accuracy": np.nan, "auc": np.nan, "ece": np.nan, "brier": np.nan}
 
 
 def _baseline_models(random_state: int = 1):
@@ -879,6 +1015,8 @@ def _ensure_training_args(_args):
 
 def _encode_splits_for_args(_args):
     """Encode train/valid/test embeddings for one trained model."""
+    from otitenet.train.train_triplet_new import TrainAE
+
     _args = _ensure_training_args(_args)
 
     model, _, prototypes, _, _, data, unique_labels, unique_batches, _ = load_model_and_prototypes(_args)
@@ -945,6 +1083,7 @@ def _encode_splits_for_args(_args):
         y = train.all_samples["cats"].get(split)
         if X is not None and y is not None and len(X) > 0:
             encoded[split] = {"X": np.asarray(X), "y": np.asarray(y)}
+    encoded["_class_names"] = [str(label) for label in unique_labels]
 
     if "train" not in encoded or "valid" not in encoded:
         raise RuntimeError("Could not encode train/valid embeddings.")
@@ -952,7 +1091,42 @@ def _encode_splits_for_args(_args):
     return encoded
 
 
-def _compute_knn_heads(X_train, y_train, X_valid, y_valid, k_values, X_test=None, y_test=None, on_head_start=None):
+def _split_metric_fields(train_metrics, valid_metrics, test_metrics=None, all_metrics=None) -> Dict[str, Any]:
+    test_metrics = test_metrics or {}
+    all_metrics = all_metrics or {}
+    out = {
+        "train_mcc": train_metrics.get("mcc"),
+        "valid_mcc": valid_metrics.get("mcc"),
+        "test_mcc": test_metrics.get("mcc"),
+        "all_mcc": all_metrics.get("mcc"),
+        "train_accuracy": train_metrics.get("accuracy"),
+        "valid_accuracy": valid_metrics.get("accuracy"),
+        "test_accuracy": test_metrics.get("accuracy"),
+        "train_auc": train_metrics.get("auc"),
+        "valid_auc": valid_metrics.get("auc"),
+        "test_auc": test_metrics.get("auc"),
+        "all_auc": all_metrics.get("auc"),
+        "ece": valid_metrics.get("ece"),
+        "brier": valid_metrics.get("brier"),
+        "valid_ece": valid_metrics.get("ece"),
+        "valid_brier": valid_metrics.get("brier"),
+    }
+    for source in (valid_metrics, test_metrics):
+        for key, value in source.items():
+            if " F1 " in key or " Recall " in key or " Precision " in key or " Support " in key:
+                out[key] = value
+    return out
+
+
+def _combine_splits(*splits):
+    xs = [split[0] for split in splits if split[0] is not None and split[1] is not None]
+    ys = [split[1] for split in splits if split[0] is not None and split[1] is not None]
+    if not xs or not ys:
+        return None, None
+    return np.concatenate(xs, axis=0), np.concatenate(ys, axis=0)
+
+
+def _compute_knn_heads(X_train, y_train, X_valid, y_valid, k_values, X_test=None, y_test=None, on_head_start=None, class_names=None):
     mcc_per_k = []
     best_k = None
     best_mcc = -1.0
@@ -964,20 +1138,17 @@ def _compute_knn_heads(X_train, y_train, X_valid, y_valid, k_values, X_test=None
         try:
             clf = KNeighborsClassifier(n_neighbors=k_eff, metric="minkowski")
             clf.fit(X_train, y_train)
-            train_metrics = _evaluate_classifier_metrics(clf, X_train, y_train)
-            valid_metrics = _evaluate_classifier_metrics(clf, X_valid, y_valid)
-            test_metrics = _evaluate_classifier_metrics(clf, X_test, y_test) if X_test is not None and y_test is not None else {}
+            train_metrics = _evaluate_classifier_metrics(clf, X_train, y_train, class_names=class_names, prefix="train")
+            valid_metrics = _evaluate_classifier_metrics(clf, X_valid, y_valid, class_names=class_names, prefix="valid")
+            test_metrics = _evaluate_classifier_metrics(clf, X_test, y_test, class_names=class_names, prefix="test") if X_test is not None and y_test is not None else {}
+            X_all, y_all = _combine_splits((X_train, y_train), (X_valid, y_valid), (X_test, y_test))
+            all_metrics = _evaluate_classifier_metrics(clf, X_all, y_all, class_names=class_names) if X_all is not None else {}
             mcc = valid_metrics["mcc"]
 
             mcc_per_k.append({
                 "k": int(k_eff),
-                "train_mcc": train_metrics.get("mcc"),
-                "valid_mcc": valid_metrics.get("mcc"),
-                "test_mcc": test_metrics.get("mcc"),
-                "train_auc": train_metrics.get("auc"),
-                "valid_auc": valid_metrics.get("auc"),
-                "test_auc": test_metrics.get("auc"),
                 "mcc": float(mcc),
+                **_split_metric_fields(train_metrics, valid_metrics, test_metrics, all_metrics),
             })
 
             if not pd.isna(mcc) and float(mcc) > best_mcc:
@@ -993,7 +1164,7 @@ def _compute_knn_heads(X_train, y_train, X_valid, y_valid, k_values, X_test=None
     }
 
 
-def _compute_prototype_heads(X_train, y_train, X_valid, y_valid, strategies, components, X_test=None, y_test=None, on_head_start=None):
+def _compute_prototype_heads(X_train, y_train, X_valid, y_valid, strategies, components, X_test=None, y_test=None, on_head_start=None, class_names=None):
     out = {}
 
     for strategy in strategies:
@@ -1020,22 +1191,19 @@ def _compute_prototype_heads(X_train, y_train, X_valid, y_valid, strategies, com
                 if len(proto_vecs) == 0:
                     continue
 
-                train_metrics = _prototype_metrics(proto_vecs, proto_labels, X_train, y_train)
-                valid_metrics = _prototype_metrics(proto_vecs, proto_labels, X_valid, y_valid)
-                test_metrics = _prototype_metrics(proto_vecs, proto_labels, X_test, y_test) if X_test is not None and y_test is not None else {}
+                train_metrics = _prototype_metrics(proto_vecs, proto_labels, X_train, y_train, class_names=class_names, prefix="train")
+                valid_metrics = _prototype_metrics(proto_vecs, proto_labels, X_valid, y_valid, class_names=class_names, prefix="valid")
+                test_metrics = _prototype_metrics(proto_vecs, proto_labels, X_test, y_test, class_names=class_names, prefix="test") if X_test is not None and y_test is not None else {}
+                X_all, y_all = _combine_splits((X_train, y_train), (X_valid, y_valid), (X_test, y_test))
+                all_metrics = _prototype_metrics(proto_vecs, proto_labels, X_all, y_all, class_names=class_names) if X_all is not None else {}
                 mcc = valid_metrics["mcc"]
 
                 per_components.append(
                     {
                         "n_components": n_comp,
                         "mcc": float(mcc),
-                        "train_mcc": train_metrics.get("mcc"),
-                        "valid_mcc": valid_metrics.get("mcc"),
-                        "test_mcc": test_metrics.get("mcc"),
-                        "train_auc": train_metrics.get("auc"),
-                        "valid_auc": valid_metrics.get("auc"),
-                        "test_auc": test_metrics.get("auc"),
                         "n_prototypes": int(len(proto_vecs)),
+                        **_split_metric_fields(train_metrics, valid_metrics, test_metrics, all_metrics),
                     }
                 )
 
@@ -1043,14 +1211,7 @@ def _compute_prototype_heads(X_train, y_train, X_valid, y_valid, strategies, com
                     best_mcc = float(mcc)
                     best_n_components = n_comp
                     best_n_prototypes = int(len(proto_vecs))
-                    best_metrics = {
-                        "train_mcc": train_metrics.get("mcc"),
-                        "valid_mcc": valid_metrics.get("mcc"),
-                        "test_mcc": test_metrics.get("mcc"),
-                        "train_auc": train_metrics.get("auc"),
-                        "valid_auc": valid_metrics.get("auc"),
-                        "test_auc": test_metrics.get("auc"),
-                    }
+                    best_metrics = _split_metric_fields(train_metrics, valid_metrics, test_metrics, all_metrics)
 
             except Exception as e:
                 per_components.append(
@@ -1074,25 +1235,37 @@ def _compute_prototype_heads(X_train, y_train, X_valid, y_valid, strategies, com
     return out
 
 
-def _compute_baseline_heads(X_train, y_train, X_valid, y_valid, X_test=None, y_test=None, on_head_start=None):
+def _compute_baseline_heads(
+    X_train,
+    y_train,
+    X_valid,
+    y_valid,
+    X_test=None,
+    y_test=None,
+    on_head_start=None,
+    class_names=None,
+    baseline_names=None,
+):
     out = {}
 
-    for name, clf in _baseline_models().items():
+    all_models = _baseline_models()
+    selected_names = list(baseline_names or all_models.keys())
+    for name in selected_names:
+        clf = all_models.get(name)
+        if clf is None:
+            continue
         if on_head_start:
             on_head_start(format_classifier_config(f"baseline_{name}"))
         try:
             clf.fit(X_train, y_train)
-            train_metrics = _evaluate_classifier_metrics(clf, X_train, y_train)
-            valid_metrics = _evaluate_classifier_metrics(clf, X_valid, y_valid)
-            test_metrics = _evaluate_classifier_metrics(clf, X_test, y_test) if X_test is not None and y_test is not None else {}
+            train_metrics = _evaluate_classifier_metrics(clf, X_train, y_train, class_names=class_names, prefix="train")
+            valid_metrics = _evaluate_classifier_metrics(clf, X_valid, y_valid, class_names=class_names, prefix="valid")
+            test_metrics = _evaluate_classifier_metrics(clf, X_test, y_test, class_names=class_names, prefix="test") if X_test is not None and y_test is not None else {}
+            X_all, y_all = _combine_splits((X_train, y_train), (X_valid, y_valid), (X_test, y_test))
+            all_metrics = _evaluate_classifier_metrics(clf, X_all, y_all, class_names=class_names) if X_all is not None else {}
             out[name] = {
                 "mcc": valid_metrics.get("mcc"),
-                "valid_mcc": valid_metrics.get("mcc"),
-                "test_mcc": test_metrics.get("mcc"),
-                "train_mcc": train_metrics.get("mcc"),
-                "valid_auc": valid_metrics.get("auc"),
-                "test_auc": test_metrics.get("auc"),
-                "train_auc": train_metrics.get("auc"),
+                **_split_metric_fields(train_metrics, valid_metrics, test_metrics, all_metrics),
             }
         except Exception as e:
             out[name] = {"mcc": None, "error": str(e)}
@@ -1158,6 +1331,7 @@ def train_heads_for_args(
     k_values,
     prototype_strategies,
     prototype_components,
+    baseline_names=None,
     include_knn=True,
     include_prototypes=True,
     include_baselines=True,
@@ -1173,6 +1347,7 @@ def train_heads_for_args(
     y_valid = encoded["valid"]["y"]
     X_test = encoded.get("test", {}).get("X")
     y_test = encoded.get("test", {}).get("y")
+    class_names = encoded.get("_class_names")
 
     result = {
         "knn": {},
@@ -1197,7 +1372,7 @@ def train_heads_for_args(
     if include_prototypes:
         total_heads += len(prototype_strategies) * len(prototype_components)
     if include_baselines:
-        total_heads += len(_baseline_models())
+        total_heads += len(baseline_names or _baseline_models())
     head_index = 0
 
     def on_head_start(head_label: str):
@@ -1224,6 +1399,7 @@ def train_heads_for_args(
             X_test=X_test,
             y_test=y_test,
             on_head_start=on_head_start,
+            class_names=class_names,
         )
 
     if include_prototypes:
@@ -1237,6 +1413,7 @@ def train_heads_for_args(
             X_test=X_test,
             y_test=y_test,
             on_head_start=on_head_start,
+            class_names=class_names,
         )
 
     if include_baselines:
@@ -1248,6 +1425,8 @@ def train_heads_for_args(
             X_test=X_test,
             y_test=y_test,
             on_head_start=on_head_start,
+            class_names=class_names,
+            baseline_names=baseline_names,
         )
 
     best_config, best_mcc = _choose_best_config(result)
@@ -1288,6 +1467,391 @@ def _clear_existing_heads_cache():
     for key in list(st.session_state.keys()):
         if key.startswith("learned_existing_heads_df") or key.startswith("learned_existing_errors"):
             st.session_state.pop(key, None)
+
+
+def _refresh_leaderboard_state_after_head_training(ctx) -> None:
+    try:
+        from otitenet.app.pages.leaderboard import load_best_models_table, _update_model_number_map
+
+        active_task = st.session_state.get("production_task") or getattr(ctx.args, "task", None)
+        leaderboard_df = load_best_models_table(ctx.cursor, task=active_task)
+        _update_model_number_map(leaderboard_df)
+        st.session_state["best_models_table"] = leaderboard_df
+    except Exception as e:
+        st.warning(f"Could not refresh leaderboard table after training heads: {e}")
+
+
+def _sync_sidebar_context_to_trained_head(model_args, result: Dict[str, Any] | None) -> None:
+    task = getattr(model_args, "task", None)
+    if not _is_blank_value(task):
+        st.session_state["production_task"] = str(task)
+
+    result = result or {}
+    train_datasets = result.get("train_datasets") or getattr(model_args, "train_datasets", "")
+    valid_dataset = result.get("valid_dataset") or getattr(model_args, "valid_dataset", "")
+    test_dataset = result.get("test_dataset") or getattr(model_args, "test_dataset", "")
+    split_key = split_config_key(train_datasets, valid_dataset, test_dataset)
+    if split_key.replace("|", "").strip():
+        st.session_state["learned_last_trained_split_combo_key"] = split_key
+        split_options = list(st.session_state.get("sidebar_split_combo_options") or [])
+        if split_key not in split_options:
+            st.session_state["sidebar_split_combo_options"] = split_options + [split_key]
+        st.session_state["selected_train_datasets"] = str(train_datasets or "")
+        st.session_state["selected_valid_dataset"] = str(valid_dataset or "")
+        st.session_state["selected_test_dataset"] = str(test_dataset or "")
+
+
+def _head_metrics_payload(model_row, model_args, result) -> Dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+
+    model_id = model_row.get("Model ID") or model_row.get("id") or model_row.get("model_id") if isinstance(model_row, dict) else None
+    log_path = model_row.get("Log Path") or model_row.get("log_path") if isinstance(model_row, dict) else getattr(model_args, "log_path", None)
+    if _is_blank_value(model_id) and _is_blank_value(log_path):
+        return None
+
+    best_config = result.get("best_config") or result.get("best_k")
+    metrics = result.get("best_head_metrics") or _metrics_for_config(result, best_config)
+    valid_mcc = metrics.get("valid_mcc", result.get("best_valid_mcc", result.get("best_mcc")))
+    if _is_blank_value(valid_mcc):
+        return None
+
+    def _metric(name):
+        value = metrics.get(name)
+        if _is_blank_value(value):
+            return None
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    train_datasets = result.get("train_datasets") or getattr(model_args, "train_datasets", "")
+    valid_dataset = result.get("valid_dataset") or getattr(model_args, "valid_dataset", "")
+    test_dataset = result.get("test_dataset") or getattr(model_args, "test_dataset", "")
+    split_key = split_config_key(train_datasets, valid_dataset, test_dataset)
+    model_dict = model_row if isinstance(model_row, dict) else {}
+
+    return {
+        "model_id": model_id,
+        "model_name": model_dict.get("Model Name") or model_dict.get("model_name") or getattr(model_args, "model_name", None),
+        "task": model_dict.get("Task") or model_dict.get("task") or getattr(model_args, "task", None),
+        "log_path": log_path,
+        "best_model_dir": model_dict.get("Best Model Dir") or model_dict.get("best_model_dir"),
+        "source_run_log_path": model_dict.get("Source Run Path") or model_dict.get("source_run_log_path"),
+        "artifact_log_path": model_dict.get("Artifact Log Path") or model_dict.get("artifact_log_path"),
+        "best_config": str(best_config) if best_config is not None else None,
+        "best_head_name": format_classifier_config(best_config),
+        "best_head_family": _infer_head_family(best_config),
+        "best_head_n_aug": int(getattr(model_args, "n_aug", 0) or 0),
+        "train_mcc": _metric("train_mcc"),
+        "valid_mcc": float(valid_mcc),
+        "test_mcc": _metric("test_mcc"),
+        "all_mcc": _metric("all_mcc"),
+        "valid_accuracy": _metric("valid_accuracy"),
+        "train_auc": _metric("train_auc"),
+        "valid_auc": _metric("valid_auc"),
+        "test_auc": _metric("test_auc"),
+        "all_auc": _metric("all_auc"),
+        "ece": _metric("ece"),
+        "brier": _metric("brier"),
+        "train_datasets": str(train_datasets or ""),
+        "valid_dataset": str(valid_dataset or ""),
+        "test_dataset": str(test_dataset or ""),
+        "split_config_key": split_key,
+    }
+
+
+def _update_csv_rows(path: str, match_func, values: Dict[str, Any], append_row: Dict[str, Any] | None = None) -> int:
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        df = pd.read_csv(path, dtype=str).fillna("")
+    except Exception:
+        return 0
+
+    if df.empty and append_row is None:
+        return 0
+
+    df = df.copy()
+    for col in values:
+        if col not in df.columns:
+            df[col] = ""
+
+    mask = df.apply(match_func, axis=1) if not df.empty else pd.Series([], dtype=bool)
+    count = int(mask.sum()) if len(mask) else 0
+
+    if count == 0 and append_row is not None:
+        for col in append_row:
+            if col not in df.columns:
+                df[col] = ""
+        for col in values:
+            if col not in df.columns:
+                df[col] = ""
+        row = {col: "" for col in df.columns}
+        row.update({k: "" if v is None else v for k, v in append_row.items() if k in row})
+        row.update({k: "" if v is None else v for k, v in values.items() if k in row})
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True, sort=False)
+        count = 1
+    elif count:
+        for col, value in values.items():
+            df.loc[mask, col] = "" if value is None else value
+
+    if count:
+        df.to_csv(path, index=False)
+    return count
+
+
+def _persist_best_head_metrics_to_csv_registries(payload: Dict[str, Any]) -> None:
+    path_candidates = {
+        str(payload.get("log_path") or "").strip(),
+        str(payload.get("best_model_dir") or "").strip(),
+        str(payload.get("source_run_log_path") or "").strip(),
+        str(payload.get("artifact_log_path") or "").strip(),
+    }
+    path_candidates = {p for p in path_candidates if p}
+
+    csv_values = {
+        "mcc": payload.get("valid_mcc"),
+        "valid_mcc": payload.get("valid_mcc"),
+        "train_mcc": payload.get("train_mcc"),
+        "test_mcc": payload.get("test_mcc"),
+        "all_mcc": payload.get("all_mcc"),
+        "valid_accuracy": payload.get("valid_accuracy"),
+        "train_auc": payload.get("train_auc"),
+        "valid_auc": payload.get("valid_auc"),
+        "test_auc": payload.get("test_auc"),
+        "all_auc": payload.get("all_auc"),
+        "ece": payload.get("ece"),
+        "brier": payload.get("brier"),
+        "best_head_config": payload.get("best_config"),
+        "best_head_name": payload.get("best_head_name"),
+        "best_head_family": payload.get("best_head_family"),
+        "best_head_n_aug": payload.get("best_head_n_aug"),
+        "head_config": payload.get("best_config"),
+        "head_name": payload.get("best_head_name"),
+        "head_family": payload.get("best_head_family"),
+        "head_n_aug": payload.get("best_head_n_aug"),
+        "train_datasets": payload.get("train_datasets"),
+        "valid_dataset": payload.get("valid_dataset"),
+        "test_dataset": payload.get("test_dataset"),
+        "split_config_key": payload.get("split_config_key"),
+    }
+
+    run_ids = {
+        os.path.basename(p.rstrip("/"))
+        for p in path_candidates
+        if os.path.basename(p.rstrip("/"))
+    }
+
+    def _path_match(row):
+        row_paths = {
+            str(row.get("model_dir", "") or "").strip(),
+            str(row.get("run_log_path", "") or "").strip(),
+            str(row.get("complete_log_path", "") or "").strip(),
+            str(row.get("log_path", "") or "").strip(),
+            str(row.get("source_run_log_path", "") or "").strip(),
+            str(row.get("best_model_dir", "") or "").strip(),
+        }
+        row_ids = {os.path.basename(p.rstrip("/")) for p in row_paths if p}
+        return bool(path_candidates.intersection({p for p in row_paths if p}) or run_ids.intersection(row_ids))
+
+    best_models_path = "configs/best_models.csv"
+    append_row = None
+    if payload.get("best_model_dir"):
+        append_row = {
+            "task": payload.get("task"),
+            "model_name": payload.get("model_name"),
+            "model_dir": payload.get("best_model_dir"),
+            "run_log_path": payload.get("source_run_log_path") or payload.get("log_path"),
+            "is_best": "yes",
+        }
+    _update_csv_rows(best_models_path, _path_match, csv_values, append_row=append_row)
+
+    task = str(payload.get("task") or "").strip()
+    if task:
+        models_csv_path = os.path.join("logs", "best_models", task, "models.csv")
+        task_values = {
+            **csv_values,
+            "valid_mcc": payload.get("valid_mcc"),
+            "train_datasets": str(payload.get("train_datasets") or "").replace(",", ";"),
+            "split_config_key": str(payload.get("split_config_key") or "").replace(",", ";"),
+        }
+        _update_csv_rows(models_csv_path, _path_match, task_values)
+
+    completed_values = {
+        "valid_mcc": payload.get("valid_mcc"),
+        "train_mcc": payload.get("train_mcc"),
+        "test_mcc": payload.get("test_mcc"),
+        "all_mcc": payload.get("all_mcc"),
+        "valid_accuracy": payload.get("valid_accuracy"),
+        "train_auc": payload.get("train_auc"),
+        "valid_auc": payload.get("valid_auc"),
+        "test_auc": payload.get("test_auc"),
+        "all_auc": payload.get("all_auc"),
+        "ece": payload.get("ece"),
+        "brier": payload.get("brier"),
+        "best_head_config": payload.get("best_config"),
+        "best_head_name": payload.get("best_head_name"),
+        "best_head_family": payload.get("best_head_family"),
+        "best_head_n_aug": payload.get("best_head_n_aug"),
+    }
+
+    def _completed_match(row):
+        return str(row.get("uuid", "") or "").strip() in run_ids
+
+    _update_csv_rows("completed_runs_metrics.csv", _completed_match, completed_values)
+
+
+def _persist_best_head_metrics_to_registry(ctx, model_row, model_args, result) -> None:
+    payload = _head_metrics_payload(model_row, model_args, result)
+    if not payload:
+        return
+
+    cursor = ctx.cursor
+    conn = getattr(ctx, "conn", None)
+
+    def _ensure_column(column_name: str, ddl: str) -> bool:
+        try:
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'best_models_registry'
+                  AND COLUMN_NAME = %s
+                """,
+                (column_name,),
+            )
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(f"ALTER TABLE best_models_registry ADD COLUMN {ddl}")
+                if conn:
+                    conn.commit()
+            return True
+        except Exception:
+            try:
+                if conn:
+                    conn.rollback()
+            except Exception:
+                pass
+            return False
+
+    optional_columns = {
+        "valid_mcc": "valid_mcc FLOAT NULL",
+        "test_mcc": "test_mcc FLOAT NULL",
+        "valid_auc": "valid_auc FLOAT NULL",
+        "test_auc": "test_auc FLOAT NULL",
+        "train_mcc": "train_mcc FLOAT NULL",
+        "train_auc": "train_auc FLOAT NULL",
+        "all_mcc": "all_mcc FLOAT NULL",
+        "all_auc": "all_auc FLOAT NULL",
+        "valid_accuracy": "valid_accuracy FLOAT NULL",
+        "ece": "ece FLOAT NULL",
+        "brier": "brier FLOAT NULL",
+        "best_head_config": "best_head_config VARCHAR(255) NULL",
+        "best_head_name": "best_head_name VARCHAR(255) NULL",
+        "best_head_family": "best_head_family VARCHAR(64) NULL",
+        "best_head_n_aug": "best_head_n_aug INT NULL",
+        "best_model_dir": "TEXT NULL",
+        "source_run_log_path": "TEXT NULL",
+    }
+    available = {name for name, ddl in optional_columns.items() if _ensure_column(name, ddl)}
+
+    assignments = [
+        "mcc = %s",
+    ]
+    values = [
+        payload.get("valid_mcc"),
+    ]
+
+    if "valid_mcc" in available:
+        assignments.append("valid_mcc = %s")
+        values.append(payload.get("valid_mcc"))
+    if "test_mcc" in available:
+        assignments.append("test_mcc = %s")
+        values.append(payload.get("test_mcc"))
+    if "valid_auc" in available:
+        assignments.append("valid_auc = %s")
+        values.append(payload.get("valid_auc"))
+    if "test_auc" in available:
+        assignments.append("test_auc = %s")
+        values.append(payload.get("test_auc"))
+    if "train_mcc" in available:
+        assignments.append("train_mcc = %s")
+        values.append(payload.get("train_mcc"))
+    if "train_auc" in available:
+        assignments.append("train_auc = %s")
+        values.append(payload.get("train_auc"))
+    if "all_mcc" in available:
+        assignments.append("all_mcc = %s")
+        values.append(payload.get("all_mcc"))
+    if "all_auc" in available:
+        assignments.append("all_auc = %s")
+        values.append(payload.get("all_auc"))
+    if "valid_accuracy" in available:
+        assignments.append("valid_accuracy = %s")
+        values.append(payload.get("valid_accuracy"))
+    if "ece" in available:
+        assignments.append("ece = %s")
+        values.append(payload.get("ece"))
+    if "brier" in available:
+        assignments.append("brier = %s")
+        values.append(payload.get("brier"))
+    if "best_head_config" in available:
+        assignments.append("best_head_config = %s")
+        values.append(payload.get("best_config"))
+    if "best_head_name" in available:
+        assignments.append("best_head_name = %s")
+        values.append(payload.get("best_head_name"))
+    if "best_head_family" in available:
+        assignments.append("best_head_family = %s")
+        values.append(payload.get("best_head_family"))
+    if "best_head_n_aug" in available:
+        assignments.append("best_head_n_aug = %s")
+        values.append(payload.get("best_head_n_aug"))
+
+    where_parts = []
+    where_values = []
+    if not _is_blank_value(payload.get("model_id")):
+        where_parts.append("id = %s")
+        where_values.append(payload.get("model_id"))
+
+    path_values = [
+        payload.get("log_path"),
+        payload.get("best_model_dir"),
+        payload.get("source_run_log_path"),
+        payload.get("artifact_log_path"),
+    ]
+    path_values = [str(v).strip() for v in path_values if not _is_blank_value(v)]
+    if path_values:
+        placeholders = ", ".join(["%s"] * len(path_values))
+        where_parts.append(f"log_path IN ({placeholders})")
+        where_values.extend(path_values)
+        if "best_model_dir" in available:
+            where_parts.append(f"best_model_dir IN ({placeholders})")
+            where_values.extend(path_values)
+        if "source_run_log_path" in available:
+            where_parts.append(f"source_run_log_path IN ({placeholders})")
+            where_values.extend(path_values)
+
+    if not where_parts:
+        _persist_best_head_metrics_to_csv_registries(payload)
+        return
+
+    where_clause = " OR ".join(f"({part})" for part in where_parts)
+    values.extend(where_values)
+
+    try:
+        cursor.execute(f"UPDATE best_models_registry SET {', '.join(assignments)} WHERE {where_clause}", tuple(values))
+        if conn:
+            conn.commit()
+    except Exception:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+
+    _persist_best_head_metrics_to_csv_registries(payload)
 
 
 def _result_summary_row(model_row, result, cache_path):
@@ -1769,6 +2333,16 @@ def _render_training_controls(ctx):
             key="learned_train_proto_strategies",
             disabled=not include_prototypes,
         )
+        baseline_options = list(BASELINE_DISPLAY_NAMES.keys())
+        baseline_labels = {name: BASELINE_DISPLAY_NAMES.get(name, name) for name in baseline_options}
+        selected_baselines = st.multiselect(
+            "Baseline classifiers",
+            baseline_options,
+            default=baseline_options,
+            format_func=lambda name: baseline_labels.get(name, name),
+            key="learned_train_baseline_classifiers",
+            disabled=not include_baselines,
+        )
 
     run = st.button(
         "🚀 Train / recalculate heads",
@@ -1780,25 +2354,16 @@ def _render_training_controls(ctx):
         _display_training_results(st.session_state.get("learned_last_training_payload"), replay=True)
         return
 
-    # --- REFRESH LEADERBOARD TABLES after training heads ---
-    try:
-        from otitenet.app.pages.leaderboard import load_best_models_table, _update_model_number_map
-        active_task = st.session_state.get("production_task") or getattr(ctx.args, "task", None)
-        leaderboard_df = load_best_models_table(ctx.cursor, task=active_task)
-        _update_model_number_map(leaderboard_df)
-        # Update session state cache to ensure top models table reflects latest data
-        st.session_state["best_models_table"] = leaderboard_df
-        # Clear learned embedding heads cache to ensure it syncs with updated models
-        _clear_existing_heads_cache()
-    except Exception as e:
-        st.warning(f"Could not refresh leaderboard table after training heads: {e}")
-
     clear_cached_model()
 
     k_values = list(range(1, int(k_max) + 1))
     proto_components = list(range(1, int(proto_max) + 1))
     prototype_strategies = prototype_strategies or ["mean"]
+    selected_baselines = selected_baselines if include_baselines else []
     n_aug_values = _parse_int_list(n_aug_text, default=[int(getattr(ctx.args, "n_aug", 0) or 0)])
+    if not include_knn and not include_prototypes and not selected_baselines:
+        st.error("Select at least one head family or one baseline classifier to train.")
+        return
 
     summary_rows = []
 
@@ -1883,53 +2448,15 @@ def _render_training_controls(ctx):
         stack_status.setdefault(key, "pending")
         stack_rows.setdefault(key, _stack_meta(model_row, model_args))
 
-
-    # Always show the tracker table above progress bars
-    tracker_placeholder = st.container()
     progress = st.progress(0)
     status = st.empty()
     head_progress = st.progress(0)
-    head_tracker = st.empty()
-    st.markdown("#### Training updates")
-    training_log_placeholder = st.empty()
-    training_log_rows: List[Dict[str, Any]] = []
 
     def _log_training_update(message: str, level: str = "info"):
-        training_log_rows.append(
-            {
-                "Step": len(training_log_rows) + 1,
-                "Level": level,
-                "Update": message,
-            }
-        )
-        training_log_placeholder.dataframe(
-            pd.DataFrame(training_log_rows),
-            use_container_width=True,
-            hide_index=True,
-        )
+        return None
 
     def _render_training_tracker(current_key=None):
-        if not stack_rows:
-            return
-        rows = []
-        for key, meta in stack_rows.items():
-            total = stack_totals.get(key, 0)
-            done = stack_done.get(key, 0)
-            state = stack_status.get(key, "pending")
-            if key == current_key and done < total:
-                state = "running"
-            rows.append(
-                {
-                    "Model ID": meta.get("Model ID"),
-                    "Model": meta.get("Model"),
-                    "Done": int(done),
-                    "Total": int(total),
-                    "Remaining": int(max(total - done, 0)),
-                    "Status": state,
-                }
-            )
-        with tracker_placeholder:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        return None
 
     def _finish_job(key, state: str, idx: int):
         stack_done[key] = min(stack_done.get(key, 0) + 1, stack_totals.get(key, 1))
@@ -1937,18 +2464,13 @@ def _render_training_controls(ctx):
         progress.progress((idx + 1) / max(len(jobs), 1))
         _render_training_tracker()
 
-    # Always render the tracker table before training starts
-    _render_training_tracker()
-
     for idx, (model_row, model_args) in enumerate(jobs):
         n_aug_label = getattr(model_args, "n_aug", model_row.get("N_Aug") if isinstance(model_row, dict) else "?")
         model_label = _model_training_label(model_row, model_args, n_aug_label)
         stack_key = _stack_key(model_row, model_args)
         stack_index = stack_done.get(stack_key, 0) + 1
         stack_total = max(stack_totals.get(stack_key, 1), 1)
-        _render_training_tracker(stack_key)
         head_progress.progress(0)
-        head_tracker.empty()
 
         mismatch, mismatch_message, checkpoint_path = _checkpoint_task_mismatch(model_args)
         if mismatch:
@@ -1981,6 +2503,9 @@ def _render_training_controls(ctx):
                 )
                 status.info(message)
                 _log_training_update(message)
+                cache_entry, _ = _load_n_aug_cache_entry(model_args, int(n_aug_label))
+                _sync_sidebar_context_to_trained_head(model_args, cache_entry)
+                _persist_best_head_metrics_to_registry(ctx, model_row, model_args, cache_entry)
                 summary_rows.append(_cache_summary_row(model_row, model_args, int(n_aug_label), "skipped_existing"))
                 _finish_job(stack_key, "skipped_existing", idx)
                 continue
@@ -1996,38 +2521,7 @@ def _render_training_controls(ctx):
         def _head_progress_callback(info):
             head_index = int(info.get("head_index", 0) or 0)
             total_heads = max(int(info.get("total_heads", 1) or 1), 1)
-            heads_left = max(int(info.get("heads_left", 0) or 0), 0)
-            current_head = str(info.get("head") or "")
-            message = (
-                f"Training {current_head} for {model_label} "
-                f"({head_index}/{total_heads} heads, {heads_left} left; "
-                f"model/n_aug job {idx + 1}/{len(jobs)})"
-            )
-            status.info(message)
-            _log_training_update(message)
             head_progress.progress(min(head_index / total_heads, 1.0))
-            head_tracker.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "Model ID": model_row.get("Model ID") if isinstance(model_row, dict) else getattr(model_args, "model_id", None),
-                            "Model": (
-                                model_row.get("Model Name")
-                                or model_row.get("model_name")
-                                or getattr(model_args, "model_name", None)
-                                if isinstance(model_row, dict)
-                                else getattr(model_args, "model_name", None)
-                            ),
-                            "N Aug": n_aug_label,
-                            "Current Head": current_head,
-                            "Head": head_index,
-                            "Total Heads": total_heads,
-                            "Heads Left": heads_left,
-                        }
-                    ]
-                ),
-                use_container_width=True,
-            )
 
 
         try:
@@ -2036,12 +2530,15 @@ def _render_training_controls(ctx):
                 k_values=k_values,
                 prototype_strategies=prototype_strategies,
                 prototype_components=proto_components,
+                baseline_names=selected_baselines,
                 include_knn=include_knn,
                 include_prototypes=include_prototypes,
                 include_baselines=include_baselines,
                 overwrite_current_n_aug=overwrite,
                 progress_callback=_head_progress_callback,
             )
+            _sync_sidebar_context_to_trained_head(model_args, result)
+            _persist_best_head_metrics_to_registry(ctx, model_row, model_args, result)
             summary_rows.append(_result_summary_row(model_row, result, cache_path))
             _log_training_update(
                 f"Finished classifier heads for {model_label}: "
@@ -2083,12 +2580,15 @@ def _render_training_controls(ctx):
                         k_values=k_values,
                         prototype_strategies=prototype_strategies,
                         prototype_components=proto_components,
+                        baseline_names=selected_baselines,
                         include_knn=include_knn,
                         include_prototypes=include_prototypes,
                         include_baselines=include_baselines,
                         overwrite_current_n_aug=True,
                         progress_callback=_head_progress_callback,
                     )
+                    _sync_sidebar_context_to_trained_head(model_args, result)
+                    _persist_best_head_metrics_to_registry(ctx, model_row, model_args, result)
                     summary_rows.append(_result_summary_row(model_row, result, cache_path))
                     _log_training_update(
                         f"Finished recalculated classifier heads for {model_label}: "
@@ -2152,6 +2652,7 @@ def _render_training_controls(ctx):
         _finish_job(stack_key, job_state, idx)
 
     _clear_existing_heads_cache()
+    _refresh_leaderboard_state_after_head_training(ctx)
 
     trained_head_rows = []
     trained_head_errors = []
@@ -2259,8 +2760,9 @@ def render(ctx):
 
     active_task = st.session_state.get("production_task") or getattr(ctx.args, "task", None)
     load_top_n = 99999 if show_all_models else int(top_n)
-    cache_key = f"learned_existing_heads_df_v7_{active_task}_top_{load_top_n}"
-    error_key = f"learned_existing_errors_v7_{active_task}_top_{load_top_n}"
+    split_cache_segment = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(st.session_state.get("sidebar_split_combo_key") or "all"))
+    cache_key = f"learned_existing_heads_df_v8_{active_task}_{split_cache_segment}_top_{load_top_n}"
+    error_key = f"learned_existing_errors_v8_{active_task}_{split_cache_segment}_top_{load_top_n}"
 
     if reload_clicked:
         _clear_existing_heads_cache()

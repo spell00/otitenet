@@ -86,35 +86,99 @@ def _arrow_safe_dataframe(df):
     return out
 
 def _best_head_config_for_args_global(args):
-    """Return the best classification head config for given args.
-    Stub returns None (no specific config).
-    """
-    return None
+    """Return the best cached classification head config for given args."""
+    entry = _best_head_entry_for_args_global(args)
+    config = entry.get("config") if isinstance(entry, dict) else None
+    if config is not None:
+        return str(config)
+
+    try:
+        from otitenet.app.utils import resolve_best_classifier_config
+
+        return str(resolve_best_classifier_config(args, use_optimized=True))
+    except Exception:
+        return str(getattr(args, "n_neighbors", 1))
 
 def _best_head_entry_for_args_global(args):
-    """Return a dict representing the best head entry.
-    Stub returns an empty dict.
-    """
+    """Return the highest-scoring cached classification head entry."""
+    try:
+        heads = _classification_head_options_for_args_global(args)
+        if heads:
+            return heads[0]
+    except Exception:
+        pass
+    try:
+        from otitenet.app.utils import resolve_best_classifier_config
+
+        try:
+            config = str(resolve_best_classifier_config(args, use_optimized=True))
+        except Exception:
+            config = str(getattr(args, "n_neighbors", 1))
+        score = (
+            getattr(args, "valid_mcc", None)
+            if getattr(args, "valid_mcc", None) is not None
+            else getattr(args, "mcc", None)
+        )
+        return {
+            "config": config,
+            "label": _head_config_label_global(config),
+            "mcc": score,
+            "valid_mcc": score,
+            "details": "fallback from selected model",
+        }
+    except Exception:
+        pass
     return {}
 
 def _classification_head_options_for_args_global(args):
-    """Return a list of possible head options for the args.
-    Stub returns an empty list – the UI will handle the empty case.
-    """
-    return []
+    """Return cached classification-head options for the args."""
+    try:
+        from otitenet.app.utils import enumerate_classification_heads
+
+        return list(enumerate_classification_heads(args) or [])
+    except Exception:
+        return []
 
 def _head_config_label_global(config):
-    """Generate a human‑readable label for a head config.
-    Stub simply returns the string representation.
-    """
-    return str(config) if config is not None else ""
+    """Generate a human-readable label for a head config."""
+    if config is None:
+        return ""
+    try:
+        from otitenet.app.utils import format_classifier_config
+
+        return format_classifier_config(str(config))
+    except Exception:
+        return str(config)
 
 def _set_classifier_head_on_args_global(args, config):
-    """Mutate args to set the classifier head config.
-    Stub stores the config on a new attribute if possible.
-    """
+    """Mutate args to set the classifier head config."""
     try:
+        config = str(config)
         setattr(args, "classifier_head_config", config)
+        setattr(args, "best_classifier_config", config)
+        setattr(args, "classification_head_config", config)
+        setattr(args, "learned_classifier_label", _head_config_label_global(config))
+
+        from otitenet.app.utils import parse_classifier_config
+
+        head_meta = parse_classifier_config(config)
+        setattr(args, "classification_head_family", head_meta.get("family"))
+        if head_meta.get("family") == "knn" and head_meta.get("k") is not None:
+            setattr(args, "n_neighbors", int(head_meta["k"]))
+            setattr(args, "siamese_inference", "knn")
+        elif head_meta.get("family") == "prototype":
+            setattr(args, "prototypes_to_use", "class")
+            if head_meta.get("strategy") is not None:
+                setattr(args, "prototype_strategy", str(head_meta["strategy"]))
+            if head_meta.get("components") is not None:
+                setattr(args, "prototype_components", int(head_meta["components"]))
+        elif head_meta.get("family") == "baseline":
+            name = str(head_meta.get("name", ""))
+            if name in {"linear_svc", "linearsvc"}:
+                setattr(args, "siamese_inference", "linearsvc")
+            elif name in {"logreg", "logistic_regression"}:
+                setattr(args, "siamese_inference", "logisticregression")
+            else:
+                setattr(args, "siamese_inference", name)
     except Exception:
-        # args may be a simple namespace; ignore failures.
         pass

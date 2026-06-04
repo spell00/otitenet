@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import streamlit as st
 from datetime import datetime
+from sklearn.preprocessing import LabelEncoder
 
 from otitenet.train.train_triplet_new import TrainAE
 from otitenet.data.data_getters import PerImageNormalize, get_images_loaders
@@ -161,6 +162,13 @@ def _quiet_streamlit_messages(enabled: bool = False):
             setattr(st, "spinner", original_spinner)
 
 
+def _fit_batch_encoder(unique_batches):
+    """Fit a batch encoder once so loaders and training-loop bookkeeping agree."""
+    encoder = LabelEncoder()
+    encoder.fit(np.asarray(unique_batches))
+    return encoder
+
+
 def get_or_build_embedding_classifier(_args, data, unique_labels, unique_batches, prototypes):
     """Return a cached embedding classifier for the selected model/head."""
     use_prototypes = (_args.prototypes_to_use in ['combined', 'class'])
@@ -177,20 +185,72 @@ def get_or_build_embedding_classifier(_args, data, unique_labels, unique_batches
         print(f"♻️  Using cached {cache[key].get('classifier_kind', 'embedding')} classifier")
         return cache[key]['classifier'], cache[key]['unique_labels']
 
+    def _candidate_train_encoding_paths():
+        candidates = []
+        for attr in ["train_encodings_path", "Train Encodings Path"]:
+            value = getattr(_args, attr, None)
+            if value:
+                candidates.append(str(value))
+
+        for attr in ["log_path", "best_model_dir", "Artifact Log Path", "Best Model Dir"]:
+            value = getattr(_args, attr, None)
+            if not value:
+                continue
+            path = str(value)
+            if os.path.isfile(path):
+                path = os.path.dirname(path)
+            candidates.append(os.path.join(path, "train_encodings.npz"))
+
+        model_params = get_model_params_path(_args)
+        candidates.append(
+            os.path.join(
+                f'logs/best_models/{_args.task}/{_args.model_name}',
+                model_params,
+                'train_encodings.npz',
+            )
+        )
+
+        if bool(getattr(_args, "split_config_in_path", False) or getattr(_args, "_split_config_in_path", False)):
+            try:
+                old_split = getattr(_args, "split_config_in_path", False)
+                old_private = getattr(_args, "_split_config_in_path", False)
+                _args.split_config_in_path = False
+                _args._split_config_in_path = False
+                legacy_params = get_model_params_path(_args)
+                candidates.append(
+                    os.path.join(
+                        f'logs/best_models/{_args.task}/{_args.model_name}',
+                        legacy_params,
+                        'train_encodings.npz',
+                    )
+                )
+            finally:
+                _args.split_config_in_path = old_split
+                _args._split_config_in_path = old_private
+
+        out = []
+        for path in candidates:
+            if not path:
+                continue
+            normalized = os.path.normpath(path)
+            if normalized not in out:
+                out.append(normalized)
+        return out
+
     # ---- Fast path: load saved train_encodings.npz if available ----
     train_encs = None
     train_cats = None
     use_pretrained = getattr(_args, 'use_pretrained_encodings', True)
     use_trained_encoder = getattr(_args, 'use_trained_encoder', use_pretrained)
+    allow_reencode = bool(getattr(_args, "allow_inference_reencode", True))
     
     if use_pretrained:
-        model_params = get_model_params_path(_args)
-        model_dir = f'logs/best_models/{_args.task}/{_args.model_name}/{model_params}'
-        npz_path = os.path.join(model_dir, 'train_encodings.npz')
-        
-        print(f"[Encodings] use_pretrained={use_pretrained}, checking path: {npz_path}")
-        
-        if os.path.exists(npz_path):
+        checked_paths = _candidate_train_encoding_paths()
+        print(f"[Encodings] use_pretrained={use_pretrained}, checking paths: {checked_paths}")
+
+        for npz_path in checked_paths:
+            if not os.path.exists(npz_path):
+                continue
             try:
                 print(f"[Encodings] Loading saved encodings from {npz_path}")
                 with st.spinner("⚡ Loading saved encodings…"):
@@ -199,18 +259,25 @@ def get_or_build_embedding_classifier(_args, data, unique_labels, unique_batches
                     train_cats = npz['cats']
                     st.success(f"✅ Loaded {len(train_encs)} saved encodings ({train_encs.nbytes / 1024 / 1024:.1f} MB)")
                     print(f"[Encodings] Successfully loaded {len(train_encs)} encodings")
+                break
             except Exception as e:
                 print(f"[Encodings] Error loading {npz_path}: {e}")
                 st.warning(f"⚠️ Could not load saved encodings ({npz_path}), falling back to re-encoding: {e}")
                 train_encs = None
-        else:
-            print(f"[Encodings] File not found: {npz_path}")
-            st.info(f"ℹ️ No saved encodings found ({npz_path}). Re-encoding from model instead.")
+        if train_encs is None:
+            print(f"[Encodings] No saved encodings found in checked paths: {checked_paths}")
+            st.info(f"ℹ️ No saved encodings found. Checked {len(checked_paths)} path(s).")
     else:
         print(f"[Encodings] use_pretrained_encodings is False, re-encoding from model")
         st.info("ℹ️ Using model re-encoding (not loading saved encodings)")
 
     if train_encs is None:
+        if not allow_reencode:
+            raise RuntimeError(
+                "Saved train encodings are required for bulk inference, but none were found. "
+                "Rebuild/sync the best-model artifacts so train_encodings.npz is present; "
+                "the app will not re-encode the training split during bulk inference."
+            )
         if use_trained_encoder:
             st.info("ℹ️ Encoding with trained model weights from the selected checkpoint")
         # ---- Slow path: encode training data with model ----
@@ -226,6 +293,7 @@ def get_or_build_embedding_classifier(_args, data, unique_labels, unique_batches
         train.n_cats = len(unique_labels)
         train.unique_batches = unique_batches
         train.unique_labels = unique_labels
+        train._batch_encoder = _fit_batch_encoder(unique_batches)
         train.epoch = 1
         train.params = {
             'n_neighbors': _args.n_neighbors,
@@ -252,7 +320,7 @@ def get_or_build_embedding_classifier(_args, data, unique_labels, unique_batches
             prototypes=prototypes,
             size=_args.new_size,
             normalize=_args.normalize,
-            batch_encoder=getattr(train, '_batch_encoder', None)
+            batch_encoder=train._batch_encoder
         )
 
         # Encode training data with model
@@ -343,7 +411,18 @@ def _safe_generate_gradcam_for_prediction(filename, _args, model, image, prototy
         return None
 
 
-def run_analysis_on_file(filename, file_bytes, _args, cursor, conn, force_reanalyze=False, show_validation_metrics=True, fast_infer=False, quiet=False):
+def run_analysis_on_file(
+    filename,
+    file_bytes,
+    _args,
+    cursor,
+    conn,
+    force_reanalyze=False,
+    show_validation_metrics=True,
+    fast_infer=False,
+    quiet=False,
+    generate_gradcam=True,
+):
     """Run complete analysis on a file and return results.
 
     Set quiet=True for bulk/background inference so per-image Streamlit
@@ -359,10 +438,21 @@ def run_analysis_on_file(filename, file_bytes, _args, cursor, conn, force_reanal
             force_reanalyze=force_reanalyze,
             show_validation_metrics=show_validation_metrics,
             fast_infer=fast_infer,
+            generate_gradcam=generate_gradcam,
         )
 
 
-def _run_analysis_on_file_impl(filename, file_bytes, _args, cursor, conn, force_reanalyze=False, show_validation_metrics=True, fast_infer=False):
+def _run_analysis_on_file_impl(
+    filename,
+    file_bytes,
+    _args,
+    cursor,
+    conn,
+    force_reanalyze=False,
+    show_validation_metrics=True,
+    fast_infer=False,
+    generate_gradcam=True,
+):
     """Run complete analysis on a file and return results."""
     # Make sure model numbering is available even if user didn't open Tab 1/2 first
     model_number_map, best_models_table = _ensure_model_number_map(cursor)
@@ -396,6 +486,7 @@ def _run_analysis_on_file_impl(filename, file_bytes, _args, cursor, conn, force_
         try:
             model, shap_model, prototypes, image_size, device_str, data, unique_labels, unique_batches, data_getter = \
                 load_model_and_prototypes(_args)
+            batch_encoder = _fit_batch_encoder(unique_batches)
         except FileNotFoundError as exc:
             selected_log_path = getattr(_args, "log_path", None)
             st.error(
@@ -435,19 +526,6 @@ def _run_analysis_on_file_impl(filename, file_bytes, _args, cursor, conn, force_
         if not hasattr(_args, "epoch"):
             _args.epoch = 0
         if not fast_infer:
-            loaders = get_images_loaders(data=data,
-                                         random_recs=_args.random_recs,
-                                         weighted_sampler=0,
-                                         is_transform=0,
-                                         samples_weights=None,
-                                         epoch=1,
-                                         unique_labels=unique_labels,
-                                         triplet_dloss=_args.dloss, bs=_args.bs,
-                                         prototypes_to_use=_args.prototypes_to_use,
-                                         prototypes=prototypes,
-                                         size=_args.new_size,
-                                         normalize=_args.normalize,
-                                         batch_encoder=getattr(shap_model, '_batch_encoder', None) if 'shap_model' in locals() else None)
             # Build or reuse cached embedding classifier once per model selection.
             embedding_classifier, unique_labels_knn = get_or_build_embedding_classifier(_args, data, unique_labels, unique_batches, prototypes)
             nets = {'cnn': shap_model, 'embedding_classifier': embedding_classifier}
@@ -669,16 +747,17 @@ def _run_analysis_on_file_impl(filename, file_bytes, _args, cursor, conn, force_
                 pass
         st.session_state['last_model_number'] = model_number
 
-        # New behavior: Grad-CAM is generated at the same time as prediction.
-        # This is intentionally best-effort so inference still succeeds if Grad-CAM fails.
-        _safe_generate_gradcam_for_prediction(
-            filename,
-            _args,
-            model,
-            image,
-            prototypes,
-            device_str,
-            complete_log_path,
-        )
+        gradcam_path = None
+        if generate_gradcam:
+            # This is intentionally best-effort so inference still succeeds if Grad-CAM fails.
+            gradcam_path = _safe_generate_gradcam_for_prediction(
+                filename,
+                _args,
+                model,
+                image,
+                prototypes,
+                device_str,
+                complete_log_path,
+            )
     
-    return pred_label, pred_confidence, complete_log_path, None, None, pred_probas
+    return pred_label, pred_confidence, complete_log_path, None, gradcam_path, pred_probas

@@ -1,5 +1,5 @@
 import os
-from comet_ml import Experiment
+import logging
 TRACKING_API_TOKEN = os.getenv("TRACKING_API_TOKEN")
 TRACKING_PROJECT_NAME = "ADLab/otitenet"
 TRACKING_MODEL_NAME = "OT"
@@ -79,7 +79,20 @@ def create_tracking_run(args, params, complete_log_path, foldername):
     # External tracking backend removed.
     return None
 
+def prepare_comet_lazy_import():
+    """Configure Comet for explicit logging before importing it lazily."""
+    os.environ.setdefault("COMET_LOGGING_CONSOLE", "ERROR")
+    logging.getLogger("comet_ml").setLevel(logging.ERROR)
+
+
 def make_comet_logger(args, params, complete_log_path, foldername):
+    prepare_comet_lazy_import()
+    try:
+        from comet_ml import Experiment
+    except ModuleNotFoundError:
+        print("[Comet] comet_ml is not installed: skipping Comet logging.")
+        return None
+
     experiment = Experiment(
         api_key=os.environ.get("COMET_API_KEY"),  # or hardcode
         project_name="otitenet",
@@ -2049,5 +2062,3 @@ def log_pca(lists, path, logger=None, mlops=True):
     if mlops == 'mlflow':
         plt.savefig(f'{path}/pca.png')
         mlflow.log_figure(fig, f'{path}/pca.png')
-
-

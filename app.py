@@ -66,6 +66,44 @@ st.title("Ear Health Classifier with SHAP 👂")
 selected_person_id = render_person_sidebar(conn, cursor)
 render_current_optimization_sidebar(is_admin)
 
+with st.sidebar.expander("Production decision settings", expanded=False):
+    st.session_state["production_use_topn_ensemble"] = st.checkbox(
+        "Use Top-N ensemble for analysis",
+        value=bool(st.session_state.get("production_use_topn_ensemble", False)),
+        key="production_use_topn_ensemble_widget",
+        help="When enabled, New Analysis runs the selected Top-N ranked models and applies the ensemble decision thresholds.",
+    )
+    st.session_state["production_top_n_models"] = st.number_input(
+        "Top-N models",
+        min_value=1,
+        max_value=25,
+        value=int(st.session_state.get("production_top_n_models", 5)),
+        step=1,
+        key="production_top_n_models_widget",
+    )
+    st.session_state["production_selected_confidence_threshold"] = st.slider(
+        "Selected model confidence threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=float(st.session_state.get("production_selected_confidence_threshold", 0.50)),
+        step=0.01,
+        key="production_selected_confidence_threshold_widget",
+    )
+    st.session_state["production_ensemble_vote_threshold_pct"] = st.slider(
+        "Top-N ensemble vote threshold (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=float(st.session_state.get("production_ensemble_vote_threshold_pct", 80.0)),
+        step=1.0,
+        key="production_ensemble_vote_threshold_pct_widget",
+    )
+    st.session_state["production_require_both_thresholds"] = st.checkbox(
+        "Require both thresholds",
+        value=bool(st.session_state.get("production_require_both_thresholds", False)),
+        key="production_require_both_thresholds_widget",
+        help="Off: a confident selected-model result is kept even if ensemble consensus is low. On: both thresholds must pass.",
+    )
+
 data_dir = "./data"
 
 args = build_args_from_sidebar(

@@ -182,18 +182,14 @@ class Dataset1(Dataset):
                 not_batch_label = None
                 while not_batch_label == batch or not_batch_label is None:
                     not_batch_label = self.unique_batches[np.random.randint(0, len(self.unique_batches))].copy()
-                # pos_ind = np.random.randint(0, self.n_batches[batch])
-                # neg_ind = np.random.randint(0, self.n_batches[not_batch_label])
-                # Check for missing batch prototypes and raise a clear error if not found
-                missing = []
-                if batch not in self.batch_prototypes:
-                    missing.append(batch)
-                if not_batch_label not in self.batch_prototypes:
-                    missing.append(not_batch_label)
-                if missing:
-                    raise ValueError(f"Missing batch prototype(s) for: {missing}. Available keys: {list(self.batch_prototypes.keys())}")
-                pos_batch_sample = self.batch_prototypes[batch].copy()
-                neg_batch_sample = self.batch_prototypes[not_batch_label].copy()
+                if batch in self.batch_prototypes and not_batch_label in self.batch_prototypes:
+                    pos_batch_sample = self.batch_prototypes[batch].copy()
+                    neg_batch_sample = self.batch_prototypes[not_batch_label].copy()
+                else:
+                    pos_ind = np.random.randint(0, self.n_batches[batch])
+                    neg_ind = np.random.randint(0, self.n_batches[not_batch_label])
+                    pos_batch_sample = self.samples[self.batches_inds[batch][pos_ind]].copy()
+                    neg_batch_sample = self.samples[self.batches_inds[not_batch_label][neg_ind]].copy()
             else:
                 not_batch_label = None
                 while not_batch_label == batch or not_batch_label is None:

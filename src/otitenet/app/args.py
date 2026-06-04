@@ -29,16 +29,28 @@ from otitenet.app.utils import (
     ensure_int,
     normalize_train_datasets,
     split_config_key,
+    split_combo_key_from_row,
+    split_combo_key_to_values,
     split_config_segment,
 )
 
 from otitenet.app.database import set_production_model
+from otitenet.app.artifact_registry import (
+    available_dataset_paths_from_registry,
+    load_best_models_registry,
+    preferred_model_artifact_dir,
+)
 from otitenet.app.utils_dataset_names import get_short_dataset_name, get_short_dataset_names
 from otitenet.data.labels import label_scheme_for_task
+from otitenet.data.dataset_paths import infer_output_subdir_from_split_datasets
 
 
 def _available_dataset_paths(data_dir: str) -> list[str]:
     """Return dataset folders under data_dir, including nested folders with infos.csv."""
+    registry_paths = available_dataset_paths_from_registry(data_dir)
+    if registry_paths:
+        return registry_paths
+
     out = []
     if not os.path.isdir(data_dir):
         return out
@@ -61,11 +73,128 @@ def _infer_new_size_from_dataset_path(dataset_path: str, default: int = 224) -> 
         return default
 
 
+def _canonical_dataset_path(dataset_path: str) -> str:
+    text = str(dataset_path or "").strip().replace("\\", "/")
+    if text.endswith("_inference"):
+        return text[: -len("_inference")]
+    return text
+
+
+def _best_model_registry_paths(task: str = "", model_name: str = "") -> list[str]:
+    """Return dataset paths used by best-model artifacts from the CSV registry."""
+    try:
+        df = load_best_models_registry()
+    except Exception:
+        return []
+    if df.empty or "dataset_path" not in df.columns:
+        return []
+    if task and "task" in df.columns:
+        df = df[df["task"].astype(str) == str(task)]
+    if model_name and "model_name" in df.columns:
+        df = df[df["model_name"].astype(str) == str(model_name)]
+    values = [_canonical_dataset_path(str(v).strip().replace("\\", "/")) for v in df["dataset_path"].tolist()]
+    return sorted(dict.fromkeys([v for v in values if v]))
+
+
+def _best_model_registry_tasks() -> list[str]:
+    """Return tasks present in the best-model CSV registry."""
+    try:
+        df = load_best_models_registry()
+    except Exception:
+        return []
+    if df.empty or "task" not in df.columns:
+        return []
+    values = [str(v).strip() for v in df["task"].tolist()]
+    return sorted(dict.fromkeys([v for v in values if v]))
+
+
+def _dataset_path_for_split_combo(combo_key: str, available_paths: list[str]) -> str:
+    train_datasets, valid_dataset, test_dataset = split_combo_key_to_values(str(combo_key or "").replace(";", ","))
+    subdir = infer_output_subdir_from_split_datasets(train_datasets, valid_dataset, test_dataset)
+    if not subdir:
+        return ""
+
+    available = [_canonical_dataset_path(p) for p in available_paths]
+    exact_matches = [p for p in available if os.path.basename(p) == subdir]
+    if exact_matches:
+        non_inference = [p for p in exact_matches if not p.endswith("_inference")]
+        return sorted(non_inference or exact_matches)[0]
+
+    inference_matches = [
+        p for p in available
+        if os.path.basename(p).removesuffix("_inference") == subdir
+    ]
+    if inference_matches:
+        non_inference = [p for p in inference_matches if not p.endswith("_inference")]
+        return sorted(non_inference or inference_matches)[0]
+
+    return ""
+
+
+def _split_combos_for_task_model(cursor, task: str, model_name: str) -> list[str]:
+    combos: list[str] = []
+    try:
+        cursor.execute(
+            """
+            SELECT DISTINCT train_datasets, valid_dataset, test_dataset, split_config_key
+            FROM best_models_registry
+            WHERE model_name = %s
+              AND (%s = '' OR task = %s)
+            """,
+            (model_name, str(task or ""), str(task or "")),
+        )
+        for train_datasets, valid_dataset, test_dataset, combo_key in cursor.fetchall() or []:
+            key = str(combo_key or "").strip().replace(";", ",")
+            if not key:
+                key = split_config_key(train_datasets, valid_dataset, test_dataset)
+            if key.replace("|", "").strip():
+                combos.append(key)
+    except Exception:
+        pass
+
+    try:
+        models_path = os.path.join("logs", "best_models", str(task or ""), "models.csv")
+        if os.path.exists(models_path):
+            df = pd.read_csv(models_path, dtype=str).fillna("")
+            model_col = "model" if "model" in df.columns else "model_name" if "model_name" in df.columns else None
+            if model_col:
+                df = df[df[model_col].astype(str) == str(model_name)]
+            for _, row in df.iterrows():
+                key = str(row.get("split_config_key", "") or "").strip().replace(";", ",")
+                if not key:
+                    key = split_config_key(row.get("train_datasets"), row.get("valid_dataset"), row.get("test_dataset"))
+                if key.replace("|", "").strip():
+                    combos.append(key)
+    except Exception:
+        pass
+
+    return _unique_preserve_order(combos)
+
+
+def _prefer_source_artifact_paths(df: pd.DataFrame) -> pd.DataFrame:
+    """Use source run artifacts for app loading when available; keep mirror path as fallback metadata."""
+    if df.empty:
+        return df
+    df = df.copy()
+    if "Best Model Dir" not in df.columns:
+        df["Best Model Dir"] = df.get("Log Path", "")
+    if "Source Run Path" not in df.columns:
+        df["Source Run Path"] = ""
+    if "Artifact ID" not in df.columns:
+        df["Artifact ID"] = ""
+    for idx, row in df.iterrows():
+        preferred = preferred_model_artifact_dir(row.to_dict())
+        if preferred:
+            df.at[idx, "Artifact Log Path"] = preferred
+            df.at[idx, "Log Path"] = preferred
+    return df
+
+
 def _validate_and_resolve_dataset(params_dict: dict, data_dir: str = './data') -> dict:
     """Validate the Dataset key inside the params_dict, replacing with a valid folder if needed."""
     task = params_dict.get("Task") or params_dict.get("task") or "otite"
     model_name = params_dict.get("Model Name") or params_dict.get("model_name") or "default"
-    dataset = params_dict.get("Dataset")
+    dataset = _canonical_dataset_path(params_dict.get("Dataset"))
     
     # Strip any data/ prefix
     if isinstance(dataset, str) and (dataset.startswith("data/") or dataset.startswith("./data/")):
@@ -73,6 +202,10 @@ def _validate_and_resolve_dataset(params_dict: dict, data_dir: str = './data') -
         
     if dataset == "otite_ds_-1":
         dataset = None
+
+    if dataset and os.path.isfile(os.path.join(data_dir, dataset, "infos.csv")):
+        params_dict["Dataset"] = _canonical_dataset_path(dataset)
+        return params_dict
         
     model_log_dir = os.path.join('logs/best_models', task, model_name)
     if os.path.isdir(model_log_dir):
@@ -96,14 +229,20 @@ def _validate_and_resolve_dataset(params_dict: dict, data_dir: str = './data') -
         else:
             dataset = 'otite_ds_64'
             
-    params_dict["Dataset"] = dataset
+    params_dict["Dataset"] = _canonical_dataset_path(dataset)
     return params_dict
 
 
 def _args_namespace_from_model_row(model_row: dict) -> argparse.Namespace:
     """Build an args-like namespace from a Quick Model Selection / registry row."""
     row = dict(model_row)
-    row.update(extract_params_from_log_path(row.get("Log Path") or row.get("log_path")))
+    parse_path = (
+        row.get("Best Model Dir")
+        or row.get("best_model_dir")
+        or row.get("Log Path")
+        or row.get("log_path")
+    )
+    row.update(extract_params_from_log_path(parse_path))
     row = _validate_and_resolve_dataset(row)
     dataset = row.get("Dataset") or row.get("path") or "otite_ds_64"
     if isinstance(dataset, str) and not dataset.startswith("data/"):
@@ -135,6 +274,7 @@ def _args_namespace_from_model_row(model_row: dict) -> argparse.Namespace:
         test_dataset=str(row.get("test_dataset") or row.get("Test Dataset") or ""),
         split_config_in_path=bool(row.get("_split_config_in_path") or row.get("Split Segment") or row.get("split_config_key")),
         _split_config_in_path=bool(row.get("_split_config_in_path") or row.get("Split Segment") or row.get("split_config_key")),
+        log_path=str(row.get("Artifact Log Path") or row.get("Log Path") or row.get("log_path") or ""),
     )
 
 
@@ -194,21 +334,11 @@ def _split_combo_key_from_values(train_datasets, valid_dataset, test_dataset) ->
 
 
 def _split_combo_key_from_row(row) -> str:
-    if row is None:
-        return ""
-    getter = row.get if hasattr(row, "get") else lambda _key, _default=None: _default
-    key = getter("split_config_key")
-    if key and str(key).strip() not in {"", "None", "nan"}:
-        return str(key).strip().replace(";", ",")
-    return _split_combo_key_from_values(
-        getter("train_datasets") or getter("Train Datasets") or "",
-        getter("valid_dataset") or getter("Valid Dataset") or "",
-        getter("test_dataset") or getter("Test Dataset") or "",
-    )
+    return split_combo_key_from_row(row)
 
 
 def _split_combo_label(combo_key: str) -> str:
-    train_datasets, valid_dataset, test_dataset = (str(combo_key or "").split("|") + ["", "", ""])[:3]
+    train_datasets, valid_dataset, test_dataset = split_combo_key_to_values(combo_key)
     train_label = get_short_dataset_names(train_datasets) or "unknown train"
     valid_label = get_short_dataset_name(valid_dataset) or "unknown valid"
     test_label = get_short_dataset_name(test_dataset) or "unknown test"
@@ -314,6 +444,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
             prototype_components=1,
             best_classifier_config='1',
             learned_classifier_label='KNN k=1',
+            log_path='',
         )
     
     active_task = st.session_state.get("production_task")
@@ -352,9 +483,10 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
 
         # Only create the task selectbox ONCE at the top of the sidebar
         task_root = 'logs/best_models'
-        task_list = sorted(os.listdir(task_root)) if os.path.isdir(task_root) else []
+        registry_tasks = _best_model_registry_tasks()
+        task_list = registry_tasks or (sorted(os.listdir(task_root)) if os.path.isdir(task_root) else [])
         if not task_list:
-            st.error("No tasks found under logs/best_models.")
+            st.error("No tasks found in the best-model registry or logs/best_models.")
             st.stop()
         task_default = selected_params.get("Task") or active_task
         sync_value('task_selectbox', task_default)
@@ -384,7 +516,20 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
             st.rerun()
 
         model_dir = os.path.join(task_root, task)
-        model_name_list = [name for name in sorted(os.listdir(model_dir)) if not name.endswith('.csv')] if os.path.isdir(model_dir) else []
+        registry_models = []
+        try:
+            registry_df = load_best_models_registry()
+            if not registry_df.empty and {"task", "model_name"}.issubset(registry_df.columns):
+                registry_models = sorted(
+                    registry_df.loc[registry_df["task"].astype(str) == str(task), "model_name"]
+                    .astype(str)
+                    .dropna()
+                    .unique()
+                    .tolist()
+                )
+        except Exception:
+            registry_models = []
+        model_name_list = registry_models or ([name for name in sorted(os.listdir(model_dir)) if not name.endswith('.csv')] if os.path.isdir(model_dir) else [])
         if not model_name_list:
             st.error(f"No models found for task {task}.")
             st.stop()
@@ -397,8 +542,21 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
 
         # Determine available dataset folders for this model
         model_dataset_base = os.path.join(model_dir, model_name)
-        available_datasets = [d for d in os.listdir(model_dataset_base)
-                             if os.path.isdir(os.path.join(model_dataset_base, d)) and d.startswith('otite_ds_')]
+        physical_datasets = [d for d in _available_dataset_paths(data_dir) if d != 'otite_ds_-1']
+        available_datasets = _best_model_registry_paths(task, model_name)
+        available_datasets = [_canonical_dataset_path(d) for d in available_datasets]
+        split_combo_options_for_path = _split_combos_for_task_model(cursor, task, model_name)
+        combo_datasets = [
+            _dataset_path_for_split_combo(combo_key, physical_datasets)
+            for combo_key in split_combo_options_for_path
+        ]
+        combo_datasets = [d for d in combo_datasets if d]
+        available_datasets = _unique_preserve_order(available_datasets + combo_datasets)
+        if not available_datasets:
+            available_datasets = [d for d in os.listdir(model_dataset_base)
+                                 if os.path.isdir(os.path.join(model_dataset_base, d)) and d.startswith('otite_ds_')]
+        if not available_datasets:
+            available_datasets = physical_datasets
         # Default dataset from metadata or fallback
         default_ds = selected_params.get('Dataset')
         if default_ds not in available_datasets:
@@ -406,6 +564,27 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         selected_path = choose_dataset("Select --path dataset", available_datasets,
                                       default=default_ds, key="dataset_selectbox")
         dataset_segment = selected_path if selected_path else 'otite_ds_64'
+        previous_dataset_segment = st.session_state.get("sidebar_dataset_last_key")
+        if previous_dataset_segment is not None and previous_dataset_segment != dataset_segment:
+            selected_params = {}
+            should_sync = False
+            for key in [
+                "selected_model_params",
+                "selected_params_version",
+                "selected_params_last_sync",
+                "selected_model_log_path",
+                "selected_model_selection_key",
+                "selected_model_version",
+                "sidebar_best_model_key",
+                "sidebar_best_model_last_sync",
+                "sidebar_classification_head_config",
+                "sidebar_classification_head_model_key",
+                "sidebar_classification_head_n_aug",
+                "optimized_k_value",
+                "k_opt_current_selection",
+            ]:
+                st.session_state.pop(key, None)
+        st.session_state["sidebar_dataset_last_key"] = dataset_segment
 
         # ---- Model Selection from Leaderboard ---- #
         st.subheader("📋 Quick Model Selection")
@@ -415,33 +594,60 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
             # Try to use model_rank if available
             try:
                 update_model_ranks()
-                cursor.execute(
-                    """
-                    SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss,
-                           n_calibration, accuracy, mcc, normalize, n_neighbors, log_path, model_rank,
-                           prototype_strategy, prototype_components,
-                           train_datasets, valid_dataset, test_dataset, split_config_key
-                    FROM best_models_registry
-                    WHERE model_rank IS NOT NULL
-                    ORDER BY model_rank ASC
-                    """
-                )
-                model_rows = cursor.fetchall()
-                use_db_rank = True
-            except Exception:
-                # Fallback if model_rank column doesn't exist yet
                 try:
                     cursor.execute(
                         """
                         SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss,
-                               n_calibration, accuracy, mcc, normalize, n_neighbors, log_path,
+                               n_calibration, accuracy, mcc, normalize, n_neighbors, log_path, model_rank,
                                prototype_strategy, prototype_components,
-                               train_datasets, valid_dataset, test_dataset, split_config_key
+                               train_datasets, valid_dataset, test_dataset, split_config_key,
+                               artifact_id, best_model_dir, source_run_log_path
                         FROM best_models_registry
-                        ORDER BY mcc DESC
+                        ORDER BY (model_rank IS NULL) ASC, model_rank ASC, mcc DESC
                         """
                     )
                     model_rows = cursor.fetchall()
+                except Exception:
+                    cursor.execute(
+                        """
+                        SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss,
+                               n_calibration, accuracy, mcc, normalize, n_neighbors, log_path, model_rank,
+                               prototype_strategy, prototype_components,
+                               train_datasets, valid_dataset, test_dataset, split_config_key
+                        FROM best_models_registry
+                        ORDER BY (model_rank IS NULL) ASC, model_rank ASC, mcc DESC
+                        """
+                    )
+                    model_rows = [tuple(list(row) + [None, None, None]) for row in (cursor.fetchall() or [])]
+                use_db_rank = True
+            except Exception:
+                # Fallback if model_rank column doesn't exist yet
+                try:
+                    try:
+                        cursor.execute(
+                            """
+                            SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss,
+                                   n_calibration, accuracy, mcc, normalize, n_neighbors, log_path,
+                                   prototype_strategy, prototype_components,
+                                   train_datasets, valid_dataset, test_dataset, split_config_key,
+                                   artifact_id, best_model_dir, source_run_log_path
+                            FROM best_models_registry
+                            ORDER BY mcc DESC
+                            """
+                        )
+                        model_rows = cursor.fetchall()
+                    except Exception:
+                        cursor.execute(
+                            """
+                            SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, classif_loss,
+                                   n_calibration, accuracy, mcc, normalize, n_neighbors, log_path,
+                                   prototype_strategy, prototype_components,
+                                   train_datasets, valid_dataset, test_dataset, split_config_key
+                            FROM best_models_registry
+                            ORDER BY mcc DESC
+                            """
+                        )
+                        model_rows = [tuple(list(row) + [None, None, None]) for row in (cursor.fetchall() or [])]
                 except Exception:
                     cursor.execute(
                         """
@@ -452,7 +658,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                         ORDER BY mcc DESC
                         """
                     )
-                    model_rows = [tuple(list(row) + [None, None, None, None]) for row in (cursor.fetchall() or [])]
+                    model_rows = [tuple(list(row) + [None, None, None, None, None, None, None]) for row in (cursor.fetchall() or [])]
                 use_db_rank = False
 
             if model_rows:
@@ -461,35 +667,72 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                     _cols = [
                         "Model ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg", "DLoss", "Dist_Fct",
                         "Classif_Loss", "N_Calibration", "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path", 
-                        "#", "Proto_Strat", "Proto_Comp", "train_datasets", "valid_dataset", "test_dataset", "split_config_key"
+                        "#", "Proto_Strat", "Proto_Comp", "train_datasets", "valid_dataset", "test_dataset", "split_config_key",
+                        "Artifact ID", "Best Model Dir", "Source Run Path",
                     ]
                 else:
                     _cols = [
                         "Model ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg", "DLoss", "Dist_Fct",
                         "Classif_Loss", "N_Calibration", "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path",
-                        "Proto_Strat", "Proto_Comp", "train_datasets", "valid_dataset", "test_dataset", "split_config_key"
+                        "Proto_Strat", "Proto_Comp", "train_datasets", "valid_dataset", "test_dataset", "split_config_key",
+                        "Artifact ID", "Best Model Dir", "Source Run Path",
                     ]
                 _df = pd.DataFrame(model_rows, columns=_cols)
+                _df["Artifact Dataset"] = _df.apply(
+                    lambda row: _canonical_dataset_path(
+                        extract_params_from_log_path(
+                            row.get("Best Model Dir")
+                            or row.get("Log Path")
+                            or row.get("Source Run Path")
+                            or ""
+                        ).get("Dataset", "")
+                    ),
+                    axis=1,
+                )
+                _df["Dataset"] = _df["Artifact Dataset"]
                 for idx, row in _df.iterrows():
                     split_config = get_model_split_config(row.get("Log Path"))
                     for col in ["train_datasets", "valid_dataset", "test_dataset", "split_config_key"]:
                         if col in _df.columns and (pd.isna(row.get(col)) or str(row.get(col)).strip() in {"", "None", "nan"}):
                             _df.at[idx, col] = split_config.get(col)
+                    combo_key = _split_combo_key_from_row(_df.loc[idx])
+                    inferred_dataset = _dataset_path_for_split_combo(combo_key, physical_datasets)
+                    _df.at[idx, "Combo Dataset"] = inferred_dataset
+                    if inferred_dataset:
+                        _df.at[idx, "Dataset"] = inferred_dataset
                 _df = attach_task_column(_df)
-                _df = filter_models_df_by_task(_df, active_task)
-                _df = _df[_df.apply(is_done_manifest_model_row, axis=1)].copy()
+                _df = _prefer_source_artifact_paths(_df)
+                _df = filter_models_df_by_task(_df, task)
+                if dataset_segment:
+                    selected_dataset_key = _canonical_dataset_path(dataset_segment)
+                    _df = _df[_df["Dataset"].astype(str).map(_canonical_dataset_path) == selected_dataset_key]
+                    if _df.empty:
+                        st.info(
+                            "No best models found for the selected dataset path. "
+                            "Choose a dataset path that matches the trained best-model artifacts."
+                        )
+                _task_filtered_df = _df.copy()
+                _manifest_filtered_df = _df[_df.apply(is_done_manifest_model_row, axis=1)].copy()
+                if not _manifest_filtered_df.empty and len(_manifest_filtered_df) < len(_task_filtered_df):
+                    st.caption(
+                        "Some registry models are not present in the current done manifest; "
+                        "showing all registry models so dataset-specific synced metrics remain available."
+                    )
+                _df = _task_filtered_df
                 
                 if not _df.empty:
-                    # Instead of using only registry splits, list all subfolders under otite_ds_64
-                    dataset_base = os.path.join(model_dir, model_name, dataset_segment)
-                    if os.path.isdir(dataset_base):
-                        all_split_folders = [d for d in os.listdir(dataset_base) if os.path.isdir(os.path.join(dataset_base, d))]
-                    else:
-                        all_split_folders = []
-                    split_options = all_split_folders
-                    split_labels = {d: d for d in all_split_folders}
+                    _df["_split_combo_key"] = _df.apply(_split_combo_key_from_row, axis=1)
+                    split_options = _unique_preserve_order(
+                        [str(v) for v in _df["_split_combo_key"].tolist() if str(v).strip()]
+                    )
+                    split_labels = {key: _split_combo_label(key) for key in split_options}
+                    st.session_state["sidebar_split_combo_options"] = split_options
+                    st.session_state["sidebar_split_combo_labels"] = split_labels
                     selected_split_key = None
                     if split_options:
+                        pending_split_key = st.session_state.pop("pending_sidebar_split_combo_key", None)
+                        if pending_split_key in split_options:
+                            st.session_state["sidebar_split_combo_key"] = pending_split_key
                         current_split_key = st.session_state.get("sidebar_split_combo_key")
                         default_split_key = current_split_key if current_split_key in split_options else split_options[0]
                         if st.session_state.get("sidebar_split_combo_key") not in split_options:
@@ -500,7 +743,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                             options=split_options,
                             format_func=lambda key: split_labels.get(key, key),
                             key="sidebar_split_combo_key",
-                            help="All available split subfolders under otite_ds_64.",
+                            help="Available train/valid/test combinations from the registry.",
                         )
 
                         previous_split_key = st.session_state.get("sidebar_split_combo_last_key")
@@ -523,14 +766,13 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                                 st.session_state.pop(key, None)
                         st.session_state["sidebar_split_combo_last_key"] = selected_split_key
 
-                        _df["_split_combo_key"] = _df.apply(_split_combo_key_from_row, axis=1)
                         _df = _df[_df["_split_combo_key"] == selected_split_key].drop(columns=["_split_combo_key"])
                         if _df.empty:
                             st.info("No models found for the selected train/valid/test dataset combination.")
                     else:
                         st.warning(
-                            "No train_datasets metadata found for these registry rows yet. "
-                            "New training runs will record it; older runs need run_metadata.json/run_summary.json with split_config."
+                            "No train/valid/test metadata found for these registry rows yet. "
+                            "Rebuild the registries after training or backfill split metadata in best_models_registry."
                         )
 
                 if not _df.empty:
@@ -594,7 +836,11 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                 if not selected_params and len(_df) > 0:
                     try:
                         best_row = _df.iloc[0].to_dict()
-                        best_row.update(extract_params_from_log_path(best_row.get("Log Path")))
+                        parse_path = best_row.get("Best Model Dir") or best_row.get("Log Path")
+                        compatible_dataset = best_row.get("Dataset")
+                        best_row.update(extract_params_from_log_path(parse_path))
+                        if compatible_dataset:
+                            best_row["Dataset"] = compatible_dataset
                         best_row = _validate_and_resolve_dataset(best_row, data_dir)
                         best_row["Task"] = best_row.get("Task") or active_task
                         if "N_Neighbors" in best_row:
@@ -654,6 +900,8 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                     rd = key_to_row.get(selected_key)
                     if rd:
                         model_dict = {
+                            '#': rd.get('#'),
+                            'model_number': rd.get('#'),
                             'Model ID': rd.get('Model ID'),
                             'model_id': rd.get('Model ID'),
                             'Model Name': rd.get('Model Name'),
@@ -676,9 +924,20 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                             'valid_dataset': rd.get('valid_dataset'),
                             'test_dataset': rd.get('test_dataset'),
                             'split_config_key': rd.get('split_config_key'),
+                            'Dataset': rd.get('Dataset'),
+                            'Artifact Dataset': rd.get('Artifact Dataset'),
+                            'Combo Dataset': rd.get('Combo Dataset'),
                             'Log Path': rd.get('Log Path'),
+                            'Artifact Log Path': rd.get('Artifact Log Path'),
+                            'Best Model Dir': rd.get('Best Model Dir'),
+                            'Source Run Path': rd.get('Source Run Path'),
+                            'Artifact ID': rd.get('Artifact ID'),
                         }
-                        model_dict.update(extract_params_from_log_path(model_dict.get("Log Path")))
+                        parse_path = model_dict.get("Best Model Dir") or model_dict.get("Log Path")
+                        compatible_dataset = model_dict.get("Dataset")
+                        model_dict.update(extract_params_from_log_path(parse_path))
+                        if compatible_dataset:
+                            model_dict["Dataset"] = compatible_dataset
                         model_dict = _validate_and_resolve_dataset(model_dict, data_dir)
                         model_dict["Task"] = model_dict.get("Task") or active_task
                         if "N_Neighbors" in model_dict:
@@ -709,7 +968,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                             pass
                         try:
                             if model_dict.get('Task'):
-                                st.session_state['task_selectbox'] = model_dict['Task']
+                                st.session_state['production_task'] = model_dict['Task']
                         except Exception:
                             pass
                         try:
@@ -784,7 +1043,14 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                                 'valid_dataset': rd.get('valid_dataset'),
                                 'test_dataset': rd.get('test_dataset'),
                                 'split_config_key': rd.get('split_config_key'),
+                                'Dataset': rd.get('Dataset'),
+                                'Artifact Dataset': rd.get('Artifact Dataset'),
+                                'Combo Dataset': rd.get('Combo Dataset'),
                                 'Log Path': rd.get('Log Path'),
+                                'Artifact Log Path': rd.get('Artifact Log Path'),
+                                'Best Model Dir': rd.get('Best Model Dir'),
+                                'Source Run Path': rd.get('Source Run Path'),
+                                'Artifact ID': rd.get('Artifact ID'),
                                 'model_number': st.session_state.model_number_map.get(selected_key, '?'),
                             }
                             selected_head_model_key = st.session_state.get('sidebar_classification_head_model_key')
@@ -851,15 +1117,20 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         # nsize selectbox is rendered after dataset + split selection (see below)
 
         # ---- Build model_dataset_dir: task/model/dataset/[split]/nsize{N} ---- #
-        # Always use the selected split subfolder (from sidebar_split_combo_key) after dataset_segment
+        # Only hashed split_* values are physical folders. Plain split_config_key values
+        # are metadata filters and must not be appended to artifact paths.
         sidebar_split_key = st.session_state.get("sidebar_split_combo_key")
-        if sidebar_split_key:
-            model_dataset_dir = os.path.join(model_dir, model_name, dataset_segment, sidebar_split_key)
-            split_segment = sidebar_split_key
+        physical_split_key = sidebar_split_key if str(sidebar_split_key or "").startswith("split_") else None
+        if physical_split_key:
+            model_dataset_dir = os.path.join(model_dir, model_name, dataset_segment, physical_split_key)
+            split_segment = physical_split_key
         else:
             # Fallback: use first available split subfolder if present
             dataset_base = os.path.join(model_dir, model_name, dataset_segment)
-            split_folders = [d for d in os.listdir(dataset_base) if os.path.isdir(os.path.join(dataset_base, d))]
+            split_folders = [
+                d for d in os.listdir(dataset_base)
+                if d.startswith("split_") and os.path.isdir(os.path.join(dataset_base, d))
+            ] if os.path.isdir(dataset_base) else []
             if split_folders:
                 model_dataset_dir = os.path.join(dataset_base, split_folders[0])
                 split_segment = split_folders[0]
@@ -893,9 +1164,12 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
             _safe_selectbox_sync('nsize_selectbox', available_sizes, nsize_default)
             new_size = st.selectbox("new_size (nsize)", available_sizes, key="nsize_selectbox")
         else:
-            # No nsize dirs found – fall back to inferring from dataset name
-            new_size = _infer_new_size_from_dataset_path(selected_path)
-            st.caption(f"No nsize directories found; inferred new_size={new_size}")
+            nsize_default = selected_params.get('new_size') or selected_params.get('NSize')
+            try:
+                new_size = int(nsize_default) if nsize_default is not None else _infer_new_size_from_dataset_path(selected_path)
+            except (TypeError, ValueError):
+                new_size = _infer_new_size_from_dataset_path(selected_path)
+            st.caption(f"No nsize mirror folders found; using registry new_size={new_size}")
 
         # Navigate into nsize dir
         nsize_subdir = os.path.join(model_dataset_dir, f"nsize{new_size}")
@@ -911,8 +1185,8 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         if possible_fgsm:
             fgsm_list = possible_fgsm
         else:
-            st.warning(f"No FGSM entries found for model {model_name} in {model_dataset_dir}.")
-            st.stop()
+            fgsm_list = [str(selected_params.get("FGSM") or selected_params.get("fgsm") or "0")]
+            st.caption("No FGSM mirror folders found; using registry value.")
 
         fgsm_default = selected_params.get("FGSM")
         sync_value('fgsm_selectbox', fgsm_default)
@@ -922,8 +1196,8 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         n_cal_dir = os.path.join(model_dataset_dir, fgsm)
         n_calibration_list = sorted(os.listdir(n_cal_dir)) if os.path.isdir(n_cal_dir) else []
         if not n_calibration_list:
-            st.error(f"No calibration folders found in {n_cal_dir}.")
-            st.stop()
+            n_calibration_list = [str(selected_params.get("N_Calibration") or selected_params.get("n_calibration") or "0")]
+            st.caption("No calibration mirror folders found; using registry value.")
         n_calibration_default = selected_params.get("N_Calibration")
         sync_value('n_calibration_selectbox', n_calibration_default)
         _safe_selectbox_sync('n_calibration_selectbox', n_calibration_list, n_calibration_default)
@@ -932,8 +1206,8 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         classif_dir = os.path.join(n_cal_dir, n_calibration)
         classif_loss_list = sorted(os.listdir(classif_dir)) if os.path.isdir(classif_dir) else []
         if not classif_loss_list:
-            st.error(f"No classif_loss folders found in {classif_dir}.")
-            st.stop()
+            classif_loss_list = [str(selected_params.get("classif_loss") or selected_params.get("Classif_Loss") or "triplet")]
+            st.caption("No classif_loss mirror folders found; using registry value.")
         classif_loss_default = selected_params.get("classif_loss") or selected_params.get("Classif_Loss")
         sync_value('classif_loss_selectbox', classif_loss_default)
         _safe_selectbox_sync('classif_loss_selectbox', classif_loss_list, classif_loss_default)
@@ -942,8 +1216,8 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         dloss_dir = os.path.join(classif_dir, classif_loss)
         dloss_list = sorted(os.listdir(dloss_dir)) if os.path.isdir(dloss_dir) else []
         if not dloss_list:
-            st.error(f"No dloss folders found in {dloss_dir}.")
-            st.stop()
+            dloss_list = [str(selected_params.get("DLoss") or selected_params.get("dloss") or "triplet")]
+            st.caption("No dloss mirror folders found; using registry value.")
         dloss_default = selected_params.get("DLoss")
         sync_value('dloss_selectbox', dloss_default)
         _safe_selectbox_sync('dloss_selectbox', dloss_list, dloss_default)
@@ -952,8 +1226,8 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         proto_dir = os.path.join(dloss_dir, dloss)
         prototypes_list = sorted(os.listdir(proto_dir)) if os.path.isdir(proto_dir) else []
         if not prototypes_list:
-            st.error(f"No prototype folders found in {proto_dir}.")
-            st.stop()
+            prototypes_list = [str(selected_params.get("Prototypes") or selected_params.get("prototypes_to_use") or "class")]
+            st.caption("No prototype mirror folders found; using registry value.")
 
         prototypes_default = selected_params.get("Prototypes")
 
@@ -981,8 +1255,8 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         npos_dir = os.path.join(proto_dir, prototypes_to_use)
         n_positives_list = sorted(os.listdir(npos_dir)) if os.path.isdir(npos_dir) else []
         if not n_positives_list:
-            st.error(f"No npos folders found in {npos_dir}.")
-            st.stop()
+            n_positives_list = [str(selected_params.get("NPos") or selected_params.get("n_positives") or "1")]
+            st.caption("No npos mirror folders found; using registry value.")
         npos_default = str(selected_params.get("NPos")) if selected_params.get("NPos") is not None else None
         sync_value('npos_selectbox', npos_default)
         _safe_selectbox_sync('npos_selectbox', n_positives_list, npos_default)
@@ -991,8 +1265,8 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         nneg_dir = os.path.join(npos_dir, n_positives)
         n_negatives_list = sorted(os.listdir(nneg_dir)) if os.path.isdir(nneg_dir) else []
         if not n_negatives_list:
-            st.error(f"No nneg folders found in {nneg_dir}.")
-            st.stop()
+            n_negatives_list = [str(selected_params.get("NNeg") or selected_params.get("n_negatives") or "1")]
+            st.caption("No nneg mirror folders found; using registry value.")
         nneg_default = str(selected_params.get("NNeg")) if selected_params.get("NNeg") is not None else None
         sync_value('nneg_selectbox', nneg_default)
         _safe_selectbox_sync('nneg_selectbox', n_negatives_list, nneg_default)
@@ -1074,7 +1348,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
     # Build the correct path including the split subfolder if present
     sidebar_split_key = st.session_state.get("sidebar_split_combo_key")
     if selected_path:
-        if sidebar_split_key:
+        if str(sidebar_split_key or "").startswith("split_"):
             path_with_split = os.path.join(data_dir, selected_path, sidebar_split_key)
         else:
             path_with_split = os.path.join(data_dir, selected_path)
@@ -1119,7 +1393,8 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
     args._split_config_in_path = args.split_config_in_path
     args.model_id = selected_params.get('model_id') or selected_params.get('Model ID')
     args.log_path = (
-        selected_params.get('Log Path')
+        selected_params.get('Artifact Log Path')
+        or selected_params.get('Log Path')
         or selected_params.get('log_path')
         or st.session_state.get('selected_model_log_path')
         or ''

@@ -10,12 +10,14 @@ import streamlit as st
 import torch
 from matplotlib import pyplot as plt
 from sklearn.decomposition import PCA
+from sklearn.metrics import auc as sk_auc, roc_curve
 
 from otitenet.app.display_metrics import (
     _arrow_safe_dataframe,
     _head_config_label_global,
 )
 from otitenet.app.model_loading import load_model_and_prototypes
+from otitenet.app.artifact_registry import preferred_model_artifact_dir, scan_best_models_registry
 from otitenet.app.utils import (
     _make_model_selection_key,
     _unique_preserve_order,
@@ -28,6 +30,7 @@ from otitenet.app.utils import (
     get_model_split_config,
     get_split_mcc_metrics,
     resolve_best_classifier_config,
+    split_combo_key_from_row,
 )
 from otitenet.app.utils_dataset_names import get_short_dataset_name, get_short_dataset_names
 from otitenet.data.data_getters import get_images_loaders
@@ -80,7 +83,13 @@ def _apply_model_row_to_args(args, row_dict: Dict[str, Any]):
     local_args = _clone_args(args)
     row = dict(row_dict or {})
 
-    parsed = extract_params_from_log_path(row.get("Log Path") or row.get("log_path") or "")
+    parsed = extract_params_from_log_path(
+        row.get("Best Model Dir")
+        or row.get("best_model_dir")
+        or row.get("Log Path")
+        or row.get("log_path")
+        or ""
+    )
     row.update({k: v for k, v in parsed.items() if v is not None})
 
     mapping = {
@@ -144,6 +153,10 @@ def top_models_head_label(row_dict, args):
         row = dict(row_dict or {})
 
         head_config = row.get("Head Config")
+        if head_config is not None and str(head_config).strip() not in {"", "nan", "None"}:
+            stored_head = row.get("Head")
+            if stored_head is not None and str(stored_head).strip() not in {"", "nan", "None", "—"}:
+                return str(stored_head)
         if head_config is None or str(head_config).strip() in {"", "nan", "None"}:
             head_config = resolve_best_classifier_config(local_args, use_optimized=True)
 
@@ -242,9 +255,15 @@ def _query_best_models(cursor) -> Tuple[List[tuple], bool]:
             """
             SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg,
                    dloss, dist_fct, classif_loss, n_calibration,
-                   accuracy, mcc, normalize, n_neighbors, log_path, model_rank,
+                   accuracy, mcc,
+                   train_mcc, valid_mcc, test_mcc, all_mcc,
+                   valid_accuracy, train_auc, valid_auc, test_auc, all_auc,
+                   ece, brier,
+                   best_head_config, best_head_name, best_head_family, best_head_n_aug,
+                   normalize, n_neighbors, log_path, model_rank,
                    prototype_strategy, prototype_components,
-                   train_datasets, valid_dataset, test_dataset, split_config_key
+                   train_datasets, valid_dataset, test_dataset, split_config_key,
+                   artifact_id, best_model_dir, source_run_log_path
             FROM best_models_registry
             ORDER BY (model_rank IS NULL) ASC, model_rank ASC, mcc DESC
             """
@@ -252,18 +271,34 @@ def _query_best_models(cursor) -> Tuple[List[tuple], bool]:
         return cursor.fetchall() or [], True
     except Exception:
         try:
-            cursor.execute(
-                """
-                SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg,
-                       dloss, dist_fct, classif_loss, n_calibration,
-                       accuracy, mcc, normalize, n_neighbors, log_path,
-                       prototype_strategy, prototype_components,
-                       train_datasets, valid_dataset, test_dataset, split_config_key
-                FROM best_models_registry
-                ORDER BY mcc DESC
-                """
-            )
-            return cursor.fetchall() or [], False
+            try:
+                cursor.execute(
+                    """
+                    SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg,
+                           dloss, dist_fct, classif_loss, n_calibration,
+                           accuracy, mcc, normalize, n_neighbors, log_path,
+                           prototype_strategy, prototype_components,
+                           train_datasets, valid_dataset, test_dataset, split_config_key,
+                           artifact_id, best_model_dir, source_run_log_path
+                    FROM best_models_registry
+                    ORDER BY mcc DESC
+                    """
+                )
+                return cursor.fetchall() or [], False
+            except Exception:
+                cursor.execute(
+                    """
+                    SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg,
+                           dloss, dist_fct, classif_loss, n_calibration,
+                           accuracy, mcc, normalize, n_neighbors, log_path,
+                           prototype_strategy, prototype_components,
+                           train_datasets, valid_dataset, test_dataset, split_config_key
+                    FROM best_models_registry
+                    ORDER BY mcc DESC
+                    """
+                )
+                rows = cursor.fetchall() or []
+                return [tuple(list(row) + [None, None, None]) for row in rows], False
         except Exception:
             cursor.execute(
                 """
@@ -276,7 +311,7 @@ def _query_best_models(cursor) -> Tuple[List[tuple], bool]:
                 """
             )
             rows = cursor.fetchall() or []
-            return [tuple(list(row) + [None, None, None, None]) for row in rows], False
+            return [tuple(list(row) + [None, None, None, None, None, None, None]) for row in rows], False
 
 
 def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.DataFrame:
@@ -284,9 +319,15 @@ def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.Data
         columns = [
             "Model ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos",
             "NNeg", "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration",
-            "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path", "#",
+            "Accuracy", "MCC",
+            "Train MCC", "Valid MCC", "Test MCC", "All MCC",
+            "Valid Accuracy", "Train AUC", "Valid AUC", "Test AUC", "All AUC",
+            "ECE", "Brier",
+            "Head Config", "Head", "Head Family", "Head N Aug",
+            "Normalize", "N_Neighbors", "Log Path", "#",
             "Proto_Strat", "Proto_Comp",
             "train_datasets", "valid_dataset", "test_dataset", "split_config_key",
+            "Artifact ID", "Best Model Dir", "Source Run Path",
         ]
     else:
         columns = [
@@ -295,6 +336,7 @@ def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.Data
             "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path",
             "Proto_Strat", "Proto_Comp",
             "train_datasets", "valid_dataset", "test_dataset", "split_config_key",
+            "Artifact ID", "Best Model Dir", "Source Run Path",
         ]
 
     if not rows:
@@ -304,6 +346,20 @@ def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.Data
 
     if df.empty:
         return df
+
+    # Preserve task information from the original registry path before Log Path is
+    # swapped to a source-run artifact path that no longer encodes best_models/<task>/.
+    df = attach_task_column(df)
+
+    if "Best Model Dir" not in df.columns:
+        df["Best Model Dir"] = df.get("Log Path", "")
+    if "Source Run Path" not in df.columns:
+        df["Source Run Path"] = ""
+    for idx, row in df.iterrows():
+        preferred = preferred_model_artifact_dir(row.to_dict())
+        if preferred:
+            df.at[idx, "Artifact Log Path"] = preferred
+            df.at[idx, "Log Path"] = preferred
 
     if "MCC" in df.columns:
         df["_mcc_numeric"] = pd.to_numeric(df["MCC"], errors="coerce").fillna(float("-inf"))
@@ -320,6 +376,91 @@ def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.Data
                 df.at[idx, col] = split_config.get(col)
 
     return df.reset_index(drop=True)
+
+
+def _models_dataframe_from_log_tree() -> pd.DataFrame:
+    """Scan logs/best_models so freshly mirrored artifacts can appear before DB sync."""
+    try:
+        artifacts = scan_best_models_registry("logs/best_models")
+    except Exception:
+        return pd.DataFrame()
+
+    if artifacts is None or artifacts.empty:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(
+        {
+            "Model ID": "",
+            "Model Name": artifacts.get("model_name", ""),
+            "NSize": artifacts.get("nsize", ""),
+            "FGSM": artifacts.get("fgsm", ""),
+            "Prototypes": artifacts.get("prototypes", ""),
+            "NPos": artifacts.get("npos", ""),
+            "NNeg": artifacts.get("nneg", ""),
+            "DLoss": artifacts.get("dloss", ""),
+            "Dist_Fct": artifacts.get("dist_fct", ""),
+            "Classif_Loss": artifacts.get("classif_loss", ""),
+            "N_Calibration": artifacts.get("n_calibration", ""),
+            "Accuracy": np.nan,
+            "MCC": np.nan,
+            "Normalize": artifacts.get("normalize", ""),
+            "N_Neighbors": artifacts.get("n_neighbors", ""),
+            "Log Path": artifacts.get("model_dir", ""),
+            "Proto_Strat": artifacts.get("prototype_strategy", ""),
+            "Proto_Comp": artifacts.get("prototype_components", ""),
+            "train_datasets": "",
+            "valid_dataset": "",
+            "test_dataset": "",
+            "split_config_key": "",
+            "Artifact ID": artifacts.get("artifact_id", ""),
+            "Best Model Dir": artifacts.get("model_dir", ""),
+            "Source Run Path": artifacts.get("run_log_path", ""),
+            "train_encodings_path": artifacts.get("train_encodings_path", ""),
+            "valid_encodings_path": artifacts.get("valid_encodings_path", ""),
+            "test_encodings_path": artifacts.get("test_encodings_path", ""),
+            "Source": "logs/best_models",
+            "Task": artifacts.get("task", ""),
+        }
+    )
+
+    for idx, row in df.iterrows():
+        split_config = get_model_split_config(row.get("Log Path"))
+        for col in ["train_datasets", "valid_dataset", "test_dataset", "split_config_key"]:
+            value = row.get(col)
+            if pd.isna(value) or str(value).strip() in {"", "None", "nan"}:
+                df.at[idx, col] = split_config.get(col, "")
+
+    return df
+
+
+def _merge_db_and_log_tree_models(db_df: pd.DataFrame) -> pd.DataFrame:
+    tree_df = _models_dataframe_from_log_tree()
+    if tree_df.empty:
+        return db_df
+    if db_df is None or db_df.empty:
+        return tree_df
+
+    db_df = db_df.copy()
+    if "Source" not in db_df.columns:
+        db_df["Source"] = "database"
+
+    known_paths = set()
+    for col in ["Log Path", "Best Model Dir", "Source Run Path"]:
+        if col in db_df.columns:
+            known_paths.update(
+                str(v).strip()
+                for v in db_df[col].dropna().astype(str)
+                if str(v).strip()
+            )
+
+    tree_df = tree_df[
+        ~tree_df["Log Path"].astype(str).str.strip().isin(known_paths)
+        & ~tree_df["Best Model Dir"].astype(str).str.strip().isin(known_paths)
+    ]
+    if tree_df.empty:
+        return db_df
+
+    return pd.concat([db_df, tree_df], ignore_index=True, sort=False)
 
 
 def _attach_metrics(df: pd.DataFrame) -> pd.DataFrame:
@@ -344,25 +485,61 @@ def _attach_metrics(df: pd.DataFrame) -> pd.DataFrame:
 
     for idx, row in df.iterrows():
         log_path = row.get("Log Path")
-        # Try to get classifier head metrics from optimization cache
+        best_model_dir = row.get("Best Model Dir") or row.get("best_model_dir") or log_path
         head_metrics = None
+        registry_head_metrics = None
+        registry_head_config = row.get("Head Config") or row.get("best_head_config")
+        registry_valid_mcc = pd.to_numeric(pd.Series([row.get("Valid MCC")]), errors="coerce").iloc[0]
+        if registry_head_config is not None and str(registry_head_config).strip() not in {"", "nan", "None"} and pd.notna(registry_valid_mcc):
+            registry_head_metrics = {
+                "Config": registry_head_config,
+                "Head": row.get("Head") or row.get("best_head_name") or format_classifier_config(registry_head_config),
+                "N Aug": row.get("Head N Aug") or row.get("best_head_n_aug"),
+                "Train MCC": row.get("Train MCC"),
+                "Valid MCC": registry_valid_mcc,
+                "Test MCC": row.get("Test MCC"),
+                "All MCC": row.get("All MCC"),
+                "Valid Accuracy": row.get("Valid Accuracy"),
+                "Train AUC": row.get("Train AUC"),
+                "Valid AUC": row.get("Valid AUC"),
+                "Test AUC": row.get("Test AUC"),
+                "All AUC": row.get("All AUC"),
+                "ECE": row.get("ECE"),
+                "Brier": row.get("Brier"),
+            }
         if _get_heads_for_model_args and args_from_model_row:
             try:
-                model_args = args_from_model_row(argparse.Namespace(), row.to_dict())
-                head_rows, _ = _get_heads_for_model_args(model_args, row.to_dict())
-                # Pick the best head (highest Valid MCC)
+                row_for_head_lookup = row.to_dict()
+                row_for_head_lookup["Log Path"] = best_model_dir
+                model_args = args_from_model_row(argparse.Namespace(), row_for_head_lookup)
+                head_rows, _ = _get_heads_for_model_args(model_args, row_for_head_lookup)
+                # The optimization cache is the source of truth after Tab 2 retraining.
+                # Persisted registry values are only a fallback because they can lag.
                 if head_rows:
                     best_head = max(head_rows, key=lambda r: float(r.get("Valid MCC", float('-inf')) if r.get("Valid MCC") is not None else float('-inf')))
                     head_metrics = best_head
             except Exception:
                 pass
+        if head_metrics is None:
+            head_metrics = registry_head_metrics
         if head_metrics:
+            head_config = head_metrics.get("Config") or head_metrics.get("config")
+            if head_config is not None:
+                df.at[idx, "Head Config"] = str(head_config)
+                df.at[idx, "Head"] = head_metrics.get("Head") or format_classifier_config(head_config)
+            if head_metrics.get("N Aug") is not None:
+                df.at[idx, "Head N Aug"] = head_metrics.get("N Aug")
             df.at[idx, "Train MCC"] = head_metrics.get("Train MCC", np.nan)
             df.at[idx, "Valid MCC"] = head_metrics.get("Valid MCC", np.nan)
             df.at[idx, "Test MCC"] = head_metrics.get("Test MCC", np.nan)
+            df.at[idx, "All MCC"] = head_metrics.get("All MCC", head_metrics.get("all_mcc", np.nan))
+            df.at[idx, "Valid Accuracy"] = head_metrics.get("Valid Accuracy", head_metrics.get("valid_accuracy", np.nan))
             df.at[idx, "Train AUC"] = head_metrics.get("Train AUC", np.nan)
             df.at[idx, "Valid AUC"] = head_metrics.get("Valid AUC", np.nan)
             df.at[idx, "Test AUC"] = head_metrics.get("Test AUC", np.nan)
+            df.at[idx, "All AUC"] = head_metrics.get("All AUC", head_metrics.get("all_auc", np.nan))
+            df.at[idx, "ECE"] = head_metrics.get("ECE", head_metrics.get("ece", np.nan))
+            df.at[idx, "Brier"] = head_metrics.get("Brier", head_metrics.get("brier", np.nan))
             # Add any extra metrics (F1, Recall, etc.)
             for metric_name, metric_value in head_metrics.items():
                 if " F1 " in metric_name or " Recall " in metric_name or " Precision " in metric_name or " Support " in metric_name:
@@ -386,7 +563,11 @@ def _attach_metrics(df: pd.DataFrame) -> pd.DataFrame:
                         df.at[idx, metric_name] = metric_value
 
         calibration_metrics = get_calibration_metrics(log_path)
-        if calibration_metrics and not calibration_metrics.get("error"):
+        has_head_calibration = False
+        for cal_col in ["ECE", "Brier"]:
+            if cal_col in df.columns and pd.notna(pd.to_numeric(pd.Series([df.at[idx, cal_col]]), errors="coerce").iloc[0]):
+                has_head_calibration = True
+        if calibration_metrics and not calibration_metrics.get("error") and not has_head_calibration:
             df.at[idx, "ECE"] = calibration_metrics.get("ece", np.nan)
             df.at[idx, "Brier"] = calibration_metrics.get("brier", np.nan)
 
@@ -446,14 +627,37 @@ def _order_model_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df[ordered_cols]
 
 
+def _split_combo_key_from_row(row) -> str:
+    return split_combo_key_from_row(row)
+
+
+def _filter_models_df_by_sidebar_split(models_df: pd.DataFrame) -> pd.DataFrame:
+    if models_df is None or models_df.empty:
+        return models_df
+
+    selected_split_key = st.session_state.get("sidebar_split_combo_key")
+    if not selected_split_key:
+        return models_df
+
+    df = models_df.copy()
+    df["_split_combo_key"] = df.apply(_split_combo_key_from_row, axis=1)
+    filtered_df = df[df["_split_combo_key"] == str(selected_split_key)].drop(columns=["_split_combo_key"])
+    return filtered_df.reset_index(drop=True)
+
+
 def load_best_models_table(cursor, task: Optional[str] = None) -> pd.DataFrame:
     rows, use_db_rank = _query_best_models(cursor)
     df = _models_dataframe_from_rows(rows, use_db_rank)
+    df = _merge_db_and_log_tree_models(df)
     if df.empty:
         return df
 
     df = attach_task_column(df)
     df = filter_models_df_by_task(df, task)
+    if df.empty:
+        return df
+
+    df = _filter_models_df_by_sidebar_split(df)
     if df.empty:
         return df
 
@@ -792,6 +996,170 @@ def _render_top_models_table(models_df: pd.DataFrame, args) -> None:
     st.dataframe(_arrow_safe_dataframe(display_df), use_container_width=True)
 
 
+def _prediction_csv_candidates(row_dict: Dict[str, Any], split: str) -> List[str]:
+    candidates: List[str] = []
+    for key in ["Artifact Log Path", "Best Model Dir", "Log Path", "Source Run Path"]:
+        path = str(row_dict.get(key) or "").strip()
+        if not path:
+            continue
+        if os.path.isfile(path):
+            path = os.path.dirname(path)
+        candidates.append(os.path.join(path, f"{split}_predictions.csv"))
+        parent = path
+        for _ in range(3):
+            parent = os.path.dirname(parent)
+            if not parent or parent == ".":
+                break
+            candidates.append(os.path.join(parent, f"{split}_predictions.csv"))
+    return _unique_preserve_order(candidates)
+
+
+def _load_prediction_csv_for_row(row_dict: Dict[str, Any], split: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    for path in _prediction_csv_candidates(row_dict, split):
+        if not os.path.exists(path):
+            continue
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            continue
+        if not df.empty:
+            return df, path
+    return None, None
+
+
+def _render_prediction_roc_curves(pred_df: pd.DataFrame, title: str) -> bool:
+    if pred_df is None or pred_df.empty or "label" not in pred_df.columns:
+        st.info("No prediction labels available for ROC plotting.")
+        return False
+
+    prob_cols = [c for c in pred_df.columns if str(c).startswith("probs_")]
+    if not prob_cols:
+        st.info("No saved probability columns available for ROC plotting.")
+        return False
+
+    fig, ax = plt.subplots(figsize=(7, 4.2))
+    curves = 0
+    truth = pred_df["label"].astype(str).str.strip()
+    for col in prob_cols:
+        label = str(col)[len("probs_"):]
+        scores = pd.to_numeric(pred_df[col], errors="coerce")
+        valid = scores.notna() & truth.ne("")
+        if valid.sum() < 2:
+            continue
+        y_true = truth[valid].str.lower().eq(str(label).strip().lower()).astype(int).values
+        if len(np.unique(y_true)) < 2:
+            continue
+        try:
+            fpr, tpr, _ = roc_curve(y_true, scores[valid].astype(float).values)
+            auc_value = sk_auc(fpr, tpr)
+        except Exception:
+            continue
+        ax.plot(fpr, tpr, linewidth=1.7, label=f"{label} vs rest (AUC={auc_value:.3f})")
+        curves += 1
+
+    if curves == 0:
+        plt.close(fig)
+        st.info("Not enough positive/negative samples to draw ROC curves.")
+        return False
+
+    ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1.0, color="0.5")
+    ax.set_xlabel("False positive rate")
+    ax.set_ylabel("True positive rate")
+    ax.set_title(title)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+    return True
+
+
+def _render_best_models_auc_curves(models_df: pd.DataFrame, page_key: str) -> None:
+    if models_df is None or models_df.empty:
+        return
+
+    st.subheader("AUC / ROC Curves")
+    options, key_to_row, key_to_label = _make_model_selection_options(models_df)
+    if not options:
+        st.info("No selectable model rows available for ROC curves.")
+        return
+
+    cols = st.columns([3, 1])
+    with cols[0]:
+        selected_key = st.selectbox(
+            "Select model for ROC curves",
+            options=options,
+            format_func=lambda key: key_to_label.get(key, str(key)),
+            key=_k(page_key, "auc_curve_model_key"),
+        )
+    with cols[1]:
+        split = st.selectbox(
+            "Split",
+            options=["valid", "test", "train"],
+            index=0,
+            key=_k(page_key, "auc_curve_split"),
+        )
+
+    row = key_to_row.get(selected_key)
+    row_dict = row.to_dict() if row is not None else {}
+    pred_df, path = _load_prediction_csv_for_row(row_dict, split)
+    if pred_df is None:
+        st.info(f"No `{split}_predictions.csv` artifact found for this model.")
+        return
+    st.caption(f"Using `{path}`")
+    _render_prediction_roc_curves(pred_df, f"Model #{row_dict.get('#', '?')} {split} ROC curves")
+
+
+def _apply_top_models_filters(models_df: pd.DataFrame, page_key: str) -> pd.DataFrame:
+    if models_df is None or models_df.empty:
+        return models_df
+
+    excluded = {"Log Path", "Artifact Log Path", "Best Model Dir", "Source Run Path", "split_config_key"}
+    candidate_columns = [
+        col for col in models_df.columns
+        if col not in excluded and models_df[col].nunique(dropna=True) > 1
+    ]
+    if not candidate_columns:
+        return models_df
+
+    preferred = [
+        "N_Calibration", "NNeg", "NPos", "Classif_Loss", "DLoss", "Prototypes",
+        "Normalize", "N_Neighbors", "Model Name", "Task", "NSize", "FGSM",
+        "Dist_Fct", "Proto_Strat", "Proto_Comp", "train_datasets",
+        "valid_dataset", "test_dataset",
+    ]
+    ordered_columns = [c for c in preferred if c in candidate_columns]
+    ordered_columns += [c for c in candidate_columns if c not in ordered_columns]
+
+    with st.expander("Filter Top Models", expanded=False):
+        filter_columns = st.multiselect(
+            "Restrict by columns",
+            options=ordered_columns,
+            default=[],
+            key=_k(page_key, "top_models_filter_columns"),
+        )
+
+        filtered_df = models_df.copy()
+        for col in filter_columns:
+            values = filtered_df[col].dropna().map(str).sort_values().unique().tolist()
+            if not values:
+                continue
+            selected_values = st.multiselect(
+                f"{col} values",
+                options=values,
+                default=values,
+                key=_k(page_key, f"top_models_filter_values_{col}"),
+            )
+            if selected_values:
+                filtered_df = filtered_df[filtered_df[col].map(str).isin(set(selected_values))]
+            else:
+                filtered_df = filtered_df.iloc[0:0]
+
+        if filter_columns:
+            st.caption(f"Showing {len(filtered_df)} / {len(models_df)} models after filters.")
+
+    return filtered_df.reset_index(drop=True)
+
+
 def _render_calibration_vs_performance(models_df: pd.DataFrame) -> None:
     st.markdown("---")
     st.subheader("📈 Calibration vs Performance")
@@ -979,7 +1347,7 @@ def _render_selected_model_calibration(row_dict: Dict[str, Any]) -> None:
 
 def _set_selected_model(row_dict: Dict[str, Any], selected_key: str) -> None:
     row_dict = dict(row_dict)
-    row_dict.update(extract_params_from_log_path(row_dict.get("Log Path")))
+    row_dict.update(extract_params_from_log_path(row_dict.get("Best Model Dir") or row_dict.get("Log Path")))
 
     row_dict["model_id"] = row_dict.get("Model ID")
 
@@ -1267,11 +1635,30 @@ def _render_model_usage_summary(cursor) -> None:
 
         cursor.execute(
             """
-            SELECT model_name, task, nsize, fgsm, normalize, n_calibration,
-                   classif_loss, dloss, prototypes, npos, nneg, n_neighbors,
-                   num_samples_analyzed, last_used
-            FROM model_usage_summary
-            ORDER BY last_used DESC
+            SELECT (
+                       SELECT bmr.id
+                       FROM best_models_registry bmr
+                       WHERE bmr.model_name = mus.model_name
+                         AND bmr.task = mus.task
+                         AND CAST(bmr.nsize AS CHAR) = CAST(mus.nsize AS CHAR)
+                         AND CAST(bmr.fgsm AS CHAR) = CAST(mus.fgsm AS CHAR)
+                         AND CAST(bmr.normalize AS CHAR) = CAST(mus.normalize AS CHAR)
+                         AND CAST(bmr.n_calibration AS CHAR) = CAST(mus.n_calibration AS CHAR)
+                         AND CAST(bmr.classif_loss AS CHAR) = CAST(mus.classif_loss AS CHAR)
+                         AND CAST(bmr.dloss AS CHAR) = CAST(mus.dloss AS CHAR)
+                         AND CAST(bmr.prototypes AS CHAR) = CAST(mus.prototypes AS CHAR)
+                         AND CAST(bmr.npos AS CHAR) = CAST(mus.npos AS CHAR)
+                         AND CAST(bmr.nneg AS CHAR) = CAST(mus.nneg AS CHAR)
+                         AND CAST(bmr.n_neighbors AS CHAR) = CAST(mus.n_neighbors AS CHAR)
+                       ORDER BY bmr.mcc DESC, bmr.id ASC
+                       LIMIT 1
+                   ) AS model_id,
+                   mus.model_name, mus.task, mus.nsize, mus.fgsm, mus.normalize,
+                   mus.n_calibration, mus.classif_loss, mus.dloss, mus.prototypes,
+                   mus.npos, mus.nneg, mus.n_neighbors, mus.num_samples_analyzed,
+                   mus.last_used
+            FROM model_usage_summary mus
+            ORDER BY mus.last_used DESC
             """
         )
 
@@ -1282,7 +1669,7 @@ def _render_model_usage_summary(cursor) -> None:
             return
 
         usage_columns = [
-            "Model", "Task", "Size", "FGSM", "Normalize", "N_Cal",
+            "Model ID", "Model", "Task", "Size", "FGSM", "Normalize", "N_Cal",
             "Loss", "DLoss", "Prototypes", "NPos", "NNeg",
             "N_Neighbors", "Samples", "Last Used",
         ]
@@ -1311,7 +1698,7 @@ def render(
     include_model_table: bool = True,
     include_calibration: bool = True,
     include_model_selector: bool = True,
-    include_embedding_tools: bool = True,
+    include_embedding_tools: bool = False,
     include_usage_summary: bool = True,
 ):
     """
@@ -1339,14 +1726,21 @@ def render(
             else:
                 _update_model_number_map(models_df)
 
-                if include_model_table:
-                    _render_top_models_table(models_df, args)
+                models_df = _apply_top_models_filters(models_df, page_key)
+                if models_df.empty:
+                    st.info("No models match the selected Top Models filters.")
+                else:
+                    _update_model_number_map(models_df)
 
-                if include_calibration:
-                    _render_calibration_vs_performance(models_df)
+                    if include_model_table:
+                        _render_top_models_table(models_df, args)
+                        _render_best_models_auc_curves(models_df, page_key)
 
-                if include_model_selector:
-                    _render_model_selector(models_df, page_key)
+                    if include_calibration:
+                        _render_calibration_vs_performance(models_df)
+
+                    if include_model_selector:
+                        _render_model_selector(models_df, page_key)
 
         except Exception as e:
             st.error(f"Could not load best models leaderboard: {e}")

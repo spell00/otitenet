@@ -369,17 +369,49 @@ def render_current_optimization_sidebar(is_admin=False):
     st.sidebar.markdown("---")
     st.sidebar.markdown("**Current Optimization:**")
 
+    def _is_present(value):
+        return value is not None and str(value).strip() not in {"", "None", "nan", "?"}
+
+    def _selected_model_status():
+        selected = st.session_state.get("selected_model_params")
+        if not isinstance(selected, dict):
+            return None
+
+        model_name = (
+            selected.get("Model Name")
+            or selected.get("model_name")
+            or selected.get("model")
+        )
+        model_id = (
+            selected.get("Model ID")
+            or selected.get("model_id")
+            or selected.get("id")
+        )
+        model_number = (
+            selected.get("#")
+            or selected.get("model_number")
+        )
+        if not _is_present(model_number):
+            selection_key = st.session_state.get("selected_model_selection_key")
+            model_number = st.session_state.get("model_number_map", {}).get(selection_key)
+
+        if not (model_name or model_id or _is_present(model_number)):
+            return None
+
+        label = f"Selected model: {model_name or 'model'}"
+        if _is_present(model_number):
+            label += f" #{model_number}"
+        if _is_present(model_id):
+            label += f" (ID: {model_id})"
+        return label
+
     current_selection = st.session_state.get("k_opt_current_selection")
 
     if current_selection:
         if is_admin:
-            selected_model_version = st.session_state.get(
-                "selected_model_version",
-                st.session_state.get("current_model_id"),
-            )
-
-            if selected_model_version is not None:
-                st.sidebar.success(f"Model #{selected_model_version}")
+            selected_status = _selected_model_status()
+            if selected_status:
+                st.sidebar.success(selected_status)
             else:
                 st.sidebar.success("Optimization selected")
 
@@ -400,6 +432,11 @@ def render_current_optimization_sidebar(is_admin=False):
                 )
 
     else:
+        selected_status = _selected_model_status()
+        if selected_status:
+            st.sidebar.success(selected_status)
+            return
+
         production_model = st.session_state.get("production_model")
 
         if production_model:
@@ -414,11 +451,17 @@ def render_current_optimization_sidebar(is_admin=False):
                     or production_model.get("Model Name")
                     or production_model.get("model")
                 )
+                model_number = production_model.get("model_number") or production_model.get("#")
 
                 if model_name or model_id:
                     task = production_model.get("label_task", st.session_state.get("production_task", DEFAULT_LABEL_TASK))
+                    label = f"Production model: {model_name or 'model'}"
+                    if _is_present(model_number):
+                        label += f" #{model_number}"
+                    if _is_present(model_id):
+                        label += f" (ID: {model_id})"
                     st.sidebar.info(
-                        f"Production model: {model_name} #{model_id}\n\n"
+                        f"{label}\n\n"
                         f"Task: {task_display_name(task)}"
                     )
                 else:

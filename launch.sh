@@ -21,7 +21,7 @@ bs=32
 num_workers=8
 dataset_name="otite_ds_64"
 valid_dataset="Banque_Viscaino_Chili_2020"
-test_dataset="inference"
+test_dataset="Banque_Viscaino_Chili_2020"
 train_datasets="Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM,GMFUNL_jan2023"
 user_set_num_jobs=0
 user_set_bs=0
@@ -411,7 +411,7 @@ build_siamese_match_key() {
     local n_pos="$7"
     local n_neg="$8"
     local normalize="$9"
-    printf 'siamese|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+    printf 'siamese|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
         "$(sanitize_key_part "$model")" \
         "$(sanitize_key_part "$loss")" \
         "$(sanitize_key_part "$dloss")" \
@@ -421,6 +421,7 @@ build_siamese_match_key() {
         "$(sanitize_key_part "$n_pos")" \
         "$(sanitize_key_part "$n_neg")" \
         "$(sanitize_key_part "$normalize")" \
+        "$(sanitize_key_part "$siamese_inference")" \
         "$(sanitize_key_part "$dataset_name")" \
         "$(sanitize_key_part "$task")"
 }
@@ -1261,6 +1262,7 @@ write_run_settings() {
         printf 'new_size,%s\n' "$(csv_escape "$new_size")"
         printf 'early_stop,%s\n' "$(csv_escape "$early_stop")"
         printf 'n_trials,%s\n' "$(csv_escape "$n_trials")"
+        printf 'siamese_inference,%s\n' "$(csv_escape "$siamese_inference")"
         printf 'log_file,%s\n' "$(csv_escape "$log_file")"
         printf 'auto_select_k,%s\n' "$(csv_escape "$auto_select_k")"
         printf 'run_cnn_mlp,%s\n' "$(csv_escape "$run_cnn_mlp")"
@@ -1778,7 +1780,7 @@ poll_running_jobs() {
 
 generate_jobs() {
     local n_calibration normalize model fgsm dloss loss prototype classif_loss n_negatives exp_id
-    for n_calibration in 0 4; do
+    for n_calibration in 4 0; do
         for normalize in yes no; do
             for model in resnet18 resnet50 vit_b_16 vit_b_16_384 densenet161 vgg16 efficientnet_b0 densenet121; do
                 for fgsm in 0 1; do
@@ -1787,22 +1789,22 @@ generate_jobs() {
                         for loss in arcface triplet; do
                             for prototype in batch no class; do
                                 if ! [[ "$prototype" == "batch" && "$dloss" == "no" ]]; then
-                                    exp_id="${test_tag}_${task}_${dataset_key}_siamese_${model}_${loss}_${dloss}_proto${prototype}_ncal${n_calibration}_norm${normalize}_fgsm${fgsm}"
+                                    exp_id="${test_tag}_${task}_${dataset_key}_siamese_${model}_${loss}_${dloss}_proto${prototype}_ncal${n_calibration}_norm${normalize}_fgsm${fgsm}_infer${siamese_inference}"
                                     register_siamese_job "$model" "$fgsm" "$n_calibration" "$loss" "$dloss" "$prototype" 1 1 "$normalize" "$exp_id"
                                 fi
                             done
                         done
 
                         for classif_loss in ce hinge; do
-                            exp_id="${test_tag}_${task}_${dataset_key}_siamese_${model}_${classif_loss}_${dloss}_proto_no_ncal${n_calibration}_norm${normalize}_fgsm${fgsm}"
+                            exp_id="${test_tag}_${task}_${dataset_key}_siamese_${model}_${classif_loss}_${dloss}_proto_no_ncal${n_calibration}_norm${normalize}_fgsm${fgsm}_infer${siamese_inference}"
                             register_siamese_job "$model" "$fgsm" "$n_calibration" "$classif_loss" "$dloss" "no" 1 1 "$normalize" "$exp_id"
                         done
 
-                        exp_id="${test_tag}_${task}_${dataset_key}_siamese_${model}_softmax_contrastive_${dloss}_proto_no_ncal${n_calibration}_norm${normalize}_fgsm${fgsm}"
+                        exp_id="${test_tag}_${task}_${dataset_key}_siamese_${model}_softmax_contrastive_${dloss}_proto_no_ncal${n_calibration}_norm${normalize}_fgsm${fgsm}_infer${siamese_inference}"
                         register_siamese_job "$model" "$fgsm" "$n_calibration" "softmax_contrastive" "$dloss" "no" 1 1 "$normalize" "$exp_id"
 
                         for n_negatives in 1 5; do
-                            exp_id="${test_tag}_${task}_${dataset_key}_siamese_${model}_triplet_${dloss}_nneg${n_negatives}_proto_no_ncal${n_calibration}_norm${normalize}_fgsm${fgsm}"
+                            exp_id="${test_tag}_${task}_${dataset_key}_siamese_${model}_triplet_${dloss}_nneg${n_negatives}_proto_no_ncal${n_calibration}_norm${normalize}_fgsm${fgsm}_infer${siamese_inference}"
                             register_siamese_job "$model" "$fgsm" "$n_calibration" "triplet" "$dloss" "no" 1 "$n_negatives" "$normalize" "$exp_id"
                         done
 

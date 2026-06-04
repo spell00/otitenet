@@ -48,18 +48,28 @@ class Prototypes:
         # Fallback to mean if strategy is unrecognized
         return np.mean(encodings, axis=0)
 
-    def set_both_prototypes(self, group, list1):
+    def _aligned_arrays(self, group, list1, include_batches=True):
         encodings = np.concatenate(list1[group]['encoded_values'])
         labels = np.concatenate(list1[group]['labels'])
-        batches = np.concatenate(list1[group]['domains'])
-        # Ensure labels and batches have the same length
-        min_len = min(len(labels), len(batches), len(encodings))
-        if len(labels) != len(batches) or len(labels) != len(encodings):
+        batches = np.concatenate(list1[group]['domains']) if include_batches else None
+        lengths = [len(encodings), len(labels)]
+        if include_batches:
+            lengths.append(len(batches))
+        min_len = min(lengths)
+        if any(length != min_len for length in lengths):
             import sys
-            sys.stderr.write(f"[Prototypes] Warning: Length mismatch in {group} - labels={len(labels)}, batches={len(batches)}, encodings={len(encodings)}. Truncating to {min_len}.\n")
-            labels = labels[:min_len]
-            batches = batches[:min_len]
+            detail = f"labels={len(labels)}, encodings={len(encodings)}"
+            if include_batches:
+                detail += f", batches={len(batches)}"
+            sys.stderr.write(f"[Prototypes] Warning: Length mismatch in {group} - {detail}. Truncating to {min_len}.\n")
             encodings = encodings[:min_len]
+            labels = labels[:min_len]
+            if include_batches:
+                batches = batches[:min_len]
+        return encodings, labels, batches
+
+    def set_both_prototypes(self, group, list1):
+        encodings, labels, batches = self._aligned_arrays(group, list1, include_batches=True)
         prototypes = {}
         for label in self.unique_labels:
             for batch in self.unique_batches:
@@ -69,8 +79,7 @@ class Prototypes:
         self.prototypes[group] = prototypes
 
     def set_class_prototypes(self, group, list1):
-        encodings = np.concatenate(list1[group]['encoded_values'])
-        labels = np.concatenate(list1[group]['labels'])
+        encodings, labels, _ = self._aligned_arrays(group, list1, include_batches=False)
         prototypes = {}
         for label in self.unique_labels:
             inds = np.where((labels == label))[0]
@@ -79,8 +88,7 @@ class Prototypes:
         self.class_prototypes[group] = prototypes
 
     def set_batch_prototypes(self, group, list1):
-        encodings = np.concatenate(list1[group]['encoded_values'])
-        batches = np.concatenate(list1[group]['domains'])
+        encodings, _, batches = self._aligned_arrays(group, list1, include_batches=True)
         prototypes = {}
         for batch in self.unique_batches:
             inds = np.where((batches == batch))[0]
@@ -92,4 +100,3 @@ class Prototypes:
                 prototypes[batch] = np.zeros((encodings.shape[1],))
         self.n_prototypes[group] = len(self.prototypes)
         self.batch_prototypes[group] = prototypes
-

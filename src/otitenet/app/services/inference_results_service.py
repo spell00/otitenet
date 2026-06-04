@@ -427,13 +427,18 @@ def compute_inference_metrics(df: pd.DataFrame) -> Dict[str, Any]:
         fn = int(np.sum(true_pos & ~pred_pos))
         support = int(np.sum(true_pos))
 
-        precision = tp / (tp + fp) if (tp + fp) else np.nan
-        recall = tp / (tp + fn) if (tp + fn) else np.nan
-        f1 = (
-            2 * precision * recall / (precision + recall)
-            if np.isfinite(precision) and np.isfinite(recall) and (precision + recall)
-            else np.nan
-        )
+        if support == 0:
+            precision = np.nan
+            recall = np.nan
+            f1 = np.nan
+        else:
+            precision = tp / (tp + fp) if (tp + fp) else np.nan
+            recall = tp / (tp + fn) if (tp + fn) else np.nan
+            f1 = (
+                2 * precision * recall / (precision + recall)
+                if np.isfinite(precision) and np.isfinite(recall) and (precision + recall)
+                else np.nan
+            )
         display_label = str(label)
         out[f"F1 {display_label}"] = f1
         out[f"Recall {display_label}"] = recall
@@ -487,11 +492,24 @@ def args_from_inference_row(base_args, row_dict: Dict[str, Any]):
         "n_calibration": ("N_Calibration", "n_calibration", "N_Cal"),
         "normalize": ("Normalize", "normalize"),
         "n_neighbors": ("N_Neighbors", "n_neighbors"),
-        "path": ("Path", "path"),
+        "path": ("Path", "path", "Dataset", "Artifact Dataset", "Combo Dataset"),
         "task": ("Task", "task"),
-        "log_path": ("Log Path", "log_path"),
+        "log_path": ("Artifact Log Path", "Log Path", "log_path"),
         "prototype_strategy": ("Proto_Strat", "prototype_strategy"),
         "prototype_components": ("Proto_Comp", "prototype_components"),
+        "valid_mcc": ("Valid MCC", "valid_mcc"),
+        "mcc": ("MCC", "mcc"),
+        "valid_auc": ("Valid AUC", "Valid_AUC", "valid_auc"),
+        "test_mcc": ("Test MCC", "Test_MCC", "test_mcc"),
+        "test_auc": ("Test AUC", "Test_AUC", "test_auc"),
+        "train_datasets": ("train_datasets", "Train Datasets"),
+        "valid_dataset": ("valid_dataset", "Valid Dataset"),
+        "test_dataset": ("test_dataset", "Test Dataset"),
+        "split_config_key": ("split_config_key", "Split Config Key"),
+        "train_encodings_path": ("train_encodings_path", "Train Encodings Path"),
+        "valid_encodings_path": ("valid_encodings_path", "Valid Encodings Path"),
+        "test_encodings_path": ("test_encodings_path", "Test Encodings Path"),
+        "best_model_dir": ("Best Model Dir", "best_model_dir", "model_dir"),
     }
 
     for attr, keys in mapping.items():
@@ -504,8 +522,20 @@ def args_from_inference_row(base_args, row_dict: Dict[str, Any]):
                 value = int(float(value))
             except Exception:
                 pass
+        elif attr in {"valid_mcc", "mcc", "valid_auc", "test_mcc", "test_auc"}:
+            try:
+                value = float(value)
+            except Exception:
+                pass
+        elif attr == "path" and isinstance(value, str) and value and not value.startswith("data/"):
+            value = os.path.join("data", value)
 
         setattr(args, attr, value)
+
+    split_key = getattr(args, "split_config_key", None)
+    if split_key and str(split_key).strip() not in {"", "None", "nan"}:
+        args.split_config_in_path = True
+        args._split_config_in_path = True
 
     # Some rows only have log_path, not path. Leave path unchanged unless row has path.
     if not hasattr(args, "bs"):

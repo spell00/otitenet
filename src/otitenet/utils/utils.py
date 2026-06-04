@@ -13,7 +13,10 @@ import mlflow
 import sklearn
 import itertools
 import numpy as np
-import tensorflow as tf
+try:
+    import tensorflow as tf
+except ModuleNotFoundError:
+    tf = None
 from sklearn import metrics
 from itertools import cycle
 from matplotlib import pyplot as plt, cm
@@ -1054,7 +1057,7 @@ def get_empty_traces():
         'dom_acc': [],
     }
     lists = {}
-    for g in ['all', 'train', 'valid', 'test']:
+    for g in ['all', 'train', 'valid', 'test', 'calibration']:
         lists[g] = {
             'set': [],
             'preds': [],
@@ -1120,6 +1123,8 @@ def log_traces(traces, values):
 
 
 def get_best_loss_from_tb(event_acc):
+    if tf is None:
+        raise ModuleNotFoundError("tensorflow is required to read TensorBoard tensor values")
     values = {}
     # plugin_data = event_acc.summary_metadata['_hparams_/session_start_info'].plugin_data.content
     # plugin_data = plugin_data_pb2.HParamsPluginData.FromString(plugin_data)
@@ -1132,6 +1137,8 @@ def get_best_loss_from_tb(event_acc):
 
 
 def get_best_acc_from_tb(event_acc):
+    if tf is None:
+        raise ModuleNotFoundError("tensorflow is required to read TensorBoard tensor values")
     values = {}
     # plugin_data = event_acc.summary_metadata['_hparams_/session_start_info'].plugin_data.content
     # plugin_data = plugin_data_pb2.HParamsPluginData.FromString(plugin_data)

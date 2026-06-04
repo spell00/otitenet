@@ -15,10 +15,13 @@ import math
 import random
 import hashlib
 import re
+import glob
 import numpy as np
 import pandas as pd
 import streamlit as st
 import pickle
+
+from otitenet.app.artifact_registry import preferred_model_artifact_dir
 
 # ---- String/Filename Utilities ---- #
 
@@ -114,6 +117,24 @@ def split_config_key(train_datasets="", valid_dataset="", test_dataset="") -> st
         str(valid_dataset or "").strip(),
         str(test_dataset or "").strip(),
     ])
+
+
+def split_combo_key_from_row(row) -> str:
+    if row is None:
+        return ""
+    getter = row.get if hasattr(row, "get") else lambda _key, _default=None: _default
+    key = getter("split_config_key")
+    if key and str(key).strip() not in {"", "None", "nan", "null"}:
+        return str(key).strip().replace(";", ",")
+    return split_config_key(
+        getter("train_datasets") or getter("Train Datasets") or "",
+        getter("valid_dataset") or getter("Valid Dataset") or "",
+        getter("test_dataset") or getter("Test Dataset") or "",
+    )
+
+
+def split_combo_key_to_values(combo_key: str) -> tuple[str, str, str]:
+    return tuple((str(combo_key or "").split("|") + ["", "", ""])[:3])
 
 
 def split_config_segment(train_datasets="", valid_dataset="", test_dataset="") -> str:
@@ -336,6 +357,26 @@ def _build_manifest_config_key(task, model_name, fgsm, n_calibration, classif_lo
     ])
 
 
+def _resolve_manifest_path(task_name: str) -> str | None:
+    """Resolve the manifest CSV path for a task across legacy and per-dataset layouts."""
+    if not task_name:
+        return None
+
+    # Legacy layout: logs/progresses/<task>/csv/PROD_<task>_job_manifest.csv
+    legacy_path = os.path.join("logs", "progresses", task_name, "csv", f"PROD_{task_name}_job_manifest.csv")
+    if os.path.exists(legacy_path):
+        return legacy_path
+
+    # New layout: logs/progresses/<task>/<dataset_key>/csv/PROD_<task>_job_manifest.csv
+    pattern = os.path.join("logs", "progresses", task_name, "*", "csv", f"PROD_{task_name}_job_manifest.csv")
+    matches = [p for p in glob.glob(pattern) if os.path.isfile(p)]
+    if not matches:
+        return None
+
+    # Prefer the most recently modified manifest when multiple dataset-key folders exist.
+    return max(matches, key=os.path.getmtime)
+
+
 def _get_done_manifest_config_keys(task: str):
     """Return the set of completed manifest config keys for a task, or None if unavailable."""
     task_name = _normalize_manifest_value(task)
@@ -346,7 +387,7 @@ def _get_done_manifest_config_keys(task: str):
     if task_name in cache:
         return cache[task_name]
 
-    manifest_path = os.path.join("logs", "progresses", task_name, "csv", f"PROD_{task_name}_job_manifest.csv")
+    manifest_path = _resolve_manifest_path(task_name)
     if not os.path.exists(manifest_path):
         cache[task_name] = None
         return None
@@ -362,6 +403,8 @@ def _get_done_manifest_config_keys(task: str):
         return None
 
     done_df = manifest_df[manifest_df["job_state"].astype(str).str.strip().str.lower() == "done"].copy()
+    if "task" in done_df.columns:
+        done_df = done_df[done_df["task"].astype(str).str.strip().str.lower() == task_name]
     done_keys = set()
     for _, row in done_df.iterrows():
         loss_value = row.get("classif_loss")
@@ -426,8 +469,8 @@ def get_done_manifest_models_df(task: str):
     if not task_name:
         return None
     
-    manifest_path = os.path.join("logs", "progresses", task_name, "csv", f"PROD_{task_name}_job_manifest.csv")
-    if not os.path.exists(manifest_path):
+    manifest_path = _resolve_manifest_path(task_name)
+    if not manifest_path or not os.path.exists(manifest_path):
         return None
     
     try:
@@ -439,6 +482,8 @@ def get_done_manifest_models_df(task: str):
         return None
     
     done_df = manifest_df[manifest_df["job_state"].astype(str).str.strip().str.lower() == "done"].copy()
+    if "task" in done_df.columns:
+        done_df = done_df[done_df["task"].astype(str).str.strip().str.lower() == task_name]
     if done_df.empty:
         return None
     
@@ -594,6 +639,8 @@ def _norm_model_csv_value(value):
 
 def _norm_model_csv_token(value):
     text = _norm_model_csv_value(value)
+    if "/" in text and text.endswith("_inference"):
+        text = text[: -len("_inference")]
     for prefix in ["prototypes_", "nsize", "fgsm", "fsgm", "ncal", "npos", "nneg", "dist_"]:
         if text.startswith(prefix):
             text = text[len(prefix):]
@@ -1204,32 +1251,59 @@ def _ensure_model_number_map(cursor):
         return model_number_map, best_models_table
 
     try:
-        cursor.execute(
-            """
-             SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct,
-                 classif_loss, n_calibration, accuracy, mcc, normalize, n_neighbors, log_path, model_rank,
-                 prototype_strategy, prototype_components, test_mcc, valid_auc, test_auc,
-                 train_datasets, valid_dataset, test_dataset, split_config_key
-            FROM best_models_registry
-            WHERE model_rank IS NOT NULL
-            ORDER BY model_rank ASC
-            """
-        )
-        model_rows = cursor.fetchall()
-        use_db_rank = True
-    except Exception:
         try:
             cursor.execute(
                 """
                  SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct,
-                     classif_loss, n_calibration, accuracy, mcc, normalize, n_neighbors, log_path,
+                     classif_loss, n_calibration, accuracy, mcc, normalize, n_neighbors, log_path, model_rank,
                      prototype_strategy, prototype_components, test_mcc, valid_auc, test_auc,
-                     train_datasets, valid_dataset, test_dataset, split_config_key
+                     train_datasets, valid_dataset, test_dataset, split_config_key,
+                     artifact_id, best_model_dir, source_run_log_path
                 FROM best_models_registry
-                ORDER BY mcc DESC
+                ORDER BY (model_rank IS NULL) ASC, model_rank ASC, mcc DESC
                 """
             )
             model_rows = cursor.fetchall()
+        except Exception:
+            cursor.execute(
+                """
+                 SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct,
+                     classif_loss, n_calibration, accuracy, mcc, normalize, n_neighbors, log_path, model_rank,
+                     prototype_strategy, prototype_components, test_mcc, valid_auc, test_auc,
+                     train_datasets, valid_dataset, test_dataset, split_config_key
+                FROM best_models_registry
+                ORDER BY (model_rank IS NULL) ASC, model_rank ASC, mcc DESC
+                """
+            )
+            model_rows = [tuple(list(row) + [None, None, None]) for row in (cursor.fetchall() or [])]
+        use_db_rank = True
+    except Exception:
+        try:
+            try:
+                cursor.execute(
+                    """
+                     SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct,
+                         classif_loss, n_calibration, accuracy, mcc, normalize, n_neighbors, log_path,
+                         prototype_strategy, prototype_components, test_mcc, valid_auc, test_auc,
+                         train_datasets, valid_dataset, test_dataset, split_config_key,
+                         artifact_id, best_model_dir, source_run_log_path
+                    FROM best_models_registry
+                    ORDER BY mcc DESC
+                    """
+                )
+                model_rows = cursor.fetchall()
+            except Exception:
+                cursor.execute(
+                    """
+                     SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct,
+                         classif_loss, n_calibration, accuracy, mcc, normalize, n_neighbors, log_path,
+                         prototype_strategy, prototype_components, test_mcc, valid_auc, test_auc,
+                         train_datasets, valid_dataset, test_dataset, split_config_key
+                    FROM best_models_registry
+                    ORDER BY mcc DESC
+                    """
+                )
+                model_rows = [tuple(list(row) + [None, None, None]) for row in (cursor.fetchall() or [])]
         except Exception:
             cursor.execute(
                 """
@@ -1240,7 +1314,7 @@ def _ensure_model_number_map(cursor):
                 ORDER BY mcc DESC
                 """
             )
-            model_rows = [tuple(list(row) + [None, None, None, None]) for row in (cursor.fetchall() or [])]
+            model_rows = [tuple(list(row) + [None, None, None, None, None, None, None]) for row in (cursor.fetchall() or [])]
         use_db_rank = False
 
     if not model_rows:
@@ -1253,6 +1327,7 @@ def _ensure_model_number_map(cursor):
             "Classif_Loss", "N_Calibration", "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path", "#",
             "Proto_Strat", "Proto_Comp", "Test_MCC", "Valid_AUC", "Test_AUC",
             "train_datasets", "valid_dataset", "test_dataset", "split_config_key",
+            "Artifact ID", "Best Model Dir", "Source Run Path",
         ]
     else:
         cols = [
@@ -1260,8 +1335,18 @@ def _ensure_model_number_map(cursor):
             "Classif_Loss", "N_Calibration", "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path",
             "Proto_Strat", "Proto_Comp", "Test_MCC", "Valid_AUC", "Test_AUC",
             "train_datasets", "valid_dataset", "test_dataset", "split_config_key",
+            "Artifact ID", "Best Model Dir", "Source Run Path",
         ]
     df = pd.DataFrame(model_rows, columns=cols)
+    if "Best Model Dir" not in df.columns:
+        df["Best Model Dir"] = df.get("Log Path", "")
+    if "Source Run Path" not in df.columns:
+        df["Source Run Path"] = ""
+    for idx, row in df.iterrows():
+        preferred = preferred_model_artifact_dir(row.to_dict())
+        if preferred:
+            df.at[idx, "Artifact Log Path"] = preferred
+            df.at[idx, "Log Path"] = preferred
     group_cols = [
         "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
         "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration", "Normalize", "N_Neighbors",
@@ -1432,11 +1517,7 @@ def parse_classifier_config(best_config) -> dict:
 
 def get_optimization_cache_file_path(_args) -> str:
     """Path to knn_optimization_cache.pkl (same layout as Tab 1 Learned Embedding)."""
-    # Always remove split segment for optimization cache path
-    args_copy = type(_args)(**vars(_args))
-    args_copy.split_config_in_path = False
-    args_copy._split_config_in_path = False
-    params = get_model_params_path(args_copy)
+    params = get_model_params_path(_args)
     parts = params.split('/')
     base_params = '/'.join(parts[:-3]) if len(parts) > 3 else params
     normalize_val = str(getattr(_args, 'normalize', 'no'))
@@ -1449,7 +1530,7 @@ def get_optimization_cache_file_path(_args) -> str:
 
 
 def _optimization_cache_file_paths(_args) -> list[str]:
-    """Return current and legacy optimization cache locations for an args namespace."""
+    """Return split-aware and legacy optimization cache locations for an args namespace."""
     paths = [get_optimization_cache_file_path(_args)]
     if bool(getattr(_args, "split_config_in_path", False) or getattr(_args, "_split_config_in_path", False)):
         old_split_flag = getattr(_args, "split_config_in_path", False)
@@ -1466,8 +1547,34 @@ def _optimization_cache_file_paths(_args) -> list[str]:
     return paths
 
 
-def _merge_optimization_cache_entries(target_cache: dict, source_cache: dict) -> dict:
-    """Merge source cache into target, keeping best MCC per n_aug."""
+def _cache_result_matches_args_split(result: dict, _args) -> bool:
+    target_key = split_config_key(**split_config_values(_args))
+    if not target_key.replace("|", "").strip():
+        return True
+
+    result_key = split_config_key(
+        result.get("train_datasets"),
+        result.get("valid_dataset"),
+        result.get("test_dataset"),
+    )
+    if not result_key.replace("|", "").strip():
+        return not bool(getattr(_args, "split_config_in_path", False) or getattr(_args, "_split_config_in_path", False))
+    return result_key == target_key
+
+
+def _merge_optimization_cache_entries(
+    target_cache: dict,
+    source_cache: dict,
+    _args=None,
+    replace_existing: bool = False,
+    allow_no_split_fallback: bool = False,
+) -> dict:
+    """Merge source cache into target.
+
+    Split-aware cache files are loaded before legacy files. Existing entries
+    therefore win by default so older no-split caches cannot override freshly
+    retrained split-specific head metrics for the same n_aug.
+    """
     if not isinstance(source_cache, dict):
         return target_cache
     for n_aug_key, result in source_cache.items():
@@ -1475,9 +1582,19 @@ def _merge_optimization_cache_entries(target_cache: dict, source_cache: dict) ->
             n_aug_int = int(n_aug_key)
         except Exception:
             continue
+        if _args is not None and isinstance(result, dict) and not _cache_result_matches_args_split(result, _args):
+            result_key = split_config_key(
+                result.get("train_datasets"),
+                result.get("valid_dataset"),
+                result.get("test_dataset"),
+            )
+            if not (allow_no_split_fallback and not result_key.replace("|", "").strip()):
+                continue
         current = target_cache.get(n_aug_int)
         if current is None:
             target_cache[n_aug_int] = result
+            continue
+        if not replace_existing:
             continue
         current_mcc = float(current.get('best_mcc', -1)) if isinstance(current, dict) else -1
         new_mcc = float(result.get('best_mcc', -1)) if isinstance(result, dict) else -1
@@ -1491,7 +1608,7 @@ def load_optimization_cache_dict(_args) -> dict:
     import glob
     merged_cache = {}
     cache_dirs = []
-    for cache_path in _optimization_cache_file_paths(_args):
+    for cache_idx, cache_path in enumerate(_optimization_cache_file_paths(_args)):
         cache_dir = os.path.dirname(cache_path)
         if cache_dir not in cache_dirs:
             cache_dirs.append(cache_dir)
@@ -1499,7 +1616,13 @@ def load_optimization_cache_dict(_args) -> dict:
             continue
         try:
             with open(cache_path, 'rb') as f:
-                merged_cache = _merge_optimization_cache_entries(merged_cache, pickle.load(f))
+                merged_cache = _merge_optimization_cache_entries(
+                    merged_cache,
+                    pickle.load(f),
+                    _args=_args,
+                    replace_existing=(cache_idx == 0),
+                    allow_no_split_fallback=(cache_idx > 0),
+                )
         except Exception as e:
             print(f"[Cache] Could not load optimization cache {cache_path}: {e}")
     for cache_dir in cache_dirs:
@@ -1507,7 +1630,12 @@ def load_optimization_cache_dict(_args) -> dict:
         for legacy_file in glob.glob(legacy_pattern):
             try:
                 with open(legacy_file, 'rb') as f:
-                    merged_cache = _merge_optimization_cache_entries(merged_cache, pickle.load(f))
+                    merged_cache = _merge_optimization_cache_entries(
+                        merged_cache,
+                        pickle.load(f),
+                        _args=_args,
+                        allow_no_split_fallback=True,
+                    )
             except Exception as e:
                 print(f"[Cache] Could not load legacy cache {legacy_file}: {e}")
     return merged_cache
@@ -1580,6 +1708,39 @@ def _update_classification_head(
         best_by_config[key] = entry
 
 
+def _classification_head_extra_metrics(source: dict | None) -> dict:
+    if not isinstance(source, dict):
+        return {}
+    allowed = {
+        "train_mcc",
+        "valid_mcc",
+        "test_mcc",
+        "all_mcc",
+        "train_accuracy",
+        "valid_accuracy",
+        "test_accuracy",
+        "train_auc",
+        "valid_auc",
+        "test_auc",
+        "all_auc",
+        "ece",
+        "brier",
+        "valid_ece",
+        "valid_brier",
+    }
+    out = {}
+    for key, value in source.items():
+        if (
+            key in allowed
+            or " F1 " in str(key)
+            or " Recall " in str(key)
+            or " Precision " in str(key)
+            or " Support " in str(key)
+        ):
+            out[key] = value
+    return out
+
+
 def enumerate_classification_heads(_args, include_all_n_aug: bool = False):
     """List classification heads from the learned-embedding optimization cache.
 
@@ -1627,12 +1788,8 @@ def enumerate_classification_heads(_args, include_all_n_aug: bool = False):
                     f"k={int(k_val)}, n_aug={n_aug}",
                     dedupe_key=f"{config}|n_aug={n_aug}" if include_all_n_aug else config,
                     n_aug=n_aug,
-                    train_mcc=item.get("train_mcc") if isinstance(item, dict) else None,
-                    test_mcc=item.get("test_mcc") if isinstance(item, dict) else None,
-                    valid_auc=item.get("valid_auc") if isinstance(item, dict) else None,
-                    train_auc=item.get("train_auc") if isinstance(item, dict) else None,
-                    test_auc=item.get("test_auc") if isinstance(item, dict) else None,
                     head_cache_version=head_cache_version,
+                    **_classification_head_extra_metrics(item),
                     **split_metrics,
                 )
 
@@ -1666,12 +1823,8 @@ def enumerate_classification_heads(_args, include_all_n_aug: bool = False):
                 f"n_comp={n_comp}, n_aug={n_aug}",
                 dedupe_key=f"{config}|n_aug={n_aug}" if include_all_n_aug else config,
                 n_aug=n_aug,
-                train_mcc=strat_data.get("train_mcc"),
-                valid_auc=strat_data.get("valid_auc"),
-                train_auc=strat_data.get("train_auc"),
-                test_mcc=strat_data.get("test_mcc"),
-                test_auc=strat_data.get("test_auc"),
                 head_cache_version=head_cache_version,
+                **_classification_head_extra_metrics(strat_data),
                 **split_metrics,
             )
 
@@ -1695,19 +1848,15 @@ def enumerate_classification_heads(_args, include_all_n_aug: bool = False):
                 f"n_aug={n_aug}",
                 dedupe_key=f"{config}|n_aug={n_aug}" if include_all_n_aug else config,
                 n_aug=n_aug,
-                train_mcc=b_data.get("train_mcc"),
-                valid_auc=b_data.get("valid_auc"),
-                train_auc=b_data.get("train_auc"),
-                test_mcc=b_data.get("test_mcc"),
-                test_auc=b_data.get("test_auc"),
                 head_cache_version=head_cache_version,
+                **_classification_head_extra_metrics(b_data),
                 **split_metrics,
             )
 
     heads = []
     for entry in best_by_config.values():
         cfg = entry["config"]
-        heads.append({
+        head = {
             "config": cfg,
             "label": format_classifier_config(cfg),
             "mcc": entry["mcc"],
@@ -1723,7 +1872,9 @@ def enumerate_classification_heads(_args, include_all_n_aug: bool = False):
             "valid_dataset": entry.get("valid_dataset"),
             "test_dataset": entry.get("test_dataset"),
             "details": entry.get("details", ""),
-        })
+        }
+        head.update(_classification_head_extra_metrics(entry))
+        heads.append(head)
     return sorted(heads, key=lambda h: h["mcc"], reverse=True)
 
 

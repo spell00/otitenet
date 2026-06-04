@@ -46,7 +46,10 @@ def get_db_connection():
             password="password",
             database="results_db",
             buffered=True,
-            autocommit=True
+            autocommit=True,
+            # Avoid sporadic C-extension parsing issues seen as
+            # "bytearray index out of range" on some environments.
+            use_pure=True,
         )
         return conn
     except Error as e:
@@ -69,7 +72,7 @@ def create_db():
         cursor.execute("SELECT 1")
         cursor.fetchone()
         return conn, cursor
-    except Exception as e:
+    except Exception:
         # If the cached connection is broken, clear cache and try one more time
         try:
             get_db_connection.clear()
@@ -82,11 +85,31 @@ def create_db():
             cursor.fetchone()
             return conn, cursor
         except Exception as e2:
-            if "Too many connections" in str(e2):
-                st.error("❌ MySQL has too many connections. Please restart MySQL service or wait for connections to timeout.")
-            else:
-                st.error(f"❌ Database error: {e2}")
-            st.stop()
+            # Final fallback: bypass cache and open a direct uncached connection.
+            # This recovers from rare cache/connector corruption states.
+            try:
+                conn = mysql.connector.connect(
+                    host="localhost",
+                    user="y_user",
+                    password="password",
+                    database="results_db",
+                    buffered=True,
+                    autocommit=True,
+                    use_pure=True,
+                )
+                if not conn.is_connected():
+                    conn.reconnect(attempts=3, delay=1)
+                conn.ping(reconnect=True, attempts=3, delay=1)
+                cursor = conn.cursor(buffered=True)
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+                return conn, cursor
+            except Exception as e3:
+                if "Too many connections" in str(e3):
+                    st.error("❌ MySQL has too many connections. Please restart MySQL service or wait for connections to timeout.")
+                else:
+                    st.error(f"❌ Database error: {e3}")
+                st.stop()
 
 
 def ensure_results_model_id(conn, cursor):
@@ -117,6 +140,35 @@ def ensure_results_model_id(conn, cursor):
                 # If FK already exists or add fails, continue without blocking runtime
                 pass
             conn.commit()
+
+        # Older databases made inference results unique by a coarse parameter
+        # tuple. Several ranked registry rows can share those parameters, which
+        # makes one model reuse or overwrite another model's stored prediction.
+        # Prefer one latest result per person/model/image instead.
+        try:
+            cursor.execute("SHOW INDEX FROM results WHERE Key_name='unique_result_model_image'")
+            has_model_unique = bool(cursor.fetchall())
+            if not has_model_unique:
+                cursor.execute(
+                    """
+                    ALTER TABLE results
+                    ADD UNIQUE KEY unique_result_model_image (filename(100), person_id, model_id)
+                    """
+                )
+                conn.commit()
+            cursor.execute("SHOW INDEX FROM results WHERE Key_name='unique_analysis'")
+            has_old_unique = bool(cursor.fetchall())
+            if has_old_unique:
+                cursor.execute("ALTER TABLE results DROP INDEX unique_analysis")
+                conn.commit()
+        except Exception:
+            # Duplicate historical rows or limited DB privileges should not stop
+            # the app; the model_id-first lookup below still fixes reads where
+            # distinct rows already exist.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
     except Exception:
         # Soft-fail: do not crash app if schema check fails
         conn.rollback()
@@ -147,15 +199,30 @@ def ensure_results_class_scores(conn, cursor):
 
 
 def ensure_registry_metrics_columns(conn, cursor):
-    """Ensure `best_models_registry` has optional metrics and dataset split columns."""
+    """Ensure `best_models_registry` has optional metrics, split, and artifact pointer columns."""
     columns = {
+        'valid_mcc': 'FLOAT NULL',
         'test_mcc': 'FLOAT NULL',
+        'all_mcc': 'FLOAT NULL',
+        'train_mcc': 'FLOAT NULL',
+        'train_auc': 'FLOAT NULL',
         'valid_auc': 'FLOAT NULL',
         'test_auc': 'FLOAT NULL',
+        'all_auc': 'FLOAT NULL',
+        'valid_accuracy': 'FLOAT NULL',
+        'ece': 'FLOAT NULL',
+        'brier': 'FLOAT NULL',
+        'best_head_config': 'VARCHAR(255) NULL',
+        'best_head_name': 'VARCHAR(255) NULL',
+        'best_head_family': 'VARCHAR(64) NULL',
+        'best_head_n_aug': 'INT NULL',
         'train_datasets': 'TEXT NULL',
         'valid_dataset': 'VARCHAR(255) NULL',
         'test_dataset': 'VARCHAR(255) NULL',
         'split_config_key': 'VARCHAR(1024) NULL',
+        'artifact_id': 'VARCHAR(32) NULL',
+        'best_model_dir': 'TEXT NULL',
+        'source_run_log_path': 'TEXT NULL',
     }
     for col, col_type in columns.items():
         try:
@@ -266,12 +333,39 @@ def check_ds_exists(cursor, filename, args):
     Returns:
         Row tuple (pred_label, confidence, log_path) if exists, None otherwise
     """
+    model_id = None
+    try:
+        raw_model_id = getattr(args, "model_id", None)
+        if raw_model_id not in (None, "", "None"):
+            model_id = int(raw_model_id)
+    except Exception:
+        model_id = None
+
+    if model_id is not None:
+        try:
+            cursor.execute(
+                '''
+                SELECT pred_label, confidence, log_path FROM results
+                WHERE filename=%s AND person_id=%s AND model_id=%s
+                ORDER BY timestamp DESC
+                LIMIT 1
+                ''',
+                (filename, st.session_state.person_id, model_id),
+            )
+            row = cursor.fetchone()
+            if row:
+                return row
+        except Exception:
+            pass
+
     cursor.execute(''' 
         SELECT pred_label, confidence, log_path FROM results
         WHERE filename=%s AND person_id=%s AND model_name=%s AND task=%s AND path=%s
               AND n_neighbors=%s AND nsize=%s AND fgsm=%s AND normalize=%s AND
               n_calibration=%s AND classif_loss=%s AND dloss=%s AND dist_fct=%s AND prototypes=%s
               AND npos=%s AND nneg=%s
+        ORDER BY timestamp DESC
+        LIMIT 1
     ''', (
         filename,
         st.session_state.person_id,
@@ -566,7 +660,6 @@ def ensure_production_model_table(conn, cursor):
             conn.commit()
             print("Created production_model table")
         else:
-            print("production_model table already exists")
             _ensure_column("label_scheme", "label_scheme VARCHAR(50) NOT NULL DEFAULT 'binary' AFTER id")
             _ensure_column("head_config", "head_config VARCHAR(255) NULL AFTER log_path")
             _ensure_column("head_name", "head_name VARCHAR(255) NULL AFTER head_config")

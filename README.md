@@ -39,9 +39,8 @@ localstorage -> /home/simon/dvc-storage/otitenet
 Initial tracked paths (practical baseline):
 
 ```bash
-/home/simon/otitenet/.conda/bin/dvc add -f data/datasets logs/progresses
+/home/simon/otitenet/.conda/bin/dvc add -f data logs/progresses logs/best_models
 /home/simon/otitenet/.conda/bin/dvc push
-git add data.dvc logs/progresses.dvc .dvc/config .gitignore
 ```
 
 Daily commands:
@@ -54,9 +53,9 @@ Daily commands:
 /home/simon/otitenet/.conda/bin/dvc checkout
 
 # after updating tracked data/artifacts
-/home/simon/otitenet/.conda/bin/dvc add -f data/datasets logs/progresses
+/home/simon/otitenet/.conda/bin/dvc add -f data logs/progresses logs/best_models
 /home/simon/otitenet/.conda/bin/dvc push
-git add data.dvc logs/progresses.dvc
+git add data.dvc logs/progresses.dvc logs/best_models.dvc configs/datasets.csv configs/best_models.csv
 ```
 
 To switch from local storage to shared/on-prem/cloud storage later:
@@ -64,6 +63,50 @@ To switch from local storage to shared/on-prem/cloud storage later:
 ```bash
 /home/simon/otitenet/.conda/bin/dvc remote add -d <remote_name> <remote_url_or_path>
 ```
+
+### DVCLive Tracking
+
+Training uses DVCLive by default and does not import Comet unless `--log_comet 1` is passed.
+Each training run writes DVCLive metrics and params under:
+
+```text
+logs/<task>/<run_uuid>/dvclive/
+```
+
+The DVCLive params include:
+
+- CLI args and optimized hyperparameters
+- DVC pointer hashes for tracked data/model registry outputs
+- Git commit, branch, dirty status, Python/platform, and `requirements.txt` hash
+- run paths and split/dataset settings
+
+Useful flags:
+
+```bash
+--log_dvclive 1              # default
+--dvclive_save_dvc_exp 1     # default
+--dvclive_monitor_system 1   # default
+--log_comet 0                # default
+```
+
+### Artifact Registries and Database
+
+The app should treat the database as the canonical index for production and best-model selection. The CSV files under `configs/` are portable snapshots that can be reviewed, committed, rebuilt, and cited in a paper:
+
+- `configs/datasets.csv` records raw/processed datasets, ignored raw folders, pixel size, source combination, inference inclusion, sample count, and DVC target path.
+- `configs/best_models.csv` records each best-model artifact, its metrics/parameters, the mirrored best-model directory, and the original source run path when available.
+- `best_models_registry` in SQL stores the same model pointers for the app, including `artifact_id`, `best_model_dir`, and `source_run_log_path`.
+
+`logs/best_models/` is kept as a convenient mirror and emergency fallback, but app loading should prefer `source_run_log_path` when that directory still contains `model.pth` and `prototypes.pkl`. This avoids making the Streamlit app depend on a fragile parameter-encoded directory tree while preserving a human-readable backup location.
+
+Rebuild and sync the registries after adding datasets or promoting models:
+
+```bash
+python scripts/build_artifact_registries.py
+python scripts/sync_best_model_artifacts_to_db.py
+```
+
+For manuscript methods/reproducibility, report the dataset registry row, DVC pointer hash, DVCLive run directory, Git commit/dirty status, and best-model registry row or `artifact_id` used for each result.
 
 ### 2. Initialize MySQL
 

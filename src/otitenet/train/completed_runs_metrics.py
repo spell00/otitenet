@@ -7,14 +7,18 @@ COMPLETED_RUNS_METRICS_HEADER = [
     'timestamp', 'exp_id',
     'trial_index',
     'uuid', 'status', 'error',
+    'task', 'run_tag',
     'model', 'model_name',
     'kind', 'variant',
     'loss', 'classif_loss',
     'prototype', 'prototypes',
     'dloss', 'BER',
     'fgsm', 'normalize', 'n_calibration', 'dist_fct', 'knn', 'n_negatives',
+    'train_datasets', 'valid_dataset', 'test_dataset', 'split_config_key',
     'retry_count', 'launcher_retry_count', 'launcher_failed_final',
-    'valid_mcc', 'test_mcc', 'valid_accuracy', 'test_accuracy',
+    'train_mcc', 'valid_mcc', 'test_mcc',
+    'train_auc', 'valid_auc', 'test_auc',
+    'valid_accuracy', 'test_accuracy',
     'source_datetime',
     'batch_entropy_norm', 'batch_nmi', 'batch_ari',
 ]
@@ -22,7 +26,9 @@ COMPLETED_RUNS_METRICS_HEADER = [
 
 def append_completed_run_metrics(csv_path, row, header=None):
     header = header or COMPLETED_RUNS_METRICS_HEADER
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    directory = os.path.dirname(csv_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
 
     df_row = pd.DataFrame([row]).reindex(columns=header)
     if not os.path.exists(csv_path):
@@ -51,6 +57,10 @@ def append_completed_run_metrics(csv_path, row, header=None):
             existing_df['retry_count'] = existing_df['launcher_retry_count']
         if 'trial_index' not in existing_df.columns:
             existing_df['trial_index'] = ''
+        if 'task' not in existing_df.columns:
+            existing_df['task'] = ''
+        if 'run_tag' not in existing_df.columns:
+            existing_df['run_tag'] = ''
 
         existing_df = existing_df.reindex(columns=header)
         merged_df = pd.concat([existing_df, df_row], ignore_index=True)
