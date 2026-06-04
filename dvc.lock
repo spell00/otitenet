@@ -13,8 +13,8 @@ stages:
       logs/dvc_exp/latest_params.yaml:
         args:
           exp_id: 
-            PROD_otitis_four_class_otite_ds_64_USA_Turquie_Chili_GMFUNL_siamese_resnet18_triplet_inverseTriplet_nneg1_proto_no_ncal4_normyes_fgsm0_inferlinearsvc_otitis_four_class_PROD
-          uuid: b77799ef-2f2d-4084-aa17-4820b121ea40
+            PROD_otitis_four_class_otite_ds_64_USA_Turquie_Chili_GMFUNL_siamese_resnet18_triplet_inverseTriplet_nneg5_proto_no_ncal4_normyes_fgsm0_inferlinearsvc_otitis_four_class_PROD
+          uuid: c0c93b09-199b-47b7-bf96-622566aa93e5
           task: otitis_four_class
           model_name: resnet18
           path: data/otite_ds_64/USA_Turquie_Chili_GMFUNL
@@ -41,7 +41,7 @@ stages:
           fgsm: 0
           n_calibration: 4
           n_positives: 1
-          n_negatives: 1
+          n_negatives: 5
           dist_fct: euclidean
           n_aug: 1
           seed: 42
@@ -49,7 +49,7 @@ stages:
           weighted_sampler: 0
           device: cuda:0
         code:
-          git_commit: 15a7d510eaa78a720476b64f7606ff1732c3fef6
+          git_commit: 572c46e7cd43f9d791dbc5ceacd815745e5b44e8
           git_branch: master
           git_dirty: true
           requirements_sha256: 72acfb144a71f6b33fbe54cd10cfb0ef1387bfed8a470727c472ad78c0c038ea
@@ -57,7 +57,7 @@ stages:
           selected_paths: data/otite_ds_64/USA_Turquie_Chili_GMFUNL;data;logs/best_models
           selected_dvc_files: data.dvc;logs/best_models.dvc
           selected_md5s: 
-            4164aea77091cc10e2a40a6c1662bea3.dir;4164aea77091cc10e2a40a6c1662bea3.dir;c5241d21c9810d3ece751625b1853f0b.dir
+            4164aea77091cc10e2a40a6c1662bea3.dir;4164aea77091cc10e2a40a6c1662bea3.dir;96beebccebc8db68da9f1905353963c6.dir
         optimized_params:
           dist_fct: euclidean
           dmargin: 0.7851759613930136
@@ -74,10 +74,10 @@ stages:
           smoothing: 0.058428929707043636
           wd: 6.870101665590006e-08
         run:
-          foldername: 0e62ef0e-ef3c-4257-ad80-98706d52f42e
-          complete_log_path: logs/otitis_four_class/0e62ef0e-ef3c-4257-ad80-98706d52f42e
+          foldername: e22b8487-eaf3-4af8-aadf-06516cfde144
+          complete_log_path: logs/otitis_four_class/e22b8487-eaf3-4af8-aadf-06516cfde144
     outs:
     - path: logs/dvc_exp/latest_metrics.json
       hash: md5
-      md5: 9312514bfbe447de494a1f8d03e8a18c
-      size: 1271
+      md5: 4bb11211c0d77b799a070e2097fd4575
+      size: 1270

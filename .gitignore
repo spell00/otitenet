@@ -106,7 +106,6 @@ completed_runs_metrics.csv
 .streamlit/
 best_models_old/
 desktop/
-dvc.lock
 package-lock.json
 package.json
 packaging/
