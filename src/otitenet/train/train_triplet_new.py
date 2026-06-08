@@ -28,6 +28,7 @@ from contextlib import nullcontext
 from PIL import Image
 from datetime import datetime
 import time
+from otitenet.data.transforms_manifest import image_preprocessing_manifest
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
@@ -318,7 +319,7 @@ def _make_comet_experiment(api_key, project_name):
         return None
     return comet_ml.Experiment(api_key=api_key, project_name=project_name)
 
-def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=None, source_run_log_path=None):
+def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=None, source_run_log_path=None, best_model_dir=None):
     """Update best_models_registry table with model performance metrics.
     
     Args:
@@ -346,6 +347,7 @@ def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=No
         test_dataset = params.get('test_dataset', '')
         split_key = params.get('split_config_key', '|'.join([str(train_datasets or ''), str(valid_dataset or ''), str(test_dataset or '')]))
         config_key = params.get('config_key') or _best_registry_config_key(params)
+        best_model_dir = best_model_dir or log_path
         artifact_id = hashlib.sha1(str(log_path).replace("\\", "/").strip("/").encode("utf-8")).hexdigest()[:12]
 
         try:
@@ -456,7 +458,7 @@ def update_best_model_registry(params, accuracy, mcc, log_path, batch_metrics=No
                     split_key,
                     log_path,
                     artifact_id,
-                    log_path,
+                    best_model_dir,
                     source_run_log_path,
                 ))
             except mysql.connector.Error as e:
@@ -1090,6 +1092,15 @@ class TrainAE:
                 'train_datasets': args_dict.get('train_datasets'),
                 'valid_dataset': args_dict.get('valid_dataset'),
                 'test_dataset': args_dict.get('test_dataset'),
+                'preprocessing': self._json_safe(
+                    image_preprocessing_manifest(
+                        (
+                            int(getattr(self.args, 'new_size', 224)),
+                            int(getattr(self.args, 'new_size', 224)),
+                        ),
+                        normalize=getattr(self.args, 'normalize', 'no'),
+                    )
+                ),
             }
             with open(metadata_path, 'w') as f:
                 json.dump(payload, f, indent=2)
@@ -1174,6 +1185,15 @@ class TrainAE:
                     _extract_best_values_as_scalars(best_vals)
                 ),
                 'split_config': self._json_safe(_split_config_from_args(self.args)),
+                'preprocessing': self._json_safe(
+                    image_preprocessing_manifest(
+                        (
+                            int(getattr(self.args, 'new_size', 224)),
+                            int(getattr(self.args, 'new_size', 224)),
+                        ),
+                        normalize=getattr(self.args, 'normalize', 'no'),
+                    )
+                ),
                 'calibration_manifest_path': self._json_safe(getattr(self.args, 'calibration_manifest_path', '')),
                 'batch_metrics': self._json_safe(getattr(self, 'batch_metrics', {})),
                 'params': {k: self._json_safe(v) for k, v in (params or {}).items()},
@@ -2233,6 +2253,7 @@ class TrainAE:
             print(f"Error copying model directory: {e}")
 
         # Persist encoded sample vectors for downstream reuse (e.g., KNN)
+        self.save_encoded_vectors(self.complete_log_path, best_lists)
         self.save_encoded_vectors(model_dir, best_lists)
 
         self.best_best_mcc = self.best_mcc
@@ -2281,9 +2302,10 @@ class TrainAE:
             registry_params,
             accuracy=best_vals.get('valid_acc', self.best_acc),
             mcc=self.best_mcc,
-            log_path=model_dir,
+            log_path=self.complete_log_path,
             batch_metrics=batch_metrics_dict,
             source_run_log_path=self.complete_log_path,
+            best_model_dir=model_dir,
         )
 
     # TODO Decide if valuable class method
@@ -2956,37 +2978,52 @@ class TrainAE:
                     distances[label] = np.inf
                     continue
                 
-                proto = proto.reshape(1, -1)
+                proto = np.asarray(proto)
+                if proto.ndim == 1:
+                    proto = proto.reshape(1, -1)
+                else:
+                    proto = proto.reshape(proto.shape[0], -1)
                 
                 if dist_fct.lower() == 'cosine':
                     # Cosine distance
                     from sklearn.metrics.pairwise import cosine_distances
-                    dist = cosine_distances(emb, proto)[0, 0]
+                    dist = float(np.min(cosine_distances(emb, proto)[0]))
                 else:
                     # Euclidean distance
-                    dist = cdist(emb, proto, metric='euclidean')[0, 0]
+                    dist = float(np.min(cdist(emb, proto, metric='euclidean')[0]))
                 
                 distances[label] = dist
             
-            # Apply distance-based classification
+            # Apply distance-based classification from closest prototype per class.
             prototype_kind = getattr(self.args, 'prototype_kind', 'distance').lower()
-            
+            finite_distances = {
+                label: float(dist)
+                for label, dist in distances.items()
+                if np.isfinite(float(dist))
+            }
             if prototype_kind == 'distance_weighted':
-                # Weight by number of training samples per class.
-                # Inverse distance weighted by class count
-                inv_distances = {}
-                for label, dist in distances.items():
-                    weight = class_counts.get(label, 1)
-                    inv_distances[label] = (weight / (dist + 1e-8)) if dist != np.inf else 0.0
-                
-                total_inv = sum(inv_distances.values())
-                probas = {label: inv_dist / (total_inv + 1e-8) for label, inv_dist in inv_distances.items()}
+                class_priors = {
+                    label: max(float(class_counts.get(label, 0)), 1.0)
+                    for label in finite_distances
+                }
             else:
-                # Simple distance-based (inverse distance ratio)
-                inv_distances = {label: 1.0 / (dist + 1e-8) if dist != np.inf else 0.0 
-                                for label, dist in distances.items()}
-                total_inv = sum(inv_distances.values())
-                probas = {label: inv_dist / (total_inv + 1e-8) for label, inv_dist in inv_distances.items()}
+                class_priors = {label: 1.0 for label in finite_distances}
+
+            if finite_distances:
+                labels = list(finite_distances.keys())
+                dist_values = np.array([finite_distances[label] for label in labels], dtype=np.float64)
+                temperature = float(np.std(dist_values))
+                if not np.isfinite(temperature) or temperature <= 1e-8:
+                    temperature = 1.0
+                logits = -dist_values / temperature
+                logits += np.log(np.array([class_priors[label] for label in labels], dtype=np.float64))
+                logits -= np.max(logits)
+                probs_arr = np.exp(logits)
+                probs_arr /= max(float(np.sum(probs_arr)), 1e-12)
+                probas = {label: 0.0 for label in distances}
+                probas.update({label: float(prob) for label, prob in zip(labels, probs_arr)})
+            else:
+                probas = {label: 0.0 for label in distances}
             
             best_label = max(probas, key=probas.get)
             predictions.append(best_label)

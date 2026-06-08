@@ -19,7 +19,7 @@ from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from sklearn.metrics import accuracy_score, matthews_corrcoef
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.svm import LinearSVC
 
 from otitenet.app.display_metrics import _arrow_safe_dataframe
@@ -87,9 +87,11 @@ def _load_raw_pixels(args, max_per_split: int = 2000):
 
     with st.spinner("Loading data through existing OtiteNet data loader..."):
         _model, _shap, prototypes, _image_size, _device, data, unique_labels, unique_batches, _data_getter = load_model_and_prototypes(args)
+        batch_encoder = LabelEncoder().fit(np.asarray(unique_batches))
 
         loaders = get_images_loaders(
             data=data,
+            batch_encoder=batch_encoder,
             random_recs=getattr(args, "random_recs", 0),
             weighted_sampler=0,
             is_transform=0,

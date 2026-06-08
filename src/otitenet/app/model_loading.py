@@ -17,6 +17,17 @@ from otitenet.models.cnn import Net, Net_shap
 from otitenet.app.utils import get_model_params_path
 
 
+def _safe_positive_int(value, default: int = 1) -> int:
+    text = str(value or "").strip()
+    if text == "" or text.lower() in {"none", "nan", "null"}:
+        return int(default)
+    try:
+        parsed = int(float(text))
+    except Exception:
+        return int(default)
+    return parsed if parsed > 0 else int(default)
+
+
 @st.cache_resource
 def resolve_model_paths(base_dir: str, normalize_val: str, dist_fct_val: str, requested_k: int):
     """Find model/prototype paths, falling back across dist_fct and knn folders if needed.
@@ -277,6 +288,8 @@ def _load_model_and_prototypes_cached(
 
 def load_model_and_prototypes(_args):
     """Load trained model, SHAP model, and prototypes with data setup."""
+    n_neighbors = _safe_positive_int(getattr(_args, "n_neighbors", None), default=1)
+    _args.n_neighbors = n_neighbors
     res = _load_model_and_prototypes_cached(
         model_name=_args.model_name,
         task=_args.task,
@@ -288,7 +301,7 @@ def load_model_and_prototypes(_args):
         prototypes_to_use=str(_args.prototypes_to_use),
         n_positives=str(_args.n_positives),
         n_negatives=str(_args.n_negatives),
-        n_neighbors=int(_args.n_neighbors),
+        n_neighbors=n_neighbors,
         normalize=str(_args.normalize),
         dist_fct=str(_args.dist_fct),
         device=str(_args.device),

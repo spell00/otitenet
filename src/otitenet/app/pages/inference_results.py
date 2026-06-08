@@ -29,7 +29,13 @@ from otitenet.app.services.inference_results_service import (
     labels_match,
     normalize_analysis_result,
 )
-from otitenet.app.utils import _ensure_model_number_map, _make_model_selection_key
+from otitenet.app.utils import (
+    _ensure_model_number_map,
+    _make_model_selection_key,
+    get_model_params_path,
+    metric_value_from_mapping,
+    sort_dataframe_by_model_metric,
+)
 
 # if "person_id" not in st.session_state:
 #     st.session_state.person_id = None
@@ -47,6 +53,357 @@ def _correct_state(prediction, truth):
     if str(prediction or "").strip().lower() in {"", "unknown", "na", "nan", "none"}:
         return "X"
     return "✓" if labels_match(prediction, truth) else ""
+
+
+def _model_id_as_int(model_id):
+    try:
+        if pd.isna(model_id):
+            return None
+    except Exception:
+        pass
+    text = str(model_id or "").strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _numeric_model_ids(model_ids):
+    out = []
+    for model_id in model_ids or []:
+        value = _model_id_as_int(model_id)
+        if value is not None:
+            out.append(value)
+    return out
+
+
+def _append_unique_path(paths, value):
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "nan", "null"}:
+        return
+    normalized = text.rstrip("/")
+    if normalized and normalized not in paths:
+        paths.append(normalized)
+
+
+def _model_row_result_log_paths(row_dict, base_args=None):
+    """Return log paths that can identify stored inference rows for a model row."""
+    paths = []
+    row_dict = dict(row_dict or {})
+    for key in ["Log Path", "Artifact Log Path", "Best Model Dir", "Source Run Path", "log_path"]:
+        value = row_dict.get(key)
+        _append_unique_path(paths, value)
+        text = str(value or "").strip().rstrip("/")
+        if not text:
+            continue
+        if text.endswith("/queries"):
+            _append_unique_path(paths, text[: -len("/queries")])
+        else:
+            _append_unique_path(paths, f"{text}/queries")
+
+    if base_args is not None:
+        try:
+            model_args = args_from_inference_row(base_args, row_dict)
+            head_config = row_dict.get("Best Head Config") or row_dict.get("Head Config")
+            if head_config is not None and str(head_config).strip() not in {"", "None", "nan", "—"}:
+                _set_classifier_head_on_args_global(model_args, str(head_config))
+            params = get_model_params_path(model_args)
+            computed = f"logs/best_models/{model_args.task}/{model_args.model_name}/{params}/queries"
+            _append_unique_path(paths, computed)
+            _append_unique_path(paths, computed[: -len("/queries")])
+        except Exception:
+            pass
+    return paths
+
+
+RESULT_IDENTITY_COLUMNS = [
+    ("Model Name", "model_name"),
+    ("Task", "task"),
+    ("Path", "path"),
+    ("N_Neighbors", "n_neighbors"),
+    ("NSize", "nsize"),
+    ("FGSM", "fgsm"),
+    ("Normalize", "normalize"),
+    ("N_Calibration", "n_calibration"),
+    ("Classif_Loss", "classif_loss"),
+    ("DLoss", "dloss"),
+    ("Dist_Fct", "dist_fct"),
+    ("Prototypes", "prototypes"),
+    ("NPos", "npos"),
+    ("NNeg", "nneg"),
+]
+
+
+def _string_identity_value(value):
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value)
+
+
+def _result_identity_from_args(args):
+    """Return the exact parameter identity used by ``insert_score``."""
+    return {
+        "Model Name": _string_identity_value(getattr(args, "model_name", "")),
+        "Task": _string_identity_value(getattr(args, "task", "")),
+        "Path": _string_identity_value(getattr(args, "path", "")),
+        "N_Neighbors": _string_identity_value(getattr(args, "n_neighbors", "")),
+        "NSize": _string_identity_value(getattr(args, "new_size", "")),
+        "FGSM": _string_identity_value(getattr(args, "fgsm", "")),
+        "Normalize": _string_identity_value(getattr(args, "normalize", "")),
+        "N_Calibration": _string_identity_value(getattr(args, "n_calibration", "")),
+        "Classif_Loss": _string_identity_value(getattr(args, "classif_loss", "")),
+        "DLoss": _string_identity_value(getattr(args, "dloss", "")),
+        "Dist_Fct": _string_identity_value(getattr(args, "dist_fct", "")),
+        "Prototypes": _string_identity_value(getattr(args, "prototypes_to_use", "")),
+        "NPos": _string_identity_value(getattr(args, "n_positives", "")),
+        "NNeg": _string_identity_value(getattr(args, "n_negatives", "")),
+    }
+
+
+def _model_row_result_identity(row_dict, base_args=None):
+    row_dict = dict(row_dict or {})
+    if base_args is None:
+        identity = {}
+        for display_col, _db_col in RESULT_IDENTITY_COLUMNS:
+            value = row_dict.get(display_col)
+            if value is None and display_col == "Path":
+                value = row_dict.get("Dataset") or row_dict.get("Artifact Dataset") or row_dict.get("Combo Dataset")
+            identity[display_col] = _string_identity_value(value)
+        return identity
+    try:
+        model_args = args_from_inference_row(base_args, row_dict)
+        head_config = (
+            (row_dict or {}).get("Best Head Config")
+            or (row_dict or {}).get("Head Config")
+            or (row_dict or {}).get("classification_head_config")
+        )
+        if head_config is not None and str(head_config).strip() not in {"", "None", "nan", "—"}:
+            _set_classifier_head_on_args_global(model_args, str(head_config))
+        return _result_identity_from_args(model_args)
+    except Exception:
+        return {}
+
+
+def _result_identity_key_from_mapping(mapping):
+    return "|".join(
+        _string_identity_value(mapping.get(display_col, ""))
+        for display_col, _db_col in RESULT_IDENTITY_COLUMNS
+    )
+
+
+def _result_filename_set(results_df):
+    if results_df is None or results_df.empty or "Filename" not in results_df.columns:
+        return set()
+    return {
+        str(value)
+        for value in results_df["Filename"].dropna().astype(str).tolist()
+        if str(value).strip()
+    }
+
+
+def _model_results_completeness(results_df, expected_filenames):
+    expected = {str(name) for name in (expected_filenames or []) if str(name or "").strip()}
+    present = _result_filename_set(results_df)
+    missing = sorted(expected - present)
+    extras = sorted(present - expected)
+    return {
+        "expected": len(expected),
+        "present": len(present & expected),
+        "missing": missing,
+        "extras": extras,
+        "complete": bool(expected) and not missing,
+    }
+
+
+def _result_matches_model_row_df(results_df, row_dict, base_args=None):
+    """Return a boolean mask selecting stored result rows for a model row."""
+    if results_df is None or results_df.empty:
+        return pd.Series([], dtype=bool)
+    model_id_int = _model_id_as_int((row_dict or {}).get("Model ID"))
+    mask = pd.Series(False, index=results_df.index)
+    if model_id_int is not None and "Model ID" in results_df.columns:
+        mask = mask | (pd.to_numeric(results_df["Model ID"], errors="coerce") == model_id_int)
+    row_paths = set(_model_row_result_log_paths(row_dict, base_args=base_args))
+    if row_paths and "Log Path" in results_df.columns:
+        result_paths = results_df["Log Path"].fillna("").astype(str).str.rstrip("/")
+        row_paths_stripped = {path.rstrip("/") for path in row_paths}
+        mask = mask | result_paths.isin(row_paths_stripped)
+    row_identity = _model_row_result_identity(row_dict, base_args=base_args)
+    if row_identity:
+        for display_col, _db_col in RESULT_IDENTITY_COLUMNS:
+            if display_col not in results_df.columns:
+                break
+        else:
+            identity_mask = pd.Series(True, index=results_df.index)
+            for display_col, _db_col in RESULT_IDENTITY_COLUMNS:
+                identity_mask &= (
+                    results_df[display_col].map(_string_identity_value)
+                    == row_identity.get(display_col, "")
+                )
+            mask = mask | identity_mask
+    return mask
+
+
+def _delete_existing_results_for_model_row(cursor, conn, person_id, filenames, row_dict, base_args=None):
+    """Delete stored inference rows for a model row using every identity the UI can read back."""
+    filenames = [str(name) for name in (filenames or []) if str(name or "").strip()]
+    if cursor is None or not filenames:
+        return 0
+
+    row_dict = dict(row_dict or {})
+    filter_parts = []
+    filter_values = []
+
+    model_id_int = _model_id_as_int(row_dict.get("Model ID"))
+    if model_id_int is not None:
+        filter_parts.append("model_id=%s")
+        filter_values.append(model_id_int)
+
+    log_paths = _model_row_result_log_paths(row_dict, base_args=base_args)
+    if log_paths:
+        placeholders = ",".join(["%s"] * len(log_paths))
+        filter_parts.append(f"log_path IN ({placeholders})")
+        filter_values.extend(log_paths)
+
+    identity = _model_row_result_identity(row_dict, base_args=base_args)
+    if identity:
+        identity_parts = []
+        for display_col, db_col in RESULT_IDENTITY_COLUMNS:
+            identity_parts.append(f"CAST({db_col} AS CHAR)=%s")
+            filter_values.append(identity.get(display_col, ""))
+        filter_parts.append("(" + " AND ".join(identity_parts) + ")")
+
+    if not filter_parts:
+        return 0
+
+    file_placeholders = ",".join(["%s"] * len(filenames))
+    query_values = tuple([person_id] + filenames + filter_values)
+    cursor.execute(
+        f"""
+        DELETE FROM results
+        WHERE person_id=%s
+          AND filename IN ({file_placeholders})
+          AND ({" OR ".join(f"({part})" for part in filter_parts)})
+        """,
+        query_values,
+    )
+    deleted = int(getattr(cursor, "rowcount", 0) or 0)
+    if conn:
+        conn.commit()
+    return deleted
+
+
+def _delete_incomplete_top_n_results(cursor, conn, person_id, filenames, top_n_model_df, incomplete_rows, base_args=None):
+    """Delete temporary partial Top-N inference results after showing them to the user."""
+    if top_n_model_df is None or top_n_model_df.empty or not incomplete_rows:
+        return 0
+
+    deleted_total = 0
+    incomplete_keys = {
+        (
+            _string_identity_value(row.get("Model ID")),
+            _string_identity_value(row.get("#")),
+            _string_identity_value(row.get("Best Head Config")),
+        )
+        for row in incomplete_rows
+    }
+    for _, model_row in top_n_model_df.iterrows():
+        row_dict = model_row.to_dict()
+        row_key = (
+            _string_identity_value(row_dict.get("Model ID")),
+            _string_identity_value(row_dict.get("#")),
+            _string_identity_value(row_dict.get("Best Head Config")),
+        )
+        if row_key not in incomplete_keys:
+            continue
+        deleted_total += _delete_existing_results_for_model_row(
+            cursor,
+            conn,
+            person_id,
+            filenames,
+            row_dict,
+            base_args=base_args,
+        )
+    return deleted_total
+
+
+def _complete_top_n_model_results(top_n_results_df, top_n_model_df, expected_filenames, base_args=None):
+    """Keep only Top-N models with one latest result for every expected image."""
+    complete_frames = []
+    complete_model_rows = []
+    incomplete_rows = []
+
+    if top_n_model_df is None or top_n_model_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), []
+
+    for _, model_row in top_n_model_df.iterrows():
+        row_dict = model_row.to_dict()
+        model_results_df = (
+            top_n_results_df[_result_matches_model_row_df(top_n_results_df, row_dict, base_args=base_args)].copy()
+            if top_n_results_df is not None and not top_n_results_df.empty
+            else pd.DataFrame()
+        )
+        completeness = _model_results_completeness(model_results_df, expected_filenames)
+        if completeness["complete"]:
+            complete_frames.append(model_results_df)
+            complete_model_rows.append(row_dict)
+        else:
+            incomplete_rows.append(
+                {
+                    "#": row_dict.get("#"),
+                    "Model ID": row_dict.get("Model ID"),
+                    "Model Name": row_dict.get("Model Name"),
+                    "Best Classification Head": row_dict.get("Best Classification Head"),
+                    "Best Head Config": row_dict.get("Best Head Config"),
+                    "Stored images": completeness["present"],
+                    "Expected images": completeness["expected"],
+                    "Missing images": len(completeness["missing"]),
+                }
+            )
+
+    complete_results_df = (
+        pd.concat(complete_frames, ignore_index=True)
+        if complete_frames
+        else pd.DataFrame()
+    )
+    complete_model_df = (
+        pd.DataFrame(complete_model_rows, columns=top_n_model_df.columns)
+        if complete_model_rows
+        else top_n_model_df.iloc[0:0].copy()
+    )
+    return complete_results_df, complete_model_df, incomplete_rows
+
+
+def _display_missing_values(df):
+    """Convert pandas missing cells to an explicit display dash."""
+    if df is None:
+        return df
+    return df.astype("object").where(pd.notna(df), "—")
+
+
+def _inference_progress_message(prefix, done_jobs, total_jobs, model_label, image_name):
+    return (
+        f"{prefix}: {int(done_jobs) + 1}/{max(int(total_jobs), 1)} "
+        f"| model={model_label} | image={image_name}"
+    )
+
+
+def _report_inference_progress(status_placeholder, progress, prefix, done_jobs, total_jobs, model_label, image_name):
+    message = _inference_progress_message(prefix, done_jobs, total_jobs, model_label, image_name)
+    print(f"[InferenceProgress] {message}", flush=True)
+    try:
+        status_placeholder.info(message)
+    except Exception:
+        pass
+    try:
+        progress.progress(min(1.0, float(done_jobs) / max(float(total_jobs), 1.0)))
+    except Exception:
+        pass
 
 
 def _plot_one_vs_rest_roc(df, title, score_prefix="Score ", prediction_col="Prediction"):
@@ -124,6 +481,142 @@ def _threshold_decision_for_row(
     return ensemble_prediction if ensemble_passes and str(ensemble_prediction or "").strip() else "Unknown"
 
 
+def _threshold_metric_value(eval_df, metric_name):
+    kept_df = eval_df[~eval_df["_Decision"].astype(str).str.lower().isin(["", "unknown", "na", "nan", "none"])].copy()
+    if metric_name == "Coverage":
+        return float(len(kept_df) / len(eval_df)) if len(eval_df) else np.nan
+    if metric_name.endswith("kept"):
+        if kept_df.empty:
+            return np.nan
+        if metric_name.startswith("ACC"):
+            return float(np.mean([
+                labels_match(pred, truth)
+                for pred, truth in zip(kept_df["_Decision"], kept_df["Ground Truth"])
+            ]))
+        try:
+            return float(matthews_corrcoef(
+                kept_df["Ground Truth"].astype(str).str.lower().values,
+                kept_df["_Decision"].astype(str).str.lower().values,
+            ))
+        except Exception:
+            return np.nan
+
+    pred = eval_df["_Decision"].astype(str).str.lower().replace({"unknown": "__unknown__"})
+    truth = eval_df["Ground Truth"].astype(str).str.lower()
+    if metric_name.startswith("ACC"):
+        return float(accuracy_score(truth.values, pred.values))
+    try:
+        return float(matthews_corrcoef(truth.values, pred.values))
+    except Exception:
+        return np.nan
+
+
+def _threshold_metric_from_arrays(decisions, truth, metric_name):
+    decision_text = pd.Series(decisions).fillna("").astype(str).str.strip().str.lower().to_numpy()
+    truth_text = pd.Series(truth).fillna("").astype(str).str.strip().str.lower().to_numpy()
+    kept = ~np.isin(decision_text, ["", "unknown", "na", "nan", "none"])
+    if metric_name == "Coverage":
+        return float(np.mean(kept)) if len(kept) else np.nan
+    if metric_name.endswith("kept"):
+        if not np.any(kept):
+            return np.nan
+        if metric_name.startswith("ACC"):
+            return float(np.mean([
+                labels_match(pred, actual)
+                for pred, actual in zip(decision_text[kept], truth_text[kept])
+            ]))
+        try:
+            return float(matthews_corrcoef(truth_text[kept], decision_text[kept]))
+        except Exception:
+            return np.nan
+
+    scored_decisions = np.where(kept, decision_text, "__unknown__")
+    if metric_name.startswith("ACC"):
+        return float(np.mean([
+            labels_match(pred, actual)
+            for pred, actual in zip(scored_decisions, truth_text)
+        ]))
+    try:
+        return float(matthews_corrcoef(truth_text, scored_decisions))
+    except Exception:
+        return np.nan
+
+
+def _compute_threshold_heat_arrays(existing_df, metric_name, coverage_metric_name, require_both_thresholds):
+    conf_values = np.round(np.linspace(0.0, 1.0, 21), 2)
+    vote_values = np.arange(0.0, 101.0, 5.0)
+    heat = np.full((len(vote_values), len(conf_values)), np.nan, dtype=float)
+    coverage_metric_heat = np.full((len(vote_values), len(conf_values)), np.nan, dtype=float)
+    coverage_heat = np.full((len(vote_values), len(conf_values)), np.nan, dtype=float)
+
+    valid_truth = ~existing_df["Ground Truth"].astype(str).str.lower().isin(["", "unknown", "na", "nan", "none"])
+    base_df = existing_df[valid_truth].copy()
+    if base_df.empty:
+        return conf_values, vote_values, heat, coverage_metric_heat, coverage_heat
+
+    truth = base_df["Ground Truth"].astype(str).to_numpy()
+    selected_pred = base_df["Prediction"].fillna("").astype(str).to_numpy()
+    ensemble_pred = base_df["Ensemble Raw Prediction"].fillna("").astype(str).to_numpy()
+    ensemble_has_prediction = ~np.isin(
+        pd.Series(ensemble_pred).str.strip().str.lower().to_numpy(),
+        ["", "unknown", "na", "nan", "none"],
+    )
+    confidence = pd.to_numeric(base_df["Confidence"], errors="coerce").to_numpy(dtype=float)
+    ensemble_vote = pd.to_numeric(base_df["Ensemble Raw Vote %"], errors="coerce").to_numpy(dtype=float)
+
+    for y_idx, vote_threshold in enumerate(vote_values):
+        ensemble_passes = np.isfinite(ensemble_vote) & (ensemble_vote >= float(vote_threshold))
+        for x_idx, confidence_threshold in enumerate(conf_values):
+            selected_passes = np.isfinite(confidence) & (confidence >= float(confidence_threshold))
+            if require_both_thresholds:
+                decisions = np.where(selected_passes & ensemble_passes, selected_pred, "Unknown")
+            else:
+                decisions = np.where(
+                    selected_passes,
+                    selected_pred,
+                    np.where(ensemble_passes & ensemble_has_prediction, ensemble_pred, "Unknown"),
+                )
+            heat[y_idx, x_idx] = _threshold_metric_from_arrays(decisions, truth, metric_name)
+            coverage_metric_heat[y_idx, x_idx] = _threshold_metric_from_arrays(decisions, truth, coverage_metric_name)
+            coverage_heat[y_idx, x_idx] = _threshold_metric_from_arrays(decisions, truth, "Coverage")
+
+    return conf_values, vote_values, heat, coverage_metric_heat, coverage_heat
+
+
+def _render_coverage_threshold_plot(conf_values, vote_values, metric_heat, coverage_heat, metric_name, title_prefix):
+    x_grid, y_grid = np.meshgrid(conf_values, vote_values)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    im = ax.imshow(
+        metric_heat,
+        origin="lower",
+        aspect="auto",
+        cmap="viridis",
+        extent=[
+            float(np.min(conf_values)),
+            float(np.max(conf_values)),
+            float(np.min(vote_values)),
+            float(np.max(vote_values)),
+        ],
+        interpolation="nearest",
+    )
+    finite_metric = metric_heat[np.isfinite(metric_heat)]
+    if finite_metric.size:
+        im.set_clim(float(np.nanmin(finite_metric)), float(np.nanmax(finite_metric)))
+    finite_coverage = coverage_heat[np.isfinite(coverage_heat)]
+    if finite_coverage.size:
+        levels = [level for level in [0.25, 0.50, 0.75, 0.90] if finite_coverage.min() <= level <= finite_coverage.max()]
+        if levels:
+            contours = ax.contour(x_grid, y_grid, coverage_heat, levels=levels, colors="black", linewidths=1.1)
+            ax.clabel(contours, inline=True, fontsize=8, fmt=lambda value: f"{100.0 * value:.0f}%")
+    ax.set_xlabel("Selected model confidence threshold")
+    ax.set_ylabel("Top-N ensemble vote threshold (%)")
+    ax.set_title(f"{title_prefix}: {metric_name} heatmap with coverage contours")
+    fig.colorbar(im, ax=ax, label=metric_name)
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+
 def _render_threshold_heatmap(existing_df, require_both_thresholds):
     if existing_df is None or existing_df.empty:
         return
@@ -138,58 +631,21 @@ def _render_threshold_heatmap(existing_df, require_both_thresholds):
         index=0,
         key="inference_threshold_heatmap_metric",
     )
-    conf_values = np.round(np.linspace(0.0, 1.0, 21), 2)
-    vote_values = np.arange(0.0, 101.0, 5.0)
-    heat = np.full((len(vote_values), len(conf_values)), np.nan, dtype=float)
-
-    valid_truth = ~existing_df["Ground Truth"].astype(str).str.lower().isin(["", "unknown", "na", "nan", "none"])
-    base_df = existing_df[valid_truth].copy()
-    if base_df.empty:
+    coverage_metric_name = st.selectbox(
+        "Coverage-aware plot metric",
+        options=["ACC kept", "MCC kept", "ACC unknown=wrong", "MCC unknown=wrong"],
+        index=0,
+        key="inference_threshold_coverage_plot_metric",
+    )
+    conf_values, vote_values, heat, coverage_metric_heat, coverage_heat = _compute_threshold_heat_arrays(
+        existing_df,
+        metric_name=metric_name,
+        coverage_metric_name=coverage_metric_name,
+        require_both_thresholds=require_both_thresholds,
+    )
+    if np.all(np.isnan(heat)):
         st.info("No ground-truth labels available for threshold heatmap.")
         return
-
-    for y_idx, vote_threshold in enumerate(vote_values):
-        for x_idx, confidence_threshold in enumerate(conf_values):
-            decisions = base_df.apply(
-                lambda row: _threshold_decision_for_row(
-                    row,
-                    confidence_threshold,
-                    vote_threshold,
-                    require_both_thresholds,
-                ),
-                axis=1,
-            )
-            eval_df = base_df.assign(_Decision=decisions)
-            kept_df = eval_df[~eval_df["_Decision"].astype(str).str.lower().isin(["", "unknown", "na", "nan", "none"])].copy()
-            if metric_name == "Coverage":
-                value = float(len(kept_df) / len(eval_df)) if len(eval_df) else np.nan
-            elif metric_name.endswith("kept"):
-                if kept_df.empty:
-                    value = np.nan
-                elif metric_name.startswith("ACC"):
-                    value = float(np.mean([
-                        labels_match(pred, truth)
-                        for pred, truth in zip(kept_df["_Decision"], kept_df["Ground Truth"])
-                    ]))
-                else:
-                    try:
-                        value = float(matthews_corrcoef(
-                            kept_df["Ground Truth"].astype(str).str.lower().values,
-                            kept_df["_Decision"].astype(str).str.lower().values,
-                        ))
-                    except Exception:
-                        value = np.nan
-            else:
-                pred = eval_df["_Decision"].astype(str).str.lower().replace({"unknown": "__unknown__"})
-                truth = eval_df["Ground Truth"].astype(str).str.lower()
-                if metric_name.startswith("ACC"):
-                    value = float(accuracy_score(truth.values, pred.values))
-                else:
-                    try:
-                        value = float(matthews_corrcoef(truth.values, pred.values))
-                    except Exception:
-                        value = np.nan
-            heat[y_idx, x_idx] = value
 
     fig, ax = plt.subplots(figsize=(8, 5))
     im = ax.imshow(heat, origin="lower", aspect="auto", cmap="viridis")
@@ -203,6 +659,14 @@ def _render_threshold_heatmap(existing_df, require_both_thresholds):
     fig.colorbar(im, ax=ax, label=metric_name)
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
+    _render_coverage_threshold_plot(
+        conf_values,
+        vote_values,
+        coverage_metric_heat,
+        coverage_heat,
+        coverage_metric_name,
+        "Coverage-aware threshold plot",
+    )
 
 def render(ctx):
     import streamlit as st
@@ -254,6 +718,19 @@ def render(ctx):
                 except Exception:
                     return np.nan
 
+            def _valid_auc_for_head_display(head_auc, head_mcc, row_dict):
+                auc_value = _as_float_or_nan(head_auc)
+                mcc_value = _as_float_or_nan(head_mcc)
+                row_auc = _as_float_or_nan(row_dict.get("Valid AUC", row_dict.get("valid_auc")))
+                if pd.isna(row_auc):
+                    return auc_value
+                if pd.isna(auc_value):
+                    return row_auc
+                if pd.notna(mcc_value) and np.isclose(float(auc_value), float(mcc_value), rtol=0.0, atol=1e-12):
+                    if not np.isclose(float(row_auc), float(mcc_value), rtol=0.0, atol=1e-12):
+                        return row_auc
+                return auc_value
+
             def _candidate_head_cache_paths(row_dict):
                 raw_path = (
                     row_dict.get("Artifact Log Path")
@@ -297,16 +774,23 @@ def render(ctx):
                     if not isinstance(cache, dict):
                         continue
 
-                    def _consider(config, score, details=""):
+                    def _consider(config, metrics, details="", n_aug=None):
                         nonlocal best
-                        score_f = _as_float_or_nan(score)
+                        if not isinstance(metrics, dict):
+                            metrics = {"valid_mcc": metrics}
+                        score_f = _as_float_or_nan(metric_value_from_mapping(metrics))
                         if pd.isna(score_f):
                             return
                         if best is None or score_f > best["score"]:
+                            mcc_f = _as_float_or_nan(metrics.get("valid_mcc", metrics.get("mcc", metrics.get("best_mcc"))))
+                            auc_f = _as_float_or_nan(metrics.get("valid_auc", metrics.get("auc")))
                             best = {
                                 "label": _head_config_label_global(config),
                                 "config": str(config),
                                 "score": score_f,
+                                "mcc": mcc_f,
+                                "auc": auc_f,
+                                "n_aug": n_aug,
                                 "details": details,
                             }
 
@@ -321,17 +805,18 @@ def render(ctx):
                                     continue
                                 _consider(
                                     f"baseline_{baseline_name}",
-                                    baseline_data.get("valid_mcc", baseline_data.get("mcc")),
+                                    baseline_data,
                                     details,
+                                    n_aug=n_aug,
                                 )
 
                         knn_data = result.get("knn") or {}
                         if isinstance(knn_data, dict):
                             for idx, item in enumerate(knn_data.get("mcc_per_k", []) or []):
                                 if isinstance(item, dict):
-                                    _consider(item.get("k", idx + 1), item.get("valid_mcc", item.get("mcc")), details)
+                                    _consider(item.get("k", idx + 1), item, details, n_aug=n_aug)
                                 else:
-                                    _consider(idx + 1, item, details)
+                                    _consider(idx + 1, {"valid_mcc": item}, details, n_aug=n_aug)
 
                         proto_data = result.get("prototypes") or {}
                         if isinstance(proto_data, dict):
@@ -341,20 +826,33 @@ def render(ctx):
                                 n_comp = strat_data.get("best_n_components", 1)
                                 _consider(
                                     f"protot_{strategy}_{n_comp}",
-                                    strat_data.get("valid_mcc", strat_data.get("best_mcc")),
+                                    strat_data,
                                     details,
+                                    n_aug=n_aug,
                                 )
 
                         if result.get("best_config") is not None:
-                            _consider(result.get("best_config"), result.get("best_mcc"), details)
+                            _consider(
+                                result.get("best_config"),
+                                result.get("best_head_metrics") or {"valid_mcc": result.get("best_mcc")},
+                                details,
+                                n_aug=n_aug,
+                            )
                     if best is not None:
-                        return best["label"], best["config"], best["score"]
+                        return best["label"], best["config"], best["mcc"], best["auc"], best["n_aug"]
                 return None
 
             def _head_summary_for_row(row_dict):
                 direct_summary = _head_summary_from_direct_cache(row_dict)
                 if direct_summary is not None:
-                    return direct_summary
+                    head_label, head_config, head_mcc, head_auc, head_n_aug = direct_summary
+                    return (
+                        head_label,
+                        head_config,
+                        head_mcc,
+                        _valid_auc_for_head_display(head_auc, head_mcc, row_dict),
+                        head_n_aug,
+                    )
 
                 tmp_args = args_from_inference_row(args, row_dict)
                 try:
@@ -376,37 +874,51 @@ def render(ctx):
                 if not head_label or str(head_label).strip() in {"", "None", "nan"}:
                     head_label = f"KNN (k={head_config})" if str(head_config).isdigit() else str(head_config)
 
-                head_score = _as_float_or_nan(best_head_entry.get("valid_mcc", best_head_entry.get("mcc")))
-                if pd.isna(head_score):
-                    head_score = _as_float_or_nan(row_dict.get("Valid MCC"))
-                if pd.isna(head_score):
-                    head_score = _as_float_or_nan(row_dict.get("MCC"))
+                head_mcc = _as_float_or_nan(best_head_entry.get("valid_mcc", best_head_entry.get("mcc", best_head_entry.get("best_mcc"))))
+                if pd.isna(head_mcc):
+                    head_mcc = _as_float_or_nan(row_dict.get("Valid MCC", row_dict.get("MCC")))
+                head_auc = _as_float_or_nan(best_head_entry.get("valid_auc", best_head_entry.get("auc")))
+                head_auc = _valid_auc_for_head_display(head_auc, head_mcc, row_dict)
+                head_n_aug = (
+                    best_head_entry.get("n_aug")
+                    or best_head_entry.get("N Aug")
+                    or row_dict.get("Head N Aug")
+                    or row_dict.get("N_Aug")
+                    or row_dict.get("N Aug")
+                )
 
-                return head_label, head_config, head_score
+                return head_label, head_config, head_mcc, head_auc, head_n_aug
 
             head_summaries = inference_model_df.apply(
                 lambda r: _head_summary_for_row(r.to_dict()), axis=1
             )
             inference_model_df["Best Classification Head"] = head_summaries.map(lambda item: item[0])
             inference_model_df["Best Head Config"] = head_summaries.map(lambda item: item[1])
-            inference_model_df["Best Head Score"] = head_summaries.map(lambda item: item[2])
+            inference_model_df["Best Head MCC"] = head_summaries.map(lambda item: item[2])
+            inference_model_df["Best Head AUC"] = head_summaries.map(lambda item: item[3])
+            inference_model_df["N Aug"] = head_summaries.map(lambda item: item[4])
 
-            # Rank inference candidates by optimized-head validation MCC when available.
-            # The backbone/run Valid MCC remains available as Backbone Valid MCC.
+            # Rank inference candidates by the configured Best model metric.
             inference_model_df["Backbone Valid MCC"] = inference_model_df.get("Valid MCC", np.nan)
-            inference_model_df["Display Valid MCC"] = inference_model_df["Best Head Score"].where(
-                pd.to_numeric(inference_model_df["Best Head Score"], errors="coerce").notna(),
-                inference_model_df.get("Valid MCC", np.nan),
+            valid_mcc_source = inference_model_df["Valid MCC"] if "Valid MCC" in inference_model_df.columns else pd.Series(np.nan, index=inference_model_df.index)
+            synced_valid_mcc = pd.to_numeric(valid_mcc_source, errors="coerce")
+            fallback_head_mcc = pd.to_numeric(inference_model_df["Best Head MCC"], errors="coerce")
+            inference_model_df["Display Valid MCC"] = synced_valid_mcc.where(
+                synced_valid_mcc.notna(),
+                fallback_head_mcc,
             )
-            inference_model_df = (
-                inference_model_df.assign(
-                    _head_sort=pd.to_numeric(inference_model_df["Display Valid MCC"], errors="coerce").fillna(-np.inf),
-                    _mcc_sort=pd.to_numeric(inference_model_df.get("MCC", np.nan), errors="coerce").fillna(-np.inf),
-                )
-                .sort_values(["_head_sort", "_mcc_sort"], ascending=[False, False])
-                .drop(columns=["_head_sort", "_mcc_sort"])
-                .reset_index(drop=True)
+            inference_model_df["Best Head MCC"] = inference_model_df["Display Valid MCC"]
+            inference_model_df["Valid MCC"] = inference_model_df["Display Valid MCC"]
+            valid_auc_source = inference_model_df["Valid AUC"] if "Valid AUC" in inference_model_df.columns else pd.Series(np.nan, index=inference_model_df.index)
+            synced_valid_auc = pd.to_numeric(valid_auc_source, errors="coerce")
+            fallback_head_auc = pd.to_numeric(inference_model_df["Best Head AUC"], errors="coerce")
+            inference_model_df["Display Valid AUC"] = synced_valid_auc.where(
+                synced_valid_auc.notna(),
+                fallback_head_auc,
             )
+            inference_model_df["Best Head AUC"] = inference_model_df["Display Valid AUC"]
+            inference_model_df["Valid AUC"] = inference_model_df["Display Valid AUC"]
+            inference_model_df = sort_dataframe_by_model_metric(inference_model_df).reset_index(drop=True)
             inference_model_df["#"] = np.arange(1, len(inference_model_df) + 1)
             model_number_map = {
                 row["_selection_key"]: row["#"]
@@ -465,39 +977,106 @@ def render(ctx):
                 key="inference_top_n_models",
             )
             top_n_model_df = inference_model_df.head(int(top_n_models)).copy()
-            top_n_model_ids = [
-                int(mid) for mid in top_n_model_df["Model ID"].dropna().tolist()
-            ]
+            top_n_model_ids = _numeric_model_ids(top_n_model_df["Model ID"].dropna().tolist())
 
-            def _fetch_latest_inference_results_for_models(model_ids):
-                if not model_ids or not inference_images:
+            def _model_row_log_paths(row_dict):
+                return _model_row_result_log_paths(row_dict, base_args=args)
+
+            def _result_matches_model_row(results_df, row_dict):
+                return _result_matches_model_row_df(results_df, row_dict, base_args=args)
+
+            def _fetch_latest_inference_results_for_models(model_ids, model_rows_df=None):
+                if not inference_images:
                     return pd.DataFrame()
                 inference_filenames_local = [os.path.basename(img) for img in inference_images]
-                model_placeholders = ",".join(["%s"] * len(model_ids))
                 file_placeholders = ",".join(["%s"] * len(inference_filenames_local))
-                cursor.execute(
-                    f"""
-                    SELECT filename, pred_label, confidence, timestamp, log_path, model_id
-                    FROM results
-                    WHERE person_id=%s
-                      AND model_id IN ({model_placeholders})
-                      AND filename IN ({file_placeholders})
-                    ORDER BY timestamp DESC
-                    """,
-                    tuple([st.session_state.person_id] + list(model_ids) + inference_filenames_local),
-                )
+                model_ids = list(model_ids or [])
+                log_paths = []
+                if model_rows_df is not None and not model_rows_df.empty:
+                    for _, model_row in model_rows_df.iterrows():
+                        for path in _model_row_log_paths(model_row.to_dict()):
+                            if path not in log_paths:
+                                log_paths.append(path)
+                identities = []
+                if model_rows_df is not None and not model_rows_df.empty:
+                    seen_identity_keys = set()
+                    for _, model_row in model_rows_df.iterrows():
+                        identity = _model_row_result_identity(model_row.to_dict(), base_args=args)
+                        identity_key = _result_identity_key_from_mapping(identity)
+                        if identity and identity_key not in seen_identity_keys:
+                            identities.append(identity)
+                            seen_identity_keys.add(identity_key)
+                if not model_ids and not log_paths and not identities:
+                    return pd.DataFrame()
+                model_filter_parts = []
+                model_filter_values = []
+                if model_ids:
+                    model_placeholders = ",".join(["%s"] * len(model_ids))
+                    model_filter_parts.append(f"model_id IN ({model_placeholders})")
+                    model_filter_values.extend(model_ids)
+                if log_paths:
+                    log_placeholders = ",".join(["%s"] * len(log_paths))
+                    model_filter_parts.append(f"log_path IN ({log_placeholders})")
+                    model_filter_values.extend(log_paths)
+                for identity in identities:
+                    identity_parts = []
+                    for display_col, db_col in RESULT_IDENTITY_COLUMNS:
+                        identity_parts.append(f"CAST({db_col} AS CHAR)=%s")
+                        model_filter_values.append(identity.get(display_col, ""))
+                    model_filter_parts.append("(" + " AND ".join(identity_parts) + ")")
+                model_filter_sql = " OR ".join(f"({part})" for part in model_filter_parts)
+                query_values = tuple([st.session_state.person_id] + model_filter_values + inference_filenames_local)
+                try:
+                    cursor.execute(
+                        f"""
+                        SELECT filename, pred_label, confidence, timestamp, log_path, model_id, class_scores,
+                               model_name, task, path, n_neighbors, nsize, fgsm, normalize, n_calibration,
+                               classif_loss, dloss, dist_fct, prototypes, npos, nneg
+                        FROM results
+                        WHERE person_id=%s
+                          AND ({model_filter_sql})
+                          AND filename IN ({file_placeholders})
+                        ORDER BY timestamp DESC
+                        """,
+                        query_values,
+                    )
+                    columns = [
+                        "Filename", "Prediction", "Confidence", "Timestamp", "Log Path", "Model ID", "Class Scores",
+                        "Model Name", "Task", "Path", "N_Neighbors", "NSize", "FGSM", "Normalize", "N_Calibration",
+                        "Classif_Loss", "DLoss", "Dist_Fct", "Prototypes", "NPos", "NNeg",
+                    ]
+                except Exception:
+                    cursor.execute(
+                        f"""
+                        SELECT filename, pred_label, confidence, timestamp, log_path, model_id,
+                               model_name, task, path, n_neighbors, nsize, fgsm, normalize, n_calibration,
+                               classif_loss, dloss, dist_fct, prototypes, npos, nneg
+                        FROM results
+                        WHERE person_id=%s
+                          AND ({model_filter_sql})
+                          AND filename IN ({file_placeholders})
+                        ORDER BY timestamp DESC
+                        """,
+                        query_values,
+                    )
+                    columns = [
+                        "Filename", "Prediction", "Confidence", "Timestamp", "Log Path", "Model ID",
+                        "Model Name", "Task", "Path", "N_Neighbors", "NSize", "FGSM", "Normalize", "N_Calibration",
+                        "Classif_Loss", "DLoss", "Dist_Fct", "Prototypes", "NPos", "NNeg",
+                    ]
                 rows = cursor.fetchall()
                 if not rows:
                     return pd.DataFrame()
-                df = pd.DataFrame(
-                    rows,
-                    columns=["Filename", "Prediction", "Confidence", "Timestamp", "Log Path", "Model ID"],
-                )
+                df = pd.DataFrame(rows, columns=columns)
                 df["Model ID"] = pd.to_numeric(df["Model ID"], errors="coerce").astype("Int64")
                 df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+                df["Model Key"] = df["Model ID"].astype(str)
+                df["Param Key"] = df.apply(lambda row: _result_identity_key_from_mapping(row.to_dict()), axis=1)
+                missing_model_id = df["Model ID"].isna()
+                df.loc[missing_model_id, "Model Key"] = df.loc[missing_model_id, "Param Key"]
                 df = (
                     df.sort_values("Timestamp", ascending=False)
-                    .drop_duplicates(subset=["Model ID", "Filename"], keep="first")
+                    .drop_duplicates(subset=["Model Key", "Filename"], keep="first")
                     .reset_index(drop=True)
                 )
                 df["Ground Truth"] = df["Filename"].apply(lambda filename: inference_ground_truth(filename, inference_dir))
@@ -556,17 +1135,34 @@ def render(ctx):
                 kept["Coverage"] = float(len(kept_df) / len(work)) if len(work) else np.nan
                 return {"unknown_wrong": unknown_wrong, "kept": kept}
 
-            def _show_decision_metrics(title, decision_df, prediction_col):
+            def _threshold_score_row(label, decision_df, prediction_col):
                 metrics = _decision_metrics(decision_df, prediction_col)
-                st.markdown(f"**{title}**")
-                cols = st.columns(7)
-                cols[0].metric("ACC unknown=wrong", fmt_metric(metrics["unknown_wrong"]["ACC"]))
-                cols[1].metric("MCC unknown=wrong", fmt_metric(metrics["unknown_wrong"]["MCC"]))
-                cols[2].metric("N", metrics["unknown_wrong"]["N"])
-                cols[3].metric("Coverage", "" if pd.isna(metrics["kept"]["Coverage"]) else f"{100.0 * metrics['kept']['Coverage']:.1f}%")
-                cols[4].metric("ACC kept", fmt_metric(metrics["kept"]["ACC"]))
-                cols[5].metric("MCC kept", fmt_metric(metrics["kept"]["MCC"]))
-                cols[6].metric("N kept", metrics["kept"]["N"])
+                kept = metrics["kept"]
+                return {
+                    "Scores": label,
+                    "ACC": fmt_metric(kept["ACC"]),
+                    "MCC": fmt_metric(kept["MCC"]),
+                    "N": kept["N"],
+                    "Coverage": "" if pd.isna(kept["Coverage"]) else f"{100.0 * kept['Coverage']:.1f}%",
+                }
+
+            def _show_inference_score_comparison(decision_df, decision_col="Decision Prediction"):
+                rows = []
+                if (
+                    "Ensemble Prediction" in decision_df.columns
+                    and decision_df["Ensemble Prediction"].astype(str).str.strip().ne("").any()
+                ):
+                    rows.append(_threshold_score_row("Top-N vote only", decision_df, "Ensemble Prediction"))
+                if (
+                    "Selected Model Prediction" in decision_df.columns
+                    and decision_df["Selected Model Prediction"].astype(str).str.strip().ne("").any()
+                ):
+                    rows.append(_threshold_score_row("Selected base model only", decision_df, "Selected Model Prediction"))
+                if decision_col in decision_df.columns:
+                    rows.append(_threshold_score_row("Currently chosen thresholds", decision_df, decision_col))
+                if not rows:
+                    return
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
             def _build_top_n_votes_df(
                 top_n_results_df,
@@ -581,11 +1177,14 @@ def render(ctx):
 
                 vote_source = top_n_results_df.copy()
                 vote_source["Model ID"] = pd.to_numeric(vote_source["Model ID"], errors="coerce").astype("Int64")
+                if "Model Key" not in vote_source.columns:
+                    vote_source["Model Key"] = vote_source["Model ID"].astype(str)
+                    missing_model_id = vote_source["Model ID"].isna()
+                    vote_source.loc[missing_model_id, "Model Key"] = vote_source.loc[
+                        missing_model_id, "Log Path"
+                    ].fillna("").astype(str)
                 vote_source["Prediction"] = vote_source["Prediction"].fillna("Unknown").astype(str)
-                try:
-                    selected_model_id_int = int(selected_model_id)
-                except Exception:
-                    selected_model_id_int = None
+                selected_model_id_int = _model_id_as_int(selected_model_id)
 
                 vote_counts = (
                     vote_source.groupby(["Filename", "Prediction"])
@@ -600,7 +1199,7 @@ def render(ctx):
                     vote_source.groupby("Filename")
                     .agg(
                         **{
-                            "Models Voted": ("Model ID", "nunique"),
+                            "Models Voted": ("Model Key", "nunique"),
                             "Ground Truth": ("Ground Truth", "first"),
                         }
                     )
@@ -720,12 +1319,7 @@ def render(ctx):
                 selected_model_results_df=None,
             ):
                 st.divider()
-                st.subheader("Top-N Class Votes / Ensemble Classification")
-                st.caption(
-                    f"Final decision uses the selected model when confidence is at least "
-                    f"{float(selected_confidence_threshold):.2f}. Top-N voting is only used as fallback below that "
-                    f"confidence; the fallback winner must reach {float(vote_threshold_pct):.1f}% of votes."
-                )
+                st.subheader("Top-N Scores")
 
                 votes_df = _build_top_n_votes_df(
                     top_n_results_df,
@@ -762,18 +1356,7 @@ def render(ctx):
                     c for c in votes_df.columns
                     if c not in ordered_cols and c not in {"Selected Model Timestamp", "Selected Model Confidence Raw"}
                 ]
-                _show_decision_metrics("Final decision metrics", votes_df, "Decision Prediction")
-                st.caption(
-                    "These metrics use the selected model first and apply the Top-N vote only as fallback."
-                )
-                if "Selected Model Prediction" in votes_df.columns and votes_df["Selected Model Prediction"].astype(str).str.strip().ne("").any():
-                    _show_decision_metrics(
-                        f"Selected model metrics ({selected_model_name})",
-                        votes_df,
-                        "Selected Model Prediction",
-                    )
-                with st.expander("Fallback Top-N ensemble diagnostics", expanded=False):
-                    _show_decision_metrics("Top-N fallback metrics", votes_df, "Ensemble Prediction")
+                _show_inference_score_comparison(votes_df, decision_col="Decision Prediction")
                 roc_votes_df = votes_df.copy()
                 for vote_col in [c for c in roc_votes_df.columns if str(c).startswith("Votes ")]:
                     roc_votes_df[f"Score {str(vote_col)[len('Votes '):]}"] = (
@@ -797,32 +1380,114 @@ def render(ctx):
                 )
                 return votes_df
 
-            top_n_existing_df = _fetch_latest_inference_results_for_models(top_n_model_ids)
-            performance_rows = []
-            if not top_n_model_df.empty:
-                for _, perf_model_row in top_n_model_df.iterrows():
-                    perf_model_id = perf_model_row.get("Model ID")
+            top_n_expected_filenames = [os.path.basename(img) for img in inference_images]
+            top_n_existing_df_raw = _fetch_latest_inference_results_for_models(top_n_model_ids, top_n_model_df)
+            top_n_existing_df, complete_top_n_model_df, incomplete_top_n_rows = (
+                _complete_top_n_model_results(
+                    top_n_existing_df_raw,
+                    top_n_model_df,
+                    top_n_expected_filenames,
+                    base_args=args,
+                )
+            )
+            if incomplete_top_n_rows:
+                st.warning(
+                    "Excluded incomplete Top-N model results. A model is only used when it has one latest stored "
+                    f"result for every inference image ({len(top_n_expected_filenames)} expected)."
+                )
+                st.dataframe(
+                    _arrow_safe_dataframe(_display_missing_values(pd.DataFrame(incomplete_top_n_rows))),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                deleted_incomplete = _delete_incomplete_top_n_results(
+                    cursor,
+                    conn,
+                    st.session_state.person_id,
+                    top_n_expected_filenames,
+                    top_n_model_df,
+                    incomplete_top_n_rows,
+                    base_args=args,
+                )
+                if deleted_incomplete:
+                    st.caption(
+                        f"Deleted {deleted_incomplete} temporary incomplete stored result row(s); "
+                        "they will be recomputed on the next run."
+                    )
+
+            def _score_type_for_model(model_results_df):
+                if model_results_df is None or model_results_df.empty or "Class Scores" not in model_results_df.columns:
+                    return "missing class_scores"
+                parsed_scores = []
+                for payload in model_results_df["Class Scores"].dropna().tolist():
                     try:
-                        perf_model_id_int = int(perf_model_id)
+                        scores = json.loads(payload) if isinstance(payload, str) else payload
                     except Exception:
-                        perf_model_id_int = None
+                        continue
+                    if not isinstance(scores, dict) or not scores:
+                        continue
+                    vals = []
+                    for value in scores.values():
+                        try:
+                            vals.append(float(value))
+                        except Exception:
+                            pass
+                    if vals:
+                        parsed_scores.append(np.asarray(vals, dtype=float))
+                if not parsed_scores:
+                    return "missing class_scores"
+                hard_rows = 0
+                soft_rows = 0
+                for vals in parsed_scores:
+                    finite = vals[np.isfinite(vals)]
+                    if finite.size == 0:
+                        continue
+                    is_binary = np.all(np.isclose(finite, 0.0, atol=1e-9) | np.isclose(finite, 1.0, atol=1e-9))
+                    is_one_hot = is_binary and np.isclose(float(np.sum(finite)), 1.0, atol=1e-9)
+                    if is_one_hot:
+                        hard_rows += 1
+                    else:
+                        soft_rows += 1
+                total = hard_rows + soft_rows
+                if total == 0:
+                    return "missing class_scores"
+                if hard_rows == total:
+                    return f"hard one-hot ({hard_rows}/{total})"
+                if soft_rows == total:
+                    return f"soft probabilities ({soft_rows}/{total})"
+                return f"mixed soft/hard ({soft_rows}/{total} soft)"
+
+            performance_rows = []
+            if not complete_top_n_model_df.empty:
+                for _, perf_model_row in complete_top_n_model_df.iterrows():
+                    perf_model_id = perf_model_row.get("Model ID")
+                    perf_model_id_int = _model_id_as_int(perf_model_id)
                     model_results_df = (
-                        top_n_existing_df[top_n_existing_df["Model ID"] == perf_model_id_int].copy()
-                        if perf_model_id_int is not None and not top_n_existing_df.empty
+                        top_n_existing_df[_result_matches_model_row(top_n_existing_df, perf_model_row.to_dict())].copy()
+                        if not top_n_existing_df.empty
                         else pd.DataFrame()
                     )
                     metrics = compute_inference_metrics(model_results_df)
+                    score_type = _score_type_for_model(model_results_df)
                     rank_value = perf_model_row.get("#", model_number_map.get(perf_model_row.get("_selection_key"), "?"))
                     head_label = perf_model_row.get("Best Classification Head") or "—"
                     head_config = perf_model_row.get("Best Head Config") or "—"
-                    head_score = perf_model_row.get("Best Head Score", np.nan)
+                    head_mcc = perf_model_row.get("Best Head MCC", np.nan)
+                    valid_auc = perf_model_row.get("Valid AUC", perf_model_row.get("Best Head AUC", np.nan))
+                    ece_value = perf_model_row.get("ECE", perf_model_row.get("ece", np.nan))
+                    head_n_aug = perf_model_row.get("N Aug", perf_model_row.get("Head N Aug", perf_model_row.get("N_Aug", "—")))
                     perf_row = {
                         "#": rank_value,
                         "Model ID": perf_model_id,
                         "Model Name": perf_model_row.get("Model Name"),
+                        "N_Calibration": perf_model_row.get("N_Calibration", perf_model_row.get("n_calibration", "—")),
+                        "N Aug": head_n_aug,
                         "Best Classification Head": head_label,
                         "Best Head Config": head_config,
-                        "Best Head Score": fmt_metric(head_score),
+                        "Valid MCC": fmt_metric(head_mcc),
+                        "Valid AUC": fmt_metric(valid_auc),
+                        "Score Type": score_type,
+                        "ECE": fmt_metric(ece_value),
                         "ACC": fmt_metric(metrics["ACC"]),
                         "MCC": fmt_metric(metrics["MCC"]),
                         "AUC": fmt_metric(metrics["AUC"]),
@@ -839,7 +1504,10 @@ def render(ctx):
             if performance_rows:
                 _top_n_perf_df = pd.DataFrame(performance_rows)
                 st.session_state["inference_topn_performance_df"] = _top_n_perf_df.copy()
-                st.dataframe(_arrow_safe_dataframe(_top_n_perf_df), use_container_width=True)
+                st.dataframe(
+                    _arrow_safe_dataframe(_display_missing_values(_top_n_perf_df)),
+                    use_container_width=True,
+                )
             else:
                 st.info("No top-N inference results available yet.")
 
@@ -852,33 +1520,56 @@ def render(ctx):
                 key="inference_force_all_top_models",
             )
             if st.button("▶️ Compute inference for all images × selected top models", key="inference_run_all_top_models"):
-                from otitenet.app.analysis import run_analysis_on_file
+                from otitenet.app.analysis import clear_embedding_classifier_cache_for_args, run_analysis_on_file
                 total_jobs = int(len(inference_images) * len(top_n_model_df))
                 progress = st.progress(0)
+                status_placeholder = st.empty()
                 done_jobs = 0
                 try:
                     for _, batch_model_row in top_n_model_df.iterrows():
                         batch_model_dict = batch_model_row.drop(labels=["_selection_key"], errors="ignore").to_dict()
                         batch_model_args = args_from_inference_row(args, batch_model_dict)
+                        # Bulk inference must not re-encode the training split in this tab.
+                        # Missing train_encodings.npz should be fixed in artifacts/training instead.
                         batch_model_args.allow_inference_reencode = False
                         # Use the best learned-embedding classification head for this model,
                         # unless the selected sidebar model/head overrides it elsewhere.
                         batch_head_config = _best_head_config_for_args_global(batch_model_args)
                         _set_classifier_head_on_args_global(batch_model_args, batch_head_config)
-                        batch_model_id = batch_model_dict.get("Model ID")
+                        if force_all_models_inference:
+                            if clear_embedding_classifier_cache_for_args(batch_model_args, head_config=batch_head_config):
+                                st.caption(
+                                    f"Cleared cached classifier for {batch_model_args.model_name} "
+                                    f"({_head_config_label_global(batch_head_config)})."
+                                )
                         batch_filenames = [os.path.basename(img) for img in inference_images]
-                        if force_all_models_inference and batch_model_id is not None and batch_filenames:
-                            placeholders = ",".join(["%s"] * len(batch_filenames))
-                            cursor.execute(
-                                f"""
-                                DELETE FROM results
-                                WHERE person_id=%s AND model_id=%s AND filename IN ({placeholders})
-                                """,
-                                tuple([st.session_state.person_id, batch_model_id] + batch_filenames),
+                        if force_all_models_inference and batch_filenames:
+                            deleted = _delete_existing_results_for_model_row(
+                                cursor,
+                                conn,
+                                st.session_state.person_id,
+                                batch_filenames,
+                                batch_model_dict,
+                                base_args=args,
                             )
-                            conn.commit()
+                            if deleted:
+                                st.caption(f"Deleted {deleted} existing stored inference rows before recompute.")
                         for img_path in inference_images:
                             img_name = os.path.basename(img_path)
+                            model_label = (
+                                f"#{batch_model_dict.get('#', '?')} "
+                                f"{batch_model_args.model_name} "
+                                f"{_head_config_label_global(batch_head_config)}"
+                            )
+                            _report_inference_progress(
+                                status_placeholder,
+                                progress,
+                                "Top-N inference",
+                                done_jobs,
+                                total_jobs,
+                                model_label,
+                                img_name,
+                            )
                             with open(img_path, "rb") as f:
                                 image_bytes = f.read()
                             run_analysis_on_file(
@@ -895,7 +1586,26 @@ def render(ctx):
                             )
                             done_jobs += 1
                             progress.progress(min(1.0, done_jobs / max(total_jobs, 1)))
+                    refreshed_df = _fetch_latest_inference_results_for_models(top_n_model_ids, top_n_model_df)
+                    _complete_results, _complete_models, _incomplete_after_run = _complete_top_n_model_results(
+                        refreshed_df,
+                        top_n_model_df,
+                        [os.path.basename(img) for img in inference_images],
+                        base_args=args,
+                    )
+                    st.session_state["inference_topn_last_incomplete"] = _incomplete_after_run
+                    status_placeholder.success(f"Computed inference for {done_jobs} image/model jobs.")
                     st.success(f"Computed inference for {done_jobs} image/model jobs.")
+                    if _incomplete_after_run:
+                        st.warning(
+                            "Some Top-N models are still incomplete after recompute. "
+                            "They will stay excluded until every selected image has a stored result."
+                        )
+                        st.dataframe(
+                            _arrow_safe_dataframe(_display_missing_values(pd.DataFrame(_incomplete_after_run))),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
                     st.rerun()
                 except Exception as e:
                     st.error(f"Top-N inference failed: {e}")
@@ -912,9 +1622,11 @@ def render(ctx):
 
             selected_model_dict = key_to_row[selected_model_key]
             model_id = selected_model_dict.get("Model ID")
+            model_id_int = _model_id_as_int(model_id)
             model_name = selected_model_dict.get("Model Name")
             log_path = selected_model_dict.get("Log Path")
             model_args = args_from_inference_row(args, selected_model_dict)
+            model_args.allow_inference_reencode = False
 
             # Classification head used for this selected model. Default to the
             # best cached head for this model, but let the user override it here.
@@ -979,7 +1691,10 @@ def render(ctx):
                 "Decision rule: selected model first. Top-N voting is used only when selected-model confidence is below "
                 "the selected-model threshold."
             )
-            selected_model_existing_df = _fetch_latest_inference_results_for_models([model_id]) if model_id is not None else pd.DataFrame()
+            selected_model_existing_df = _fetch_latest_inference_results_for_models(
+                [model_id_int] if model_id_int is not None else [],
+                pd.DataFrame([selected_model_dict]),
+            )
 
             def _generate_gradcams_for_files(filenames, log_path_by_filename=None, skip_existing=True):
                 filenames = [str(name) for name in filenames if str(name or "").strip()]
@@ -1058,27 +1773,47 @@ def render(ctx):
             if st.button("▶️ Run Inference on All Images", key="inference_run_all"):
                 with st.spinner(f"Running inference on {len(inference_images)} images with {model_name}..."):
                     try:
-                        from otitenet.app.analysis import run_analysis_on_file
+                        from otitenet.app.analysis import clear_embedding_classifier_cache_for_args, run_analysis_on_file
 
                         inference_filenames = [os.path.basename(img) for img in inference_images]
+                        if force_reanalyze_inference:
+                            if clear_embedding_classifier_cache_for_args(model_args, head_config=selected_head_config):
+                                st.caption(
+                                    f"Cleared cached classifier for {model_args.model_name} "
+                                    f"({_head_config_label_global(selected_head_config)})."
+                                )
 
                         # Force means replace old rows for this selected model/images, not accumulate duplicates.
-                        if force_reanalyze_inference and model_id is not None and inference_filenames:
-                            placeholders = ",".join(["%s"] * len(inference_filenames))
-                            cursor.execute(
-                                f"""
-                                DELETE FROM results
-                                WHERE person_id=%s AND model_id=%s AND filename IN ({placeholders})
-                                """,
-                                tuple([st.session_state.person_id, model_id] + inference_filenames),
+                        if force_reanalyze_inference and inference_filenames:
+                            deleted = _delete_existing_results_for_model_row(
+                                cursor,
+                                conn,
+                                st.session_state.person_id,
+                                inference_filenames,
+                                selected_model_dict,
+                                base_args=args,
                             )
-                            conn.commit()
+                            if deleted:
+                                st.caption(f"Deleted {deleted} existing stored inference rows before recompute.")
 
                         results = []
                         correct_count = 0
+                        total_jobs = len(inference_images)
+                        progress = st.progress(0)
+                        status_placeholder = st.empty()
 
-                        for img_path in inference_images:
+                        for img_idx, img_path in enumerate(inference_images):
                             img_name = os.path.basename(img_path)
+                            model_label = f"{model_name} {_head_config_label_global(selected_head_config)}"
+                            _report_inference_progress(
+                                status_placeholder,
+                                progress,
+                                "Selected-model inference",
+                                img_idx,
+                                total_jobs,
+                                model_label,
+                                img_name,
+                            )
                             with open(img_path, 'rb') as f:
                                 image_bytes = f.read()
 
@@ -1112,8 +1847,10 @@ def render(ctx):
                             for label, score in class_scores.items():
                                 result_row[f"Score {label}"] = fmt_confidence(score)
                             results.append(result_row)
+                            progress.progress(min(1.0, len(results) / max(total_jobs, 1)))
 
                         accuracy = correct_count / len(results) if results else 0
+                        status_placeholder.success(f"Computed inference for {len(results)} image jobs.")
 
                         st.divider()
                         st.subheader("📊 Performance Summary")
@@ -1124,6 +1861,12 @@ def render(ctx):
                             st.metric("Total Images", len(results))
 
                         st.success(f"Inference completed: {correct_count}/{len(results)} correct ({accuracy:.2%})")
+                        if results:
+                            st.dataframe(
+                                _arrow_safe_dataframe(pd.DataFrame(results)),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
 
                     except Exception as e:
                         st.error(f"Inference failed: {e}")
@@ -1136,8 +1879,20 @@ def render(ctx):
 
             inference_filenames = [os.path.basename(img) for img in inference_images]
             existing_results = []
+            existing_df_from_fetch = _fetch_latest_inference_results_for_models(
+                [model_id_int] if model_id_int is not None else [],
+                pd.DataFrame([selected_model_dict]),
+            )
 
-            if model_id is not None and inference_filenames:
+            if not existing_df_from_fetch.empty:
+                existing_results = list(
+                    existing_df_from_fetch[
+                        ["Filename", "Prediction", "Confidence", "Timestamp", "Log Path", "Class Scores"]
+                        if "Class Scores" in existing_df_from_fetch.columns
+                        else ["Filename", "Prediction", "Confidence", "Timestamp", "Log Path"]
+                    ].itertuples(index=False, name=None)
+                )
+            elif model_id_int is not None and inference_filenames:
                 placeholders = ",".join(["%s"] * len(inference_filenames))
                 try:
                     cursor.execute(
@@ -1147,7 +1902,7 @@ def render(ctx):
                         WHERE person_id=%s AND model_id=%s AND filename IN ({placeholders})
                         ORDER BY timestamp DESC
                         """,
-                        tuple([st.session_state.person_id, model_id] + inference_filenames),
+                        tuple([st.session_state.person_id, model_id_int] + inference_filenames),
                     )
                 except Exception:
                     # Backward-compatible fallback if class_scores column is unavailable.
@@ -1158,7 +1913,7 @@ def render(ctx):
                         WHERE person_id=%s AND model_id=%s AND filename IN ({placeholders})
                         ORDER BY timestamp DESC
                         """,
-                        tuple([st.session_state.person_id, model_id] + inference_filenames),
+                        tuple([st.session_state.person_id, model_id_int] + inference_filenames),
                     )
                 existing_results = cursor.fetchall()
 
@@ -1305,11 +2060,7 @@ def render(ctx):
                     ).reset_index()
                     st.dataframe(_arrow_safe_dataframe(per_class_metrics_df), use_container_width=True)
 
-                _show_decision_metrics(
-                    "Selected model with threshold/fallback metrics",
-                    existing_df,
-                    "Decision",
-                )
+                _show_inference_score_comparison(existing_df, decision_col="Decision")
                 _plot_one_vs_rest_roc(existing_df, "Selected model inference ROC curves")
                 _render_threshold_heatmap(existing_df, require_both_thresholds)
 

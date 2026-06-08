@@ -365,9 +365,10 @@ def _load_top_models(ctx, top_n):
             pass
 
     try:
-        from otitenet.app.pages.leaderboard import load_best_models_table
+        from otitenet.app.pages.leaderboard import apply_active_top_models_selection, load_best_models_table
 
         df = load_best_models_table(ctx.cursor, task=active_task)
+        df = apply_active_top_models_selection(df)
         df = attach_task_column(df)
         df = filter_models_df_by_task(df, active_task)
         df = _apply_sidebar_split_filter(df)
@@ -554,14 +555,54 @@ def _render_charts(heads_df):
         st.markdown("#### Mean Valid MCC by classifier family")
         st.bar_chart(family_df.set_index("Classifier")["Mean_Valid_MCC"])
 
-    # Show only the best head per Model ID in the comparison table, with short train_datasets column
+    # Show only the best head per Model ID in the comparison table.
     if best is not None and len(best) > 0:
         comp_df = best.copy()
-        # Add short train_datasets column if present
-        if "train_datasets" in comp_df.columns:
-            comp_df["Short Train Datasets"] = comp_df["train_datasets"].apply(get_short_dataset_names)
+        comp_df = _dedupe_display_columns(comp_df)
         st.markdown("#### Classifier comparison across models (best head per model)")
         st.dataframe(comp_df, use_container_width=True)
+
+
+def _columns_same_values(df, left, right) -> bool:
+    if left not in df.columns or right not in df.columns:
+        return False
+    left_values = df[left].fillna("").astype(str).str.strip()
+    right_values = df[right].fillna("").astype(str).str.strip()
+    return bool(left_values.equals(right_values))
+
+
+def _dedupe_display_columns(df):
+    """Drop display aliases only when they contain identical values."""
+    if df is None or df.empty:
+        return df
+    display_df = df.copy()
+    preferred_aliases = {
+        "Train Datasets": ["train_datasets", "Short Train Datasets"],
+        "Valid Dataset": ["valid_dataset", "Short Valid Dataset"],
+        "Test Dataset": ["test_dataset", "Short Test Dataset"],
+        "Model": ["Model Name", "model_name"],
+        "Model ID": ["model_id", "id"],
+        "N Aug": ["n_aug", "N_Aug", "Head N Aug", "best_head_n_aug"],
+        "Config": ["Head Config", "best_head_config"],
+        "Head": ["Best Classification Head", "best_head_name"],
+        "Valid MCC": ["valid_mcc", "Best Head MCC"],
+        "Valid AUC": ["valid_auc", "Best Head AUC"],
+    }
+    drop_cols = set()
+    for preferred, aliases in preferred_aliases.items():
+        if preferred not in display_df.columns:
+            continue
+        for alias in aliases:
+            if alias in display_df.columns and _columns_same_values(display_df, preferred, alias):
+                drop_cols.add(alias)
+
+    for col in list(display_df.columns):
+        if str(col).startswith("_"):
+            drop_cols.add(col)
+
+    if drop_cols:
+        display_df = display_df.drop(columns=[c for c in drop_cols if c in display_df.columns])
+    return display_df
 
 
 def _render_head_tables(heads_df):
@@ -958,15 +999,24 @@ def _evaluate_classifier_metrics(clf, X, y, class_names=None, prefix: str | None
 
 def _prototype_metrics(proto_vecs, proto_labels, X, y, class_names=None, prefix: str | None = None) -> Dict[str, float]:
     try:
+        from otitenet.app.inference import prototype_distance_probabilities_from_distances
+
         dists = np.linalg.norm(X[:, None, :] - proto_vecs[None, :, :], axis=2)
-        pred = proto_labels[np.argmin(dists, axis=1)]
         labels = np.unique(proto_labels)
-        scores = []
+        scores = np.zeros((X.shape[0], len(labels)), dtype=float)
         for label in labels:
             mask = proto_labels == label
             label_dist = np.min(dists[:, mask], axis=1) if np.any(mask) else np.full(X.shape[0], np.inf)
-            scores.append(-label_dist)
-        score_arr = np.vstack(scores).T if scores else np.empty((X.shape[0], 0))
+            for row_idx, dist in enumerate(label_dist):
+                scores[row_idx, np.where(labels == label)[0][0]] = float(dist)
+        prob_rows = []
+        for row_distances in scores:
+            prob_map = prototype_distance_probabilities_from_distances(
+                {label: row_distances[idx] for idx, label in enumerate(labels)}
+            )
+            prob_rows.append([prob_map.get(label, 0.0) for label in labels])
+        score_arr = np.asarray(prob_rows, dtype=float)
+        pred = labels[np.argmax(score_arr, axis=1)] if score_arr.size else np.asarray([])
         return _prediction_metrics(y, pred, scores=score_arr, classes=labels, class_names=class_names, prefix=prefix)
     except Exception:
         return {"mcc": np.nan, "accuracy": np.nan, "auc": np.nan, "ece": np.nan, "brier": np.nan}
@@ -1089,6 +1139,55 @@ def _encode_splits_for_args(_args):
         raise RuntimeError("Could not encode train/valid embeddings.")
 
     return encoded
+
+
+def _save_encoded_splits_for_inference(_args, encoded: Dict[str, Any]) -> list[str]:
+    """Persist learned-head embeddings so inference never has to re-encode training data."""
+    if not isinstance(encoded, dict):
+        return []
+
+    destinations = []
+    for attr in ("log_path", "source_run_log_path", "Source Run Path"):
+        value = str(getattr(_args, attr, "") or "").strip()
+        if value:
+            destinations.append(value)
+    cache_path = get_optimization_cache_file_path(_args)
+    cache_dir = os.path.dirname(cache_path)
+    if cache_dir:
+        destinations.append(cache_dir)
+
+    try:
+        params = get_model_params_path(_args)
+        full_dir = os.path.join(f"logs/best_models/{_args.task}/{_args.model_name}", params)
+        destinations.append(full_dir)
+    except Exception:
+        pass
+
+    written = []
+    seen = set()
+    for dest_dir in destinations:
+        if not dest_dir or dest_dir in seen:
+            continue
+        seen.add(dest_dir)
+        os.makedirs(dest_dir, exist_ok=True)
+        for split in ["train", "valid", "test"]:
+            split_payload = encoded.get(split)
+            if not isinstance(split_payload, dict):
+                continue
+            embeddings = split_payload.get("X")
+            cats = split_payload.get("y")
+            if embeddings is None or cats is None or len(embeddings) == 0:
+                continue
+            npz_path = os.path.join(dest_dir, f"{split}_encodings.npz")
+            np.savez(
+                npz_path,
+                embeddings=np.asarray(embeddings),
+                cats=np.asarray(cats),
+                labels=np.asarray([str(label) for label in encoded.get("_class_names", [])]),
+            )
+            written.append(npz_path)
+
+    return written
 
 
 def _split_metric_fields(train_metrics, valid_metrics, test_metrics=None, all_metrics=None) -> Dict[str, Any]:
@@ -1340,6 +1439,7 @@ def train_heads_for_args(
 ):
     """Compute learned-embedding classifier heads and write the optimization cache."""
     encoded = _encode_splits_for_args(_args)
+    encoded_artifact_paths = _save_encoded_splits_for_inference(_args, encoded)
 
     X_train = encoded["train"]["X"]
     y_train = encoded["train"]["y"]
@@ -1364,6 +1464,8 @@ def train_heads_for_args(
         "train_datasets": getattr(_args, "train_datasets", ""),
         "valid_dataset": getattr(_args, "valid_dataset", ""),
         "test_dataset": getattr(_args, "test_dataset", ""),
+        "encoded_artifact_paths": encoded_artifact_paths,
+        "train_encodings_path": next((p for p in encoded_artifact_paths if os.path.basename(p) == "train_encodings.npz"), None),
     }
 
     total_heads = 0
@@ -1471,10 +1573,11 @@ def _clear_existing_heads_cache():
 
 def _refresh_leaderboard_state_after_head_training(ctx) -> None:
     try:
-        from otitenet.app.pages.leaderboard import load_best_models_table, _update_model_number_map
+        from otitenet.app.pages.leaderboard import apply_active_top_models_selection, load_best_models_table, _update_model_number_map
 
         active_task = st.session_state.get("production_task") or getattr(ctx.args, "task", None)
         leaderboard_df = load_best_models_table(ctx.cursor, task=active_task)
+        leaderboard_df = apply_active_top_models_selection(leaderboard_df)
         _update_model_number_map(leaderboard_df)
         st.session_state["best_models_table"] = leaderboard_df
     except Exception as e:
@@ -1701,6 +1804,13 @@ def _persist_best_head_metrics_to_csv_registries(payload: Dict[str, Any]) -> Non
 
     _update_csv_rows("completed_runs_metrics.csv", _completed_match, completed_values)
 
+    try:
+        from otitenet.app.database import cleanup_duplicate_registry_csvs
+
+        cleanup_duplicate_registry_csvs()
+    except Exception:
+        pass
+
 
 def _persist_best_head_metrics_to_registry(ctx, model_row, model_args, result) -> None:
     payload = _head_metrics_payload(model_row, model_args, result)
@@ -1811,9 +1921,9 @@ def _persist_best_head_metrics_to_registry(ctx, model_row, model_args, result) -
 
     where_parts = []
     where_values = []
-    if not _is_blank_value(payload.get("model_id")):
+    if _int_like_value(payload.get("model_id")):
         where_parts.append("id = %s")
-        where_values.append(payload.get("model_id"))
+        where_values.append(int(str(payload.get("model_id")).strip()))
 
     path_values = [
         payload.get("log_path"),
@@ -1890,6 +2000,16 @@ def _metric_present(value) -> bool:
         return not pd.isna(value)
     except Exception:
         return True
+
+
+def _int_like_value(value) -> bool:
+    if _is_blank_value(value):
+        return False
+    try:
+        int(str(value).strip())
+        return True
+    except Exception:
+        return False
 
 
 def _load_n_aug_cache_entry(_args, n_aug: int) -> Tuple[Dict[str, Any] | None, str]:
@@ -2767,8 +2887,9 @@ def render(ctx):
     if reload_clicked:
         _clear_existing_heads_cache()
         try:
-            from otitenet.app.pages.leaderboard import load_best_models_table, _update_model_number_map
+            from otitenet.app.pages.leaderboard import apply_active_top_models_selection, load_best_models_table, _update_model_number_map
             leaderboard_df = load_best_models_table(ctx.cursor, task=active_task)
+            leaderboard_df = apply_active_top_models_selection(leaderboard_df)
             _update_model_number_map(leaderboard_df)
         except Exception as e:
             st.warning(f"Could not refresh leaderboard table after reload: {e}")
@@ -2854,6 +2975,14 @@ def render(ctx):
     filtered_df = _render_filters(heads_df)
 
     _render_charts(filtered_df)
+
+    try:
+        from otitenet.app.pages.leaderboard import render_validation_threshold_heatmap
+
+        heatmap_models_df = _load_top_models(ctx, top_n=load_top_n)
+        render_validation_threshold_heatmap(heatmap_models_df, page_key="learned_embedding")
+    except Exception as e:
+        st.warning(f"Could not render validation threshold heatmap: {e}")
 
     st.divider()
 

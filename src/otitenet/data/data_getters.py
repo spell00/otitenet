@@ -11,7 +11,7 @@ from ..data.dataset import Dataset2, Dataset1
 from sklearn.preprocessing import LabelEncoder
 from ..data.dataset_paths import resolve_processed_dataset_path
 from ..data.labels import label_scheme_for_task, normalize_label
-from torchvision.transforms import v2 as transforms
+from ..utils.encoding_utils import get_base_transform, get_knn_augmentation_transform
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 
@@ -229,31 +229,10 @@ def get_images_loaders(data, random_recs, weighted_sampler,
     # Ensure n_aug is at least 1
     n_aug = max(1, int(n_aug))
     
-    # Build transforms; only normalize when requested
-    train_ops = [
-        transforms.ToImage(),
-        transforms.ToDtype(torch.float32, scale=True),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(degrees=(-180, 180)),
-        transforms.RandomApply(
-            nn.ModuleList([
-                transforms.RandomResizedCrop(
-                    size=size,
-                    scale=(0.8, 1.),
-                    ratio=(0.8, 1.2)
-                )
-            ]), p=0.5),
-    ]
-        
-    eval_ops = [
-        transforms.ToImage(),
-        transforms.ToDtype(torch.float32, scale=True),
-    ]
-    # Normalization is handled in get_images if requested
-
-    transform_train = transforms.Compose(train_ops)
-    transform = transforms.Compose(eval_ops)
+    # Shared transform definitions keep training loaders and encoding utilities equivalent.
+    # Normalization is handled in get_images if requested.
+    transform_train = get_knn_augmentation_transform(size)
+    transform = get_base_transform()
 
     # Use provided batch_encoder or create a new one
     if batch_encoder is None:

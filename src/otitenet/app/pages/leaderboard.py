@@ -2,6 +2,7 @@ import argparse
 import io
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -9,28 +10,41 @@ import pandas as pd
 import streamlit as st
 import torch
 from matplotlib import pyplot as plt
+from matplotlib.lines import Line2D
 from sklearn.decomposition import PCA
-from sklearn.metrics import auc as sk_auc, roc_curve
+from sklearn.metrics import accuracy_score, auc as sk_auc, matthews_corrcoef, roc_curve
+from sklearn.preprocessing import LabelEncoder
 
 from otitenet.app.display_metrics import (
     _arrow_safe_dataframe,
     _head_config_label_global,
 )
 from otitenet.app.model_loading import load_model_and_prototypes
-from otitenet.app.artifact_registry import preferred_model_artifact_dir, scan_best_models_registry
+from otitenet.app.artifact_registry import (
+    allow_legacy_best_models_artifacts,
+    preferred_model_artifact_dir,
+    scan_best_models_registry,
+)
+from otitenet.app.services.inference_results_service import labels_match
 from otitenet.app.utils import (
     _make_model_selection_key,
     _unique_preserve_order,
+    apply_selection_keys_to_models_df,
     attach_task_column,
+    best_cached_head_metrics_for_model_row,
     ensure_int,
     extract_params_from_log_path,
     filter_models_df_by_task,
     format_classifier_config,
     get_calibration_metrics,
+    get_model_order_metric,
     get_model_split_config,
     get_split_mcc_metrics,
+    metric_value_from_mapping,
     resolve_best_classifier_config,
+    sort_dataframe_by_model_metric,
     split_combo_key_from_row,
+    split_config_key,
 )
 from otitenet.app.utils_dataset_names import get_short_dataset_name, get_short_dataset_names
 from otitenet.data.data_getters import get_images_loaders
@@ -380,6 +394,8 @@ def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.Data
 
 def _models_dataframe_from_log_tree() -> pd.DataFrame:
     """Scan logs/best_models so freshly mirrored artifacts can appear before DB sync."""
+    if not allow_legacy_best_models_artifacts():
+        return pd.DataFrame()
     try:
         artifacts = scan_best_models_registry("logs/best_models")
     except Exception:
@@ -433,37 +449,172 @@ def _models_dataframe_from_log_tree() -> pd.DataFrame:
     return df
 
 
+def _dataset_path_from_manifest_value(value: Any) -> str:
+    dataset = str(value or "").strip().replace("\\", "/")
+    if dataset and "/" not in dataset and dataset.startswith("otite_ds_"):
+        parts = dataset.split("_", 3)
+        if len(parts) == 4:
+            dataset = f"{parts[0]}_{parts[1]}_{parts[2]}/{parts[3]}"
+    return dataset
+
+
+def _progress_manifest_models_dataframe(task: Optional[str] = None) -> pd.DataFrame:
+    task_text = str(task or "").strip()
+    roots = []
+    if task_text:
+        roots.append(os.path.join("logs", "progresses", task_text))
+    else:
+        roots.append(os.path.join("logs", "progresses"))
+
+    rows: List[Dict[str, Any]] = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            manifest_names = [
+                name for name in filenames
+                if name.startswith("PROD_") and name.endswith("_job_manifest.csv")
+            ]
+            if not manifest_names:
+                continue
+            for manifest_name in manifest_names:
+                manifest_path = os.path.join(dirpath, manifest_name)
+                try:
+                    manifest_df = pd.read_csv(manifest_path, dtype=str).fillna("")
+                except Exception:
+                    continue
+                if "job_state" in manifest_df.columns:
+                    manifest_df = manifest_df[manifest_df["job_state"].astype(str).str.lower() == "done"]
+                if task_text and "task" in manifest_df.columns:
+                    manifest_df = manifest_df[manifest_df["task"].astype(str) == task_text]
+                for _, row in manifest_df.iterrows():
+                    row_task = str(row.get("task") or task_text).strip()
+                    if not row_task:
+                        continue
+                    uuid = str(row.get("uuid") or "").strip()
+                    source_run_path = os.path.join("logs", row_task, uuid) if uuid else ""
+                    if source_run_path and not os.path.isdir(source_run_path):
+                        source_run_path = ""
+                    log_path = source_run_path or str(row.get("stdout_file") or row.get("log_file") or "").strip()
+                    if not log_path:
+                        continue
+                    classif_loss = str(row.get("classif_loss") or "").strip() or str(row.get("loss") or "").strip()
+                    split_key = split_config_key(row.get("train_datasets"), row.get("valid_dataset"), row.get("test_dataset"))
+                    rows.append(
+                        {
+                            "Model ID": str(row.get("exp_id") or row.get("job_id") or uuid or "").strip(),
+                            "Model Name": str(row.get("model") or "").strip(),
+                            "NSize": str(row.get("new_size") or "").strip(),
+                            "FGSM": str(row.get("fgsm") or "").strip(),
+                            "Prototypes": str(row.get("prototype") or row.get("prototypes") or "").strip(),
+                            "NPos": str(row.get("n_positives") or "").strip(),
+                            "NNeg": str(row.get("n_negatives") or "").strip(),
+                            "DLoss": str(row.get("dloss") or "").strip(),
+                            "Dist_Fct": str(row.get("dist_fct") or "").strip(),
+                            "Classif_Loss": classif_loss,
+                            "N_Calibration": str(row.get("n_calibration") or "").strip(),
+                            "Accuracy": np.nan,
+                            "MCC": np.nan,
+                            "Normalize": str(row.get("normalize") or "").strip(),
+                            "N_Neighbors": str(row.get("knn") or row.get("n_neighbors") or "").strip(),
+                            "Log Path": log_path,
+                            "Proto_Strat": str(row.get("prototype_strategy") or "").strip(),
+                            "Proto_Comp": str(row.get("prototype_components") or "").strip(),
+                            "train_datasets": str(row.get("train_datasets") or "").strip(),
+                            "valid_dataset": str(row.get("valid_dataset") or "").strip(),
+                            "test_dataset": str(row.get("test_dataset") or "").strip(),
+                            "split_config_key": split_key,
+                            "Artifact ID": uuid,
+                            "Best Model Dir": source_run_path or log_path,
+                            "Source Run Path": source_run_path,
+                            "Dataset": _dataset_path_from_manifest_value(row.get("dataset_name") or row.get("dataset_key")),
+                            "Source": "progress manifest",
+                            "Task": row_task,
+                        }
+                    )
+    return pd.DataFrame(rows)
+
+
 def _merge_db_and_log_tree_models(db_df: pd.DataFrame) -> pd.DataFrame:
     tree_df = _models_dataframe_from_log_tree()
     if tree_df.empty:
-        return db_df
-    if db_df is None or db_df.empty:
-        return tree_df
+        out = db_df
+    elif db_df is None or db_df.empty:
+        out = tree_df
+    else:
+        db_df = db_df.copy()
+        if "Source" not in db_df.columns:
+            db_df["Source"] = "database"
 
-    db_df = db_df.copy()
-    if "Source" not in db_df.columns:
-        db_df["Source"] = "database"
+        known_paths = set()
+        for col in ["Log Path", "Best Model Dir", "Source Run Path"]:
+            if col in db_df.columns:
+                known_paths.update(
+                    str(v).strip()
+                    for v in db_df[col].dropna().astype(str)
+                    if str(v).strip()
+                )
+
+        tree_df = tree_df[
+            ~tree_df["Log Path"].astype(str).str.strip().isin(known_paths)
+            & ~tree_df["Best Model Dir"].astype(str).str.strip().isin(known_paths)
+        ]
+        out = db_df if tree_df.empty else pd.concat([db_df, tree_df], ignore_index=True, sort=False)
+
+    manifest_df = _progress_manifest_models_dataframe()
+    if manifest_df.empty:
+        return out
+    if out is None or out.empty:
+        return manifest_df
 
     known_paths = set()
     for col in ["Log Path", "Best Model Dir", "Source Run Path"]:
-        if col in db_df.columns:
+        if col in out.columns:
             known_paths.update(
                 str(v).strip()
-                for v in db_df[col].dropna().astype(str)
+                for v in out[col].dropna().astype(str)
                 if str(v).strip()
             )
-
-    tree_df = tree_df[
-        ~tree_df["Log Path"].astype(str).str.strip().isin(known_paths)
-        & ~tree_df["Best Model Dir"].astype(str).str.strip().isin(known_paths)
+    manifest_df = manifest_df[
+        ~manifest_df["Log Path"].astype(str).str.strip().isin(known_paths)
+        & ~manifest_df["Best Model Dir"].astype(str).str.strip().isin(known_paths)
     ]
-    if tree_df.empty:
-        return db_df
+    if manifest_df.empty:
+        return out
+    return pd.concat([out, manifest_df], ignore_index=True, sort=False)
 
-    return pd.concat([db_df, tree_df], ignore_index=True, sort=False)
+
+def _recent_trained_heads_for_model(row: pd.Series) -> List[Dict[str, Any]]:
+    payload = st.session_state.get("learned_last_training_payload") or {}
+    recent_rows = payload.get("trained_head_rows") or []
+    if not recent_rows:
+        return []
+
+    model_id = row.get("Model ID") or row.get("id") or row.get("model_id")
+    log_path = str(row.get("Log Path") or row.get("log_path") or "").strip()
+    best_model_dir = str(row.get("Best Model Dir") or row.get("best_model_dir") or "").strip()
+    candidates = []
+
+    for recent in recent_rows:
+        if not isinstance(recent, dict):
+            continue
+        recent_model_id = recent.get("Model ID") or recent.get("id") or recent.get("model_id")
+        recent_log_path = str(recent.get("Log Path") or recent.get("log_path") or "").strip()
+        model_matches = model_id is not None and recent_model_id is not None and str(model_id) == str(recent_model_id)
+        path_matches = bool(recent_log_path and recent_log_path in {log_path, best_model_dir})
+        if model_matches or path_matches:
+            candidates.append(recent)
+
+    return candidates
 
 
-def _attach_metrics(df: pd.DataFrame) -> pd.DataFrame:
+def _active_calibration_split(page_key: str | None = None) -> str:
+    if page_key:
+        return str(st.session_state.get(_k(page_key, "calibration_split"), "valid"))
+    return str(st.session_state.get("leaderboard_calibration_split", "valid"))
+
+
+def _attach_metrics(df: pd.DataFrame, calibration_split: str = "valid") -> pd.DataFrame:
     df = df.copy()
 
     metric_cols = [
@@ -504,22 +655,31 @@ def _attach_metrics(df: pd.DataFrame) -> pd.DataFrame:
                 "Valid AUC": row.get("Valid AUC"),
                 "Test AUC": row.get("Test AUC"),
                 "All AUC": row.get("All AUC"),
-                "ECE": row.get("ECE"),
-                "Brier": row.get("Brier"),
+                "ECE": np.nan,
+                "Brier": np.nan,
             }
+        head_candidates = []
+        cached_head_metrics = best_cached_head_metrics_for_model_row(row.to_dict())
+        if cached_head_metrics:
+            head_candidates.append(cached_head_metrics)
         if _get_heads_for_model_args and args_from_model_row:
             try:
                 row_for_head_lookup = row.to_dict()
                 row_for_head_lookup["Log Path"] = best_model_dir
                 model_args = args_from_model_row(argparse.Namespace(), row_for_head_lookup)
                 head_rows, _ = _get_heads_for_model_args(model_args, row_for_head_lookup)
-                # The optimization cache is the source of truth after Tab 2 retraining.
-                # Persisted registry values are only a fallback because they can lag.
                 if head_rows:
-                    best_head = max(head_rows, key=lambda r: float(r.get("Valid MCC", float('-inf')) if r.get("Valid MCC") is not None else float('-inf')))
-                    head_metrics = best_head
+                    head_candidates.extend(head_rows)
             except Exception:
                 pass
+        head_candidates.extend(_recent_trained_heads_for_model(row))
+        # The optimization cache and just-trained rows are the source of truth
+        # after Tab 2 retraining. Persisted registry values are only a fallback.
+        if head_candidates:
+            head_metrics = max(
+                head_candidates,
+                key=lambda r: metric_value_from_mapping(r, default=float("-inf")),
+            )
         if head_metrics is None:
             head_metrics = registry_head_metrics
         if head_metrics:
@@ -529,17 +689,17 @@ def _attach_metrics(df: pd.DataFrame) -> pd.DataFrame:
                 df.at[idx, "Head"] = head_metrics.get("Head") or format_classifier_config(head_config)
             if head_metrics.get("N Aug") is not None:
                 df.at[idx, "Head N Aug"] = head_metrics.get("N Aug")
-            df.at[idx, "Train MCC"] = head_metrics.get("Train MCC", np.nan)
-            df.at[idx, "Valid MCC"] = head_metrics.get("Valid MCC", np.nan)
-            df.at[idx, "Test MCC"] = head_metrics.get("Test MCC", np.nan)
+            df.at[idx, "Train MCC"] = head_metrics.get("Train MCC", head_metrics.get("train_mcc", np.nan))
+            df.at[idx, "Valid MCC"] = head_metrics.get("Valid MCC", head_metrics.get("Best Valid MCC", head_metrics.get("valid_mcc", np.nan)))
+            df.at[idx, "Test MCC"] = head_metrics.get("Test MCC", head_metrics.get("Best Test MCC", head_metrics.get("test_mcc", np.nan)))
             df.at[idx, "All MCC"] = head_metrics.get("All MCC", head_metrics.get("all_mcc", np.nan))
             df.at[idx, "Valid Accuracy"] = head_metrics.get("Valid Accuracy", head_metrics.get("valid_accuracy", np.nan))
-            df.at[idx, "Train AUC"] = head_metrics.get("Train AUC", np.nan)
-            df.at[idx, "Valid AUC"] = head_metrics.get("Valid AUC", np.nan)
-            df.at[idx, "Test AUC"] = head_metrics.get("Test AUC", np.nan)
+            df.at[idx, "Train AUC"] = head_metrics.get("Train AUC", head_metrics.get("train_auc", np.nan))
+            df.at[idx, "Valid AUC"] = head_metrics.get("Valid AUC", head_metrics.get("Best Valid AUC", head_metrics.get("valid_auc", np.nan)))
+            df.at[idx, "Test AUC"] = head_metrics.get("Test AUC", head_metrics.get("Best Test AUC", head_metrics.get("test_auc", np.nan)))
             df.at[idx, "All AUC"] = head_metrics.get("All AUC", head_metrics.get("all_auc", np.nan))
-            df.at[idx, "ECE"] = head_metrics.get("ECE", head_metrics.get("ece", np.nan))
-            df.at[idx, "Brier"] = head_metrics.get("Brier", head_metrics.get("brier", np.nan))
+            df.at[idx, "ECE"] = np.nan
+            df.at[idx, "Brier"] = np.nan
             # Add any extra metrics (F1, Recall, etc.)
             for metric_name, metric_value in head_metrics.items():
                 if " F1 " in metric_name or " Recall " in metric_name or " Precision " in metric_name or " Support " in metric_name:
@@ -562,12 +722,8 @@ def _attach_metrics(df: pd.DataFrame) -> pd.DataFrame:
                             df[metric_name] = np.nan
                         df.at[idx, metric_name] = metric_value
 
-        calibration_metrics = get_calibration_metrics(log_path)
-        has_head_calibration = False
-        for cal_col in ["ECE", "Brier"]:
-            if cal_col in df.columns and pd.notna(pd.to_numeric(pd.Series([df.at[idx, cal_col]]), errors="coerce").iloc[0]):
-                has_head_calibration = True
-        if calibration_metrics and not calibration_metrics.get("error") and not has_head_calibration:
+        calibration_metrics = get_calibration_metrics(log_path, split=calibration_split)
+        if calibration_metrics and not calibration_metrics.get("error"):
             df.at[idx, "ECE"] = calibration_metrics.get("ece", np.nan)
             df.at[idx, "Brier"] = calibration_metrics.get("brier", np.nan)
 
@@ -645,7 +801,7 @@ def _filter_models_df_by_sidebar_split(models_df: pd.DataFrame) -> pd.DataFrame:
     return filtered_df.reset_index(drop=True)
 
 
-def load_best_models_table(cursor, task: Optional[str] = None) -> pd.DataFrame:
+def load_best_models_table(cursor, task: Optional[str] = None, calibration_split: str = "valid") -> pd.DataFrame:
     rows, use_db_rank = _query_best_models(cursor)
     df = _models_dataframe_from_rows(rows, use_db_rank)
     df = _merge_db_and_log_tree_models(df)
@@ -661,7 +817,7 @@ def load_best_models_table(cursor, task: Optional[str] = None) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df = _attach_metrics(df)
+    df = _attach_metrics(df, calibration_split=calibration_split)
     df = _order_model_columns(df)
     return df
 
@@ -710,6 +866,7 @@ def compute_best_proto_mcc_for_args(
     train.n_cats = len(unique_labels)
     train.unique_batches = unique_batches
     train.unique_labels = unique_labels
+    train._batch_encoder = LabelEncoder().fit(np.asarray(unique_batches))
     train.epoch = 1
     train.model = model
     train.params = {"n_neighbors": int(getattr(_args, "n_neighbors", 1))}
@@ -731,6 +888,7 @@ def compute_best_proto_mcc_for_args(
         prototypes=prototypes,
         size=getattr(_args, "new_size", 64),
         normalize=getattr(_args, "normalize", "no"),
+        batch_encoder=train._batch_encoder,
     )
 
     with torch.no_grad():
@@ -812,6 +970,7 @@ def compute_pca_for_args(_args, proto_strategies=None, proto_components=1):
     train.n_cats = len(unique_labels)
     train.unique_batches = unique_batches
     train.unique_labels = unique_labels
+    train._batch_encoder = LabelEncoder().fit(np.asarray(unique_batches))
     train.epoch = 1
     train.model = model
     train.params = {"n_neighbors": int(getattr(_args, "n_neighbors", 1))}
@@ -833,37 +992,45 @@ def compute_pca_for_args(_args, proto_strategies=None, proto_components=1):
         prototypes=prototypes,
         size=getattr(_args, "new_size", 64),
         normalize=getattr(_args, "normalize", "no"),
+        batch_encoder=train._batch_encoder,
     )
 
     with torch.no_grad():
-        _, lists, _ = train.loop("train", None, 0, loaders["train"], lists, traces)
-        if "valid" in loaders:
-            _, lists, _ = train.loop("valid", None, 0, loaders["valid"], lists, traces)
-        if "test" in loaders:
+        for group in ["train", "valid", "test", "calibration"]:
+            if group not in loaders:
+                continue
             try:
-                _, lists, _ = train.loop("test", None, 0, loaders["test"], lists, traces)
+                _, lists, _ = train.loop(group, None, 0, loaders[group], lists, traces)
             except Exception:
-                pass
+                if group in {"train", "valid"}:
+                    raise
 
     encs = []
     cats = []
-    batches = []
+    datasets = []
+    splits = []
 
-    for grp in ["train", "valid", "test"]:
+    for grp in ["train", "valid", "test", "calibration"]:
         if lists.get(grp, {}).get("encoded_values"):
-            encs.append(np.concatenate(lists[grp]["encoded_values"]))
-            cats.append(np.concatenate(lists[grp]["cats"]))
+            grp_encs = np.concatenate(lists[grp]["encoded_values"])
+            grp_cats = np.concatenate(lists[grp]["cats"])
+            encs.append(grp_encs)
+            cats.append(grp_cats)
 
             try:
-                batches.append(np.concatenate(lists[grp]["domains"]))
+                grp_datasets = np.concatenate(lists[grp]["domains"]).astype(str)
             except Exception:
-                batches.append(np.array([grp] * len(np.concatenate(lists[grp]["cats"]))))
+                grp_datasets = np.array([grp] * len(grp_cats), dtype=str)
+            datasets.append(grp_datasets)
+            splits.append(np.array([grp] * len(grp_cats), dtype=str))
 
     if not encs:
         raise RuntimeError("No embeddings available to plot.")
 
     all_encs = np.concatenate(encs)
     all_cats = np.concatenate(cats)
+    all_datasets = np.concatenate(datasets) if datasets else np.array(["unknown"] * len(all_cats), dtype=str)
+    all_splits = np.concatenate(splits) if splits else np.array(["unknown"] * len(all_cats), dtype=str)
 
     n_comp = min(3, all_encs.shape[1])
     pca = PCA(n_components=n_comp)
@@ -878,8 +1045,24 @@ def compute_pca_for_args(_args, proto_strategies=None, proto_components=1):
 
     strategy_markers = {"mean": "X", "kmeans": "*", "gmm": "P"}
     strategy_sizes = {"mean": 300, "kmeans": 500, "gmm": 400}
-
-    scatter = None
+    split_markers = {
+        "train": "o",
+        "valid": "^",
+        "test": "s",
+        "calibration": "D",
+    }
+    split_sizes = {
+        "train": 24,
+        "valid": 32,
+        "test": 32,
+        "calibration": 58,
+    }
+    dataset_values = sorted(pd.unique(pd.Series(all_datasets).astype(str)))
+    dataset_cmap = plt.get_cmap("tab20", max(1, len(dataset_values)))
+    dataset_colors = {
+        dataset: dataset_cmap(idx % dataset_cmap.N)
+        for idx, dataset in enumerate(dataset_values)
+    }
 
     for ax_idx, proto_strategy in enumerate(proto_strategies):
         ax = axes[ax_idx]
@@ -910,14 +1093,24 @@ def compute_pca_for_args(_args, proto_strategies=None, proto_components=1):
 
         proto_pca = pca.transform(proto_arr) if proto_arr is not None else None
 
-        scatter = ax.scatter(
-            encs_pca[:, 0],
-            encs_pca[:, 1],
-            c=all_cats,
-            cmap="tab20",
-            alpha=0.5,
-            s=20,
-        )
+        for dataset in dataset_values:
+            dataset_mask = all_datasets.astype(str) == str(dataset)
+            for split, marker in split_markers.items():
+                mask = dataset_mask & (all_splits == split)
+                if not np.any(mask):
+                    continue
+                is_calibration = split == "calibration"
+                ax.scatter(
+                    encs_pca[mask, 0],
+                    encs_pca[mask, 1],
+                    marker=marker,
+                    color=dataset_colors[dataset],
+                    alpha=0.82 if is_calibration else 0.52,
+                    s=split_sizes.get(split, 28),
+                    edgecolors="black" if is_calibration else "none",
+                    linewidths=1.1 if is_calibration else 0.0,
+                    zorder=4 if is_calibration else 2,
+                )
 
         if proto_pca is not None:
             marker = strategy_markers.get(proto_strategy, "*")
@@ -947,11 +1140,43 @@ def compute_pca_for_args(_args, proto_strategies=None, proto_components=1):
             ax.set_ylabel(f"PC2 ({explained[1]:.1f}%)")
         ax.grid(True, alpha=0.3)
 
-    if scatter is not None:
-        cbar = plt.colorbar(scatter, ax=axes[-1], pad=0.02)
-        cbar.set_label("Class ID")
+    dataset_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="None",
+            markerfacecolor=dataset_colors[dataset],
+            markeredgecolor="none",
+            markersize=7,
+            label=get_short_dataset_names(str(dataset)),
+        )
+        for dataset in dataset_values
+    ]
+    split_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker=marker,
+            linestyle="None",
+            color="black",
+            markerfacecolor="white",
+            markeredgecolor="black" if split == "calibration" else "none",
+            markersize=8 if split == "calibration" else 7,
+            label=split,
+        )
+        for split, marker in split_markers.items()
+        if np.any(all_splits == split)
+    ]
+    dataset_legend = None
+    if dataset_handles:
+        dataset_legend = axes[0].legend(handles=dataset_handles, title="Dataset", loc="upper left", fontsize=8, title_fontsize=9)
+    if split_handles:
+        if dataset_legend is not None and axes[0] is axes[-1]:
+            axes[0].add_artist(dataset_legend)
+        axes[-1].legend(handles=split_handles, title="Split", loc="upper right", fontsize=8, title_fontsize=9)
 
-    fig.suptitle("PCA with Prototypes (train/valid/test)", fontsize=14, y=1.02)
+    fig.suptitle("PCA with Prototypes (dataset color, split shape, calibration outlined)", fontsize=14, y=1.02)
     plt.tight_layout()
 
     fig_bytes = io.BytesIO()
@@ -1027,6 +1252,455 @@ def _load_prediction_csv_for_row(row_dict: Dict[str, Any], split: str) -> Tuple[
     return None, None
 
 
+def _validation_threshold_decision_for_row(
+    row,
+    confidence_threshold,
+    vote_threshold_pct,
+    require_both_thresholds,
+):
+    try:
+        confidence_value = float(row.get("Confidence"))
+    except Exception:
+        confidence_value = np.nan
+    try:
+        ensemble_vote_pct = float(row.get("Ensemble Raw Vote %"))
+    except Exception:
+        ensemble_vote_pct = np.nan
+
+    selected_prediction = row.get("Prediction")
+    ensemble_prediction = row.get("Ensemble Raw Prediction", "Unknown")
+    selected_passes = pd.notna(confidence_value) and confidence_value >= float(confidence_threshold)
+    ensemble_passes = pd.notna(ensemble_vote_pct) and ensemble_vote_pct >= float(vote_threshold_pct)
+
+    if require_both_thresholds:
+        return selected_prediction if selected_passes and ensemble_passes else "Unknown"
+    if selected_passes:
+        return selected_prediction
+    return ensemble_prediction if ensemble_passes and str(ensemble_prediction or "").strip() else "Unknown"
+
+
+def _threshold_metric_value(eval_df: pd.DataFrame, metric_name: str) -> float:
+    kept_df = eval_df[~eval_df["_Decision"].astype(str).str.lower().isin(["", "unknown", "na", "nan", "none"])].copy()
+    if metric_name == "Coverage":
+        return float(len(kept_df) / len(eval_df)) if len(eval_df) else np.nan
+    if metric_name.endswith("kept"):
+        if kept_df.empty:
+            return np.nan
+        if metric_name.startswith("ACC"):
+            return float(np.mean([
+                labels_match(pred, truth)
+                for pred, truth in zip(kept_df["_Decision"], kept_df["Ground Truth"])
+            ]))
+        try:
+            return float(matthews_corrcoef(
+                kept_df["Ground Truth"].astype(str).str.lower().values,
+                kept_df["_Decision"].astype(str).str.lower().values,
+            ))
+        except Exception:
+            return np.nan
+
+    pred = eval_df["_Decision"].astype(str).str.lower().replace({"unknown": "__unknown__"})
+    truth = eval_df["Ground Truth"].astype(str).str.lower()
+    if metric_name.startswith("ACC"):
+        return float(accuracy_score(truth.values, pred.values))
+    try:
+        return float(matthews_corrcoef(truth.values, pred.values))
+    except Exception:
+        return np.nan
+
+
+def _threshold_metric_from_arrays(decisions: np.ndarray, truth: np.ndarray, metric_name: str) -> float:
+    decision_text = pd.Series(decisions).fillna("").astype(str).str.strip().str.lower().to_numpy()
+    truth_text = pd.Series(truth).fillna("").astype(str).str.strip().str.lower().to_numpy()
+    kept = ~np.isin(decision_text, ["", "unknown", "na", "nan", "none"])
+    if metric_name == "Coverage":
+        return float(np.mean(kept)) if len(kept) else np.nan
+    if metric_name.endswith("kept"):
+        if not np.any(kept):
+            return np.nan
+        if metric_name.startswith("ACC"):
+            return float(np.mean([
+                labels_match(pred, actual)
+                for pred, actual in zip(decision_text[kept], truth_text[kept])
+            ]))
+        try:
+            return float(matthews_corrcoef(truth_text[kept], decision_text[kept]))
+        except Exception:
+            return np.nan
+
+    scored_decisions = np.where(kept, decision_text, "__unknown__")
+    if metric_name.startswith("ACC"):
+        return float(np.mean([
+            labels_match(pred, actual)
+            for pred, actual in zip(scored_decisions, truth_text)
+        ]))
+    try:
+        return float(matthews_corrcoef(truth_text, scored_decisions))
+    except Exception:
+        return np.nan
+
+
+def _compute_threshold_heat_arrays(
+    decision_df: pd.DataFrame,
+    metric_name: str,
+    coverage_metric_name: str,
+    require_both_thresholds: bool,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    conf_values = np.round(np.linspace(0.0, 1.0, 21), 2)
+    vote_values = np.arange(0.0, 101.0, 5.0)
+    heat = np.full((len(vote_values), len(conf_values)), np.nan, dtype=float)
+    coverage_metric_heat = np.full((len(vote_values), len(conf_values)), np.nan, dtype=float)
+    coverage_heat = np.full((len(vote_values), len(conf_values)), np.nan, dtype=float)
+
+    valid_truth = ~decision_df["Ground Truth"].astype(str).str.lower().isin(["", "unknown", "na", "nan", "none"])
+    base_df = decision_df[valid_truth].copy()
+    if base_df.empty:
+        return conf_values, vote_values, heat, coverage_metric_heat, coverage_heat
+
+    truth = base_df["Ground Truth"].astype(str).to_numpy()
+    selected_pred = base_df["Prediction"].fillna("").astype(str).to_numpy()
+    ensemble_pred = base_df["Ensemble Raw Prediction"].fillna("").astype(str).to_numpy()
+    ensemble_has_prediction = ~np.isin(
+        pd.Series(ensemble_pred).str.strip().str.lower().to_numpy(),
+        ["", "unknown", "na", "nan", "none"],
+    )
+    confidence = pd.to_numeric(base_df["Confidence"], errors="coerce").to_numpy(dtype=float)
+    ensemble_vote = pd.to_numeric(base_df["Ensemble Raw Vote %"], errors="coerce").to_numpy(dtype=float)
+
+    for y_idx, vote_threshold in enumerate(vote_values):
+        ensemble_passes = np.isfinite(ensemble_vote) & (ensemble_vote >= float(vote_threshold))
+        for x_idx, confidence_threshold in enumerate(conf_values):
+            selected_passes = np.isfinite(confidence) & (confidence >= float(confidence_threshold))
+            if require_both_thresholds:
+                decisions = np.where(selected_passes & ensemble_passes, selected_pred, "Unknown")
+            else:
+                decisions = np.where(
+                    selected_passes,
+                    selected_pred,
+                    np.where(ensemble_passes & ensemble_has_prediction, ensemble_pred, "Unknown"),
+                )
+            heat[y_idx, x_idx] = _threshold_metric_from_arrays(decisions, truth, metric_name)
+            coverage_metric_heat[y_idx, x_idx] = _threshold_metric_from_arrays(decisions, truth, coverage_metric_name)
+            coverage_heat[y_idx, x_idx] = _threshold_metric_from_arrays(decisions, truth, "Coverage")
+
+    return conf_values, vote_values, heat, coverage_metric_heat, coverage_heat
+
+
+def _render_coverage_threshold_plot(
+    conf_values,
+    vote_values,
+    metric_heat,
+    coverage_heat,
+    metric_name: str,
+    title_prefix: str,
+    x_label: str,
+) -> None:
+    x_grid, y_grid = np.meshgrid(conf_values, vote_values)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    im = ax.imshow(
+        metric_heat,
+        origin="lower",
+        aspect="auto",
+        cmap="viridis",
+        extent=[
+            float(np.min(conf_values)),
+            float(np.max(conf_values)),
+            float(np.min(vote_values)),
+            float(np.max(vote_values)),
+        ],
+        interpolation="nearest",
+    )
+    finite_metric = metric_heat[np.isfinite(metric_heat)]
+    if finite_metric.size:
+        im.set_clim(float(np.nanmin(finite_metric)), float(np.nanmax(finite_metric)))
+    finite_coverage = coverage_heat[np.isfinite(coverage_heat)]
+    if finite_coverage.size:
+        levels = [
+            level for level in [0.25, 0.50, 0.75, 0.90]
+            if finite_coverage.min() <= level <= finite_coverage.max()
+        ]
+        if levels:
+            contours = ax.contour(x_grid, y_grid, coverage_heat, levels=levels, colors="black", linewidths=1.1)
+            ax.clabel(contours, inline=True, fontsize=8, fmt=lambda value: f"{100.0 * value:.0f}%")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Top-N validation ensemble vote threshold (%)")
+    ax.set_title(f"{title_prefix}: {metric_name} heatmap with coverage contours")
+    fig.colorbar(im, ax=ax, label=metric_name)
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+
+def _prediction_frame_for_thresholds(pred_df: pd.DataFrame, model_key: str) -> pd.DataFrame:
+    if pred_df is None or pred_df.empty or "label" not in pred_df.columns:
+        return pd.DataFrame()
+
+    prob_cols = [c for c in pred_df.columns if str(c).startswith("probs_")]
+    if not prob_cols:
+        return pd.DataFrame()
+
+    probs = pred_df[prob_cols].apply(pd.to_numeric, errors="coerce")
+    if probs.empty:
+        return pd.DataFrame()
+
+    labels = [str(c)[len("probs_"):] for c in prob_cols]
+    best_idx = probs.to_numpy(dtype=float).argmax(axis=1)
+    confidence = probs.max(axis=1)
+    pred_from_probs = pd.Series([labels[i] for i in best_idx], index=pred_df.index)
+    prediction = pred_df["pred"] if "pred" in pred_df.columns else pred_from_probs
+    if "name" in pred_df.columns:
+        sample_key = pred_df["name"].astype(str)
+    else:
+        sample_key = pd.Series([str(i) for i in range(len(pred_df))], index=pred_df.index)
+
+    return pd.DataFrame(
+        {
+            "_sample_key": sample_key.astype(str),
+            "Ground Truth": pred_df["label"].astype(str),
+            f"Prediction {model_key}": prediction.astype(str),
+            f"Confidence {model_key}": pd.to_numeric(confidence, errors="coerce"),
+        }
+    )
+
+
+def _build_validation_threshold_frame(model_rows: pd.DataFrame, selected_idx: int, max_models: int) -> pd.DataFrame:
+    if model_rows is None or model_rows.empty:
+        return pd.DataFrame()
+
+    selected_idx = max(0, min(int(selected_idx), len(model_rows) - 1))
+    rows = model_rows.head(int(max_models)).copy().reset_index(drop=True)
+    if selected_idx >= len(rows):
+        selected_idx = 0
+
+    frames = []
+    model_keys = []
+    for idx, row in rows.iterrows():
+        pred_df, _path = _load_prediction_csv_for_row(row.to_dict(), "valid")
+        frame = _prediction_frame_for_thresholds(pred_df, f"m{idx}")
+        if frame.empty:
+            continue
+        frames.append(frame)
+        model_keys.append(f"m{idx}")
+
+    if not frames or f"m{selected_idx}" not in model_keys:
+        return pd.DataFrame()
+
+    merged = frames[0]
+    for frame in frames[1:]:
+        merged = merged.merge(
+            frame.drop(columns=["Ground Truth"], errors="ignore"),
+            on="_sample_key",
+            how="inner",
+        )
+    if merged.empty:
+        return pd.DataFrame()
+
+    selected_key = f"m{selected_idx}"
+    prediction_cols = [f"Prediction {key}" for key in model_keys if f"Prediction {key}" in merged.columns]
+    if not prediction_cols:
+        return pd.DataFrame()
+
+    ensemble_predictions = []
+    ensemble_votes = []
+    for _, row in merged.iterrows():
+        votes = [
+            str(row.get(col) or "").strip()
+            for col in prediction_cols
+            if str(row.get(col) or "").strip()
+        ]
+        if not votes:
+            ensemble_predictions.append("Unknown")
+            ensemble_votes.append(np.nan)
+            continue
+        counts = pd.Series(votes).value_counts()
+        winner = str(counts.index[0])
+        ensemble_predictions.append(winner)
+        ensemble_votes.append(100.0 * float(counts.iloc[0]) / float(len(votes)))
+
+    return pd.DataFrame(
+        {
+            "Ground Truth": merged["Ground Truth"],
+            "Prediction": merged[f"Prediction {selected_key}"],
+            "Confidence": merged[f"Confidence {selected_key}"],
+            "Ensemble Raw Prediction": ensemble_predictions,
+            "Ensemble Raw Vote %": ensemble_votes,
+        }
+    )
+
+
+def _render_threshold_heatmap_from_decisions(
+    decision_df: pd.DataFrame,
+    page_key: str,
+    require_both_thresholds: bool,
+    metric_name: str,
+    coverage_metric_name: str,
+) -> None:
+    if decision_df is None or decision_df.empty:
+        st.info("No validation predictions available for threshold heatmap.")
+        return
+
+    conf_values, vote_values, heat, coverage_metric_heat, coverage_heat = _compute_threshold_heat_arrays(
+        decision_df,
+        metric_name=metric_name,
+        coverage_metric_name=coverage_metric_name,
+        require_both_thresholds=require_both_thresholds,
+    )
+    if np.all(np.isnan(heat)):
+        st.info("No validation labels available for threshold heatmap.")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    im = ax.imshow(heat, origin="lower", aspect="auto", cmap="viridis")
+    ax.set_xticks(np.arange(len(conf_values))[::2])
+    ax.set_xticklabels([f"{v:.1f}" for v in conf_values[::2]])
+    ax.set_yticks(np.arange(len(vote_values))[::2])
+    ax.set_yticklabels([f"{v:.0f}" for v in vote_values[::2]])
+    ax.set_xlabel("Selected model validation confidence threshold")
+    ax.set_ylabel("Top-N validation ensemble vote threshold (%)")
+    ax.set_title(metric_name)
+    fig.colorbar(im, ax=ax, label=metric_name)
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+    _render_coverage_threshold_plot(
+        conf_values,
+        vote_values,
+        coverage_metric_heat,
+        coverage_heat,
+        coverage_metric_name,
+        "Coverage-aware validation threshold plot",
+        x_label="Selected model validation confidence threshold",
+    )
+
+
+def render_validation_threshold_heatmap(models_df: pd.DataFrame, page_key: str = "leaderboard") -> None:
+    if models_df is None or models_df.empty:
+        return
+
+    with st.expander("Threshold Sensitivity Heatmap (validation)", expanded=False):
+        max_default = min(5, len(models_df))
+        metric_options = ["ACC kept", "ACC unknown=wrong", "Coverage", "MCC kept", "MCC unknown=wrong"]
+        coverage_metric_options = ["ACC kept", "MCC kept", "ACC unknown=wrong", "MCC unknown=wrong"]
+
+        with st.form(key=_k(page_key, "validation_threshold_form")):
+            max_models = st.number_input(
+                "Validation Top-N models",
+                min_value=1,
+                max_value=min(25, len(models_df)),
+                value=max_default,
+                step=1,
+                key=_k(page_key, "validation_threshold_top_n"),
+            )
+            top_df = models_df.head(int(max_models)).copy().reset_index(drop=True)
+            top_df["_validation_selection_key"] = top_df.apply(
+                lambda row: _make_model_selection_key(row.to_dict()),
+                axis=1,
+            )
+            selection_options = top_df["_validation_selection_key"].tolist()
+            key_to_idx = {key: idx for idx, key in enumerate(selection_options)}
+            selected_model_key = _k(page_key, "validation_threshold_selected_model")
+            if st.session_state.get(selected_model_key) not in selection_options:
+                st.session_state[selected_model_key] = selection_options[0] if selection_options else None
+            selected_key = st.selectbox(
+                "Selected validation model",
+                options=selection_options,
+                format_func=lambda key: (
+                    f"#{top_df.iloc[key_to_idx[key]].get('#', key_to_idx[key] + 1)} | "
+                    f"ID {top_df.iloc[key_to_idx[key]].get('Model ID', '?')}"
+                ),
+                key=selected_model_key,
+            )
+            require_both = st.checkbox(
+                "Require both thresholds",
+                value=bool(st.session_state.get("production_require_both_thresholds", False)),
+                key=_k(page_key, "validation_threshold_require_both"),
+            )
+            metric_name = st.selectbox(
+                "Heatmap metric",
+                options=metric_options,
+                index=0,
+                key=_k(page_key, "validation_threshold_heatmap_metric"),
+            )
+            coverage_metric_name = st.selectbox(
+                "Coverage-aware plot metric",
+                options=coverage_metric_options,
+                index=0,
+                key=_k(page_key, "validation_threshold_coverage_plot_metric"),
+            )
+            render_clicked = st.form_submit_button("Render / update heatmap")
+
+        cache_key = _k(page_key, "validation_threshold_cached")
+        if render_clicked:
+            selected_idx = key_to_idx.get(selected_key, 0)
+            top_df = top_df.drop(columns=["_validation_selection_key"], errors="ignore")
+            model_signature = tuple(_make_model_selection_key(row.to_dict()) for _, row in top_df.iterrows())
+            config_signature = (
+                model_signature,
+                int(selected_idx),
+                int(max_models),
+                bool(require_both),
+                str(metric_name),
+                str(coverage_metric_name),
+            )
+            with st.spinner("Computing threshold heatmaps..."):
+                decision_df = _build_validation_threshold_frame(top_df, int(selected_idx), int(max_models))
+                conf_values, vote_values, heat, coverage_metric_heat, coverage_heat = _compute_threshold_heat_arrays(
+                    decision_df,
+                    metric_name=str(metric_name),
+                    coverage_metric_name=str(coverage_metric_name),
+                    require_both_thresholds=bool(require_both),
+                )
+            st.session_state[cache_key] = {
+                "signature": config_signature,
+                "metric_name": str(metric_name),
+                "coverage_metric_name": str(coverage_metric_name),
+                "conf_values": conf_values,
+                "vote_values": vote_values,
+                "heat": heat,
+                "coverage_metric_heat": coverage_metric_heat,
+                "coverage_heat": coverage_heat,
+            }
+
+        cached = st.session_state.get(cache_key)
+        if not cached:
+            st.info("Choose settings, then click Render / update heatmap.")
+            return
+
+        metric_name = cached["metric_name"]
+        coverage_metric_name = cached["coverage_metric_name"]
+        conf_values = cached["conf_values"]
+        vote_values = cached["vote_values"]
+        heat = cached["heat"]
+        coverage_metric_heat = cached["coverage_metric_heat"]
+        coverage_heat = cached["coverage_heat"]
+        if np.all(np.isnan(heat)):
+            st.info("No validation labels available for threshold heatmap.")
+            return
+
+        st.subheader("Threshold Sensitivity Heatmap")
+        fig, ax = plt.subplots(figsize=(8, 5))
+        im = ax.imshow(heat, origin="lower", aspect="auto", cmap="viridis")
+        ax.set_xticks(np.arange(len(conf_values))[::2])
+        ax.set_xticklabels([f"{v:.1f}" for v in conf_values[::2]])
+        ax.set_yticks(np.arange(len(vote_values))[::2])
+        ax.set_yticklabels([f"{v:.0f}" for v in vote_values[::2]])
+        ax.set_xlabel("Selected model validation confidence threshold")
+        ax.set_ylabel("Top-N validation ensemble vote threshold (%)")
+        ax.set_title(metric_name)
+        fig.colorbar(im, ax=ax, label=metric_name)
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+        _render_coverage_threshold_plot(
+            conf_values,
+            vote_values,
+            coverage_metric_heat,
+            coverage_heat,
+            coverage_metric_name,
+            "Coverage-aware validation threshold plot",
+            x_label="Selected model validation confidence threshold",
+        )
+        return
+
+
 def _render_prediction_roc_curves(pred_df: pd.DataFrame, title: str) -> bool:
     if pred_df is None or pred_df.empty or "label" not in pred_df.columns:
         st.info("No prediction labels available for ROC plotting.")
@@ -1073,7 +1747,7 @@ def _render_prediction_roc_curves(pred_df: pd.DataFrame, title: str) -> bool:
     return True
 
 
-def _render_best_models_auc_curves(models_df: pd.DataFrame, page_key: str) -> None:
+def _render_best_models_auc_curves(models_df: pd.DataFrame, page_key: str, split: str = "valid") -> None:
     if models_df is None or models_df.empty:
         return
 
@@ -1083,21 +1757,11 @@ def _render_best_models_auc_curves(models_df: pd.DataFrame, page_key: str) -> No
         st.info("No selectable model rows available for ROC curves.")
         return
 
-    cols = st.columns([3, 1])
-    with cols[0]:
-        selected_key = st.selectbox(
-            "Select model for ROC curves",
-            options=options,
-            format_func=lambda key: key_to_label.get(key, str(key)),
-            key=_k(page_key, "auc_curve_model_key"),
-        )
-    with cols[1]:
-        split = st.selectbox(
-            "Split",
-            options=["valid", "test", "train"],
-            index=0,
-            key=_k(page_key, "auc_curve_split"),
-        )
+    selected_key = st.session_state.get(_k(page_key, "best_model_key"))
+    if selected_key not in options:
+        selected_key = st.session_state.get("selected_model_selection_key")
+    if selected_key not in options:
+        selected_key = options[0]
 
     row = key_to_row.get(selected_key)
     row_dict = row.to_dict() if row is not None else {}
@@ -1109,9 +1773,9 @@ def _render_best_models_auc_curves(models_df: pd.DataFrame, page_key: str) -> No
     _render_prediction_roc_curves(pred_df, f"Model #{row_dict.get('#', '?')} {split} ROC curves")
 
 
-def _apply_top_models_filters(models_df: pd.DataFrame, page_key: str) -> pd.DataFrame:
+def _render_top_models_filter_controls(models_df: pd.DataFrame, page_key: str) -> None:
     if models_df is None or models_df.empty:
-        return models_df
+        return
 
     excluded = {"Log Path", "Artifact Log Path", "Best Model Dir", "Source Run Path", "split_config_key"}
     candidate_columns = [
@@ -1119,7 +1783,7 @@ def _apply_top_models_filters(models_df: pd.DataFrame, page_key: str) -> pd.Data
         if col not in excluded and models_df[col].nunique(dropna=True) > 1
     ]
     if not candidate_columns:
-        return models_df
+        return
 
     preferred = [
         "N_Calibration", "NNeg", "NPos", "Classif_Loss", "DLoss", "Prototypes",
@@ -1130,37 +1794,131 @@ def _apply_top_models_filters(models_df: pd.DataFrame, page_key: str) -> pd.Data
     ordered_columns = [c for c in preferred if c in candidate_columns]
     ordered_columns += [c for c in candidate_columns if c not in ordered_columns]
 
+    def _is_integer_series(series: pd.Series) -> bool:
+        numeric = pd.to_numeric(series, errors="coerce").dropna()
+        if numeric.empty:
+            return False
+        return bool(np.all(np.isclose(numeric, np.round(numeric), rtol=0.0, atol=1e-12)))
+
+    def _is_numeric_filter_column(series: pd.Series) -> bool:
+        non_null = series.dropna()
+        if non_null.empty:
+            return False
+        numeric = pd.to_numeric(non_null, errors="coerce")
+        return bool(numeric.notna().mean() >= 0.9)
+
+    def _filter_key(col: str, suffix: str) -> str:
+        safe_col = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(col))
+        return _k(page_key, f"top_models_filter_{safe_col}_{suffix}")
+
     with st.expander("Filter Top Models", expanded=False):
         filter_columns = st.multiselect(
             "Restrict by columns",
             options=ordered_columns,
-            default=[],
+            default=st.session_state.get(_k(page_key, "top_models_filter_columns"), []),
             key=_k(page_key, "top_models_filter_columns"),
         )
 
         filtered_df = models_df.copy()
         for col in filter_columns:
-            values = filtered_df[col].dropna().map(str).sort_values().unique().tolist()
-            if not values:
+            if col not in filtered_df.columns:
                 continue
-            selected_values = st.multiselect(
-                f"{col} values",
-                options=values,
-                default=values,
-                key=_k(page_key, f"top_models_filter_values_{col}"),
-            )
-            if selected_values:
-                filtered_df = filtered_df[filtered_df[col].map(str).isin(set(selected_values))]
+            if _is_numeric_filter_column(filtered_df[col]):
+                numeric_values = pd.to_numeric(filtered_df[col], errors="coerce")
+                available = numeric_values.dropna()
+                if available.empty:
+                    continue
+                min_value = float(available.min())
+                max_value = float(available.max())
+                is_integer = _is_integer_series(filtered_df[col])
+                operators = [">=", "<="]
+                if is_integer:
+                    operators.append("=")
+                operator = st.selectbox(
+                    f"{col} filter",
+                    options=operators,
+                    index=0,
+                    key=_filter_key(col, "operator"),
+                )
+                default_value = min_value if operator == ">=" else max_value
+                if operator == "=" and is_integer:
+                    value = st.number_input(
+                        f"{col} value",
+                        value=int(round(default_value)),
+                        min_value=int(np.floor(min_value)),
+                        max_value=int(np.ceil(max_value)),
+                        step=1,
+                        key=_filter_key(col, "value"),
+                    )
+                    filtered_df = filtered_df[numeric_values.eq(float(value))]
+                else:
+                    value = st.number_input(
+                        f"{col} value",
+                        value=float(default_value),
+                        min_value=float(min_value),
+                        max_value=float(max_value),
+                        step=float(max((max_value - min_value) / 100.0, 0.0001)),
+                        format="%.6f",
+                        key=_filter_key(col, "value"),
+                    )
+                    if operator == ">=":
+                        filtered_df = filtered_df[numeric_values >= float(value)]
+                    else:
+                        filtered_df = filtered_df[numeric_values <= float(value)]
             else:
-                filtered_df = filtered_df.iloc[0:0]
+                values = filtered_df[col].dropna().map(str).sort_values().unique().tolist()
+                if not values:
+                    continue
+                selected_values = st.multiselect(
+                    f"{col} values",
+                    options=values,
+                    default=values,
+                    key=_filter_key(col, "values"),
+                )
+                if selected_values:
+                    filtered_df = filtered_df[filtered_df[col].map(str).isin(set(selected_values))]
+                else:
+                    filtered_df = filtered_df.iloc[0:0]
 
         if filter_columns:
-            st.caption(f"Showing {len(filtered_df)} / {len(models_df)} models after filters.")
+            st.caption(f"Draft restriction matches {len(filtered_df)} / {len(models_df)} models. Click Apply restrictions to update the table.")
 
-    return filtered_df.reset_index(drop=True)
+        col_apply, col_clear = st.columns([1, 1])
+        with col_apply:
+            apply_clicked = st.button("Apply restrictions", key=_k(page_key, "top_models_filter_apply"))
+        with col_clear:
+            clear_clicked = st.button("Clear restrictions", key=_k(page_key, "top_models_filter_clear"))
+
+        if clear_clicked:
+            st.session_state.pop("top_models_filtered_selection_keys", None)
+            st.session_state["top_models_filters_active"] = False
+            st.rerun()
+        elif apply_clicked:
+            if filter_columns:
+                st.session_state["top_models_filtered_selection_keys"] = [
+                    _make_model_selection_key(row.to_dict()) for _, row in filtered_df.iterrows()
+                ]
+                st.session_state["top_models_filters_active"] = True
+            else:
+                st.session_state.pop("top_models_filtered_selection_keys", None)
+                st.session_state["top_models_filters_active"] = False
+            st.rerun()
+
+        if st.session_state.get("top_models_filters_active"):
+            active_df = apply_active_top_models_selection(models_df)
+            st.caption(f"Showing {len(active_df)} / {len(models_df)} models after applied filters.")
 
 
-def _render_calibration_vs_performance(models_df: pd.DataFrame) -> None:
+def apply_active_top_models_selection(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply the user-pruned Top Models selection to another dataframe."""
+    return apply_selection_keys_to_models_df(
+        df,
+        st.session_state.get("top_models_filtered_selection_keys"),
+        filters_active=bool(st.session_state.get("top_models_filters_active")),
+    )
+
+
+def _render_calibration_vs_performance(models_df: pd.DataFrame, split: str = "valid") -> None:
     st.markdown("---")
     st.subheader("📈 Calibration vs Performance")
 
@@ -1174,7 +1932,7 @@ def _render_calibration_vs_performance(models_df: pd.DataFrame) -> None:
             if pd.isna(val):
                 log_path = row.get("Log Path")
                 if log_path:
-                    metrics = get_calibration_metrics(log_path)
+                    metrics = get_calibration_metrics(log_path, split=split)
                     if metrics and not metrics.get("error"):
                         plot_df.at[idx, "ECE"] = metrics.get("ece", np.nan)
                         plot_df.at[idx, "Brier"] = metrics.get("brier", np.nan)
@@ -1205,7 +1963,7 @@ def _render_calibration_vs_performance(models_df: pd.DataFrame) -> None:
 
     st.caption(
         f"Calibration points available: {len(plot_df)} / {len(models_df)} models. "
-        "A point requires saved validation probabilities in valid_predictions.csv."
+        f"A point requires saved {split} probabilities in {split}_predictions.csv."
     )
 
     if plot_df.empty:
@@ -1214,19 +1972,19 @@ def _render_calibration_vs_performance(models_df: pd.DataFrame) -> None:
             with st.expander("Calibration rows skipped"):
                 rows = calibration_errors[:]
                 if calibration_missing:
-                    rows.append({"Reason": f"{calibration_missing} rows had no valid_predictions.csv calibration artifact"})
+                    rows.append({"Reason": f"{calibration_missing} rows had no {split}_predictions.csv calibration artifact"})
                 st.dataframe(pd.DataFrame(rows), use_container_width=True)
         return
 
     col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown("**Valid MCC vs ECE**")
+        st.markdown(f"**Valid MCC vs {split} ECE**")
         fig, ax = plt.subplots(figsize=(6, 3.5))
         ax.scatter(plot_df["Calibration Plot MCC"], plot_df["ECE"], alpha=0.6, s=50)
         ax.set_xlabel("Valid MCC (higher is better)", fontsize=10)
         ax.set_ylabel("ECE (lower is better)", fontsize=10)
-        ax.set_title("Expected Calibration Error vs Valid MCC", fontsize=11)
+        ax.set_title(f"{split.title()} Expected Calibration Error vs Valid MCC", fontsize=11)
         ax.grid(True, alpha=0.3)
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
@@ -1235,16 +1993,16 @@ def _render_calibration_vs_performance(models_df: pd.DataFrame) -> None:
         with st.expander("Calibration rows skipped"):
             rows = calibration_errors[:]
             if calibration_missing:
-                rows.append({"Reason": f"{calibration_missing} rows had no valid_predictions.csv calibration artifact"})
+                rows.append({"Reason": f"{calibration_missing} rows had no {split}_predictions.csv calibration artifact"})
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
     with col2:
-        st.markdown("**Valid MCC vs Brier Score**")
+        st.markdown(f"**Valid MCC vs {split} Brier Score**")
         fig, ax = plt.subplots(figsize=(6, 3.5))
         ax.scatter(plot_df["Calibration Plot MCC"], plot_df["Brier"], alpha=0.6, s=50)
         ax.set_xlabel("Valid MCC (higher is better)", fontsize=10)
         ax.set_ylabel("Brier Score (lower is better)", fontsize=10)
-        ax.set_title("Brier Score vs Valid MCC", fontsize=11)
+        ax.set_title(f"{split.title()} Brier Score vs Valid MCC", fontsize=11)
         ax.grid(True, alpha=0.3)
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
@@ -1279,15 +2037,15 @@ def _make_model_selection_options(models_df: pd.DataFrame):
     return options, key_to_row, key_to_label
 
 
-def _render_selected_model_calibration(row_dict: Dict[str, Any]) -> None:
+def _render_selected_model_calibration(row_dict: Dict[str, Any], split: str = "valid") -> None:
     log_path = row_dict.get("Log Path")
 
     if not log_path:
         return
 
-    st.subheader(f"📈 Calibration Curve (Model #{row_dict.get('#', '?')})")
+    st.subheader(f"📈 Calibration Curve (Model #{row_dict.get('#', '?')}, {split})")
 
-    metrics = get_calibration_metrics(log_path)
+    metrics = get_calibration_metrics(log_path, split=split)
 
     if metrics is None:
         st.info("No calibration metrics available for this model.")
@@ -1367,7 +2125,7 @@ def _set_selected_model(row_dict: Dict[str, Any], selected_key: str) -> None:
     st.session_state.selected_model_version = st.session_state.get("selected_model_version", 0) + 1
 
 
-def _render_model_selector(models_df: pd.DataFrame, page_key: str) -> None:
+def _render_model_selector(models_df: pd.DataFrame, page_key: str, calibration_split: str = "valid") -> None:
     if models_df.empty:
         st.warning("No models found in leaderboard.")
         return
@@ -1404,7 +2162,7 @@ def _render_model_selector(models_df: pd.DataFrame, page_key: str) -> None:
     row = key_to_row.get(selected_key)
     if row is not None:
         row_dict = row.to_dict()
-        _render_selected_model_calibration(row_dict)
+        _render_selected_model_calibration(row_dict, split=calibration_split)
 
     if st.button("✅ Use Selected Model", key=_k(page_key, "use_selected_model_btn")):
         row = key_to_row.get(selected_key)
@@ -1717,7 +2475,12 @@ def render(
 
     if include_model_table or include_calibration or include_model_selector:
         try:
-            models_df = load_best_models_table(cursor, task=active_task)
+            calibration_split_key = _k(page_key, "calibration_split")
+            calibration_split_options = ["valid", "test", "train"]
+            calibration_split = str(st.session_state.get(calibration_split_key, "valid"))
+            if calibration_split not in calibration_split_options:
+                calibration_split = "valid"
+            models_df = load_best_models_table(cursor, task=active_task, calibration_split=calibration_split)
             if models_df.empty:
                 if active_task:
                     st.warning(f"No models found in leaderboard for task {active_task}.")
@@ -1726,21 +2489,36 @@ def render(
             else:
                 _update_model_number_map(models_df)
 
-                models_df = _apply_top_models_filters(models_df, page_key)
-                if models_df.empty:
+                display_models_df = apply_active_top_models_selection(models_df).reset_index(drop=True)
+                if display_models_df.empty:
                     st.info("No models match the selected Top Models filters.")
+                    _render_top_models_filter_controls(models_df, page_key)
                 else:
-                    _update_model_number_map(models_df)
+                    _update_model_number_map(display_models_df)
 
                     if include_model_table:
-                        _render_top_models_table(models_df, args)
-                        _render_best_models_auc_curves(models_df, page_key)
+                        _render_top_models_table(display_models_df, args)
 
-                    if include_calibration:
-                        _render_calibration_vs_performance(models_df)
+                    _render_top_models_filter_controls(models_df, page_key)
+
+                    calibration_split = st.selectbox(
+                        "Calibration / ROC split",
+                        options=calibration_split_options,
+                        index=calibration_split_options.index(calibration_split),
+                        key=calibration_split_key,
+                    )
+                    if calibration_split_key != "leaderboard_calibration_split":
+                        st.session_state["leaderboard_calibration_split"] = calibration_split
 
                     if include_model_selector:
-                        _render_model_selector(models_df, page_key)
+                        _render_model_selector(display_models_df, page_key, calibration_split=calibration_split)
+
+                    if include_model_table:
+                        _render_best_models_auc_curves(display_models_df, page_key, split=calibration_split)
+                        render_validation_threshold_heatmap(display_models_df, page_key)
+
+                    if include_calibration:
+                        _render_calibration_vs_performance(display_models_df, split=calibration_split)
 
         except Exception as e:
             st.error(f"Could not load best models leaderboard: {e}")

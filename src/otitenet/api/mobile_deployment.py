@@ -7,6 +7,8 @@ import hashlib
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+from otitenet.data.transforms_manifest import image_preprocessing_manifest
+
 
 DEPLOYMENT_ROOT = Path("data/mobile_deployments")
 CURRENT_DIR = DEPLOYMENT_ROOT / "current"
@@ -49,6 +51,18 @@ def write_current_manifest(manifest: Dict[str, Any]) -> None:
         json.dump(manifest, f, indent=2, default=str)
 
 
+def write_current_transforms(preprocessing: Dict[str, Any]) -> str:
+    CURRENT_DIR.mkdir(parents=True, exist_ok=True)
+    path = CURRENT_DIR / "transforms.json"
+    payload = {
+        "schema_version": 1,
+        "image": preprocessing,
+    }
+    with path.open("w") as f:
+        json.dump(payload, f, indent=2, default=str)
+    return path.name
+
+
 def create_simple_torch_classifier_manifest(
     model_id: int,
     model_name: str,
@@ -72,21 +86,13 @@ def create_simple_torch_classifier_manifest(
         raise FileNotFoundError(f"Model file not found in deployment dir: {model_path}")
 
     is_onnx = model_path.suffix.lower() == ".onnx"
-    normalize_value = str(normalize or "no").lower()
-    preprocessing: Dict[str, Any] = {
-        "resize": list(input_size),
-        "resize_mode": "app_64_then_size",
-        "color_mode": "RGB",
-        "normalize": normalize_value,
-    }
-    if normalize_value in {"yes", "true", "1", "per_image"}:
-        preprocessing["normalization"] = "per_image"
-    elif normalize_mean is not None and normalize_std is not None:
-        preprocessing["normalization"] = "channel_mean_std"
-        preprocessing["normalize_mean"] = list(normalize_mean)
-        preprocessing["normalize_std"] = list(normalize_std)
-    else:
-        preprocessing["normalization"] = "none"
+    preprocessing = image_preprocessing_manifest(
+        input_size,
+        normalize=normalize,
+        normalize_mean=normalize_mean,
+        normalize_std=normalize_std,
+    )
+    transforms_file = write_current_transforms(preprocessing)
 
     manifest = {
         "deployment_id": "current",
@@ -105,10 +111,12 @@ def create_simple_torch_classifier_manifest(
         "labels": labels,
         "files": {
             "model": model_path.name,
+            "transforms": transforms_file,
             "manifest": "manifest.json",
         },
         "sha256": {
             "model": sha256_file(model_path),
+            "transforms": sha256_file(CURRENT_DIR / transforms_file),
         },
     }
 
@@ -126,6 +134,8 @@ def create_knn_embedding_manifest(
     k: int,
     distance: str = "cosine",
     input_size: tuple[int, int] = (224, 224),
+    normalize: str = "no",
+    production_params: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
     Future deployment type:
@@ -141,6 +151,9 @@ def create_knn_embedding_manifest(
         if not p.exists():
             raise FileNotFoundError(f"Deployment file not found: {p}")
 
+    preprocessing = image_preprocessing_manifest(input_size, normalize=normalize)
+    transforms_file = write_current_transforms(preprocessing)
+
     manifest = {
         "deployment_id": "current",
         "model_id": int(model_id),
@@ -154,22 +167,21 @@ def create_knn_embedding_manifest(
             "image_size": list(input_size),
             "channels": 3,
         },
-        "preprocessing": {
-            "resize": list(input_size),
-            "normalize_mean": [0.485, 0.456, 0.406],
-            "normalize_std": [0.229, 0.224, 0.225],
-        },
+        "preprocessing": preprocessing,
+        "production_params": production_params or {},
         "labels": labels,
         "files": {
             "embedding_model": embedding_path.name,
             "reference_embeddings": ref_emb_path.name,
             "reference_labels": ref_lab_path.name,
+            "transforms": transforms_file,
             "manifest": "manifest.json",
         },
         "sha256": {
             "embedding_model": sha256_file(embedding_path),
             "reference_embeddings": sha256_file(ref_emb_path),
             "reference_labels": sha256_file(ref_lab_path),
+            "transforms": sha256_file(CURRENT_DIR / transforms_file),
         },
     }
 
@@ -197,14 +209,8 @@ def create_torch_prototype_manifest(
     if not prototypes_path.exists():
         raise FileNotFoundError(f"Prototype file not found in deployment dir: {prototypes_path}")
 
-    normalize_value = str(normalize or "no").lower()
-    preprocessing: Dict[str, Any] = {
-        "resize": list(input_size),
-        "resize_mode": "app_64_then_size",
-        "color_mode": "RGB",
-        "normalize": normalize_value,
-        "normalization": "per_image" if normalize_value in {"yes", "true", "1", "per_image"} else "none",
-    }
+    preprocessing = image_preprocessing_manifest(input_size, normalize=normalize)
+    transforms_file = write_current_transforms(preprocessing)
 
     manifest = {
         "deployment_id": "current",
@@ -226,11 +232,13 @@ def create_torch_prototype_manifest(
         "files": {
             "model": model_path.name,
             "prototypes": prototypes_path.name,
+            "transforms": transforms_file,
             "manifest": "manifest.json",
         },
         "sha256": {
             "model": sha256_file(model_path),
             "prototypes": sha256_file(prototypes_path),
+            "transforms": sha256_file(CURRENT_DIR / transforms_file),
         },
     }
     write_current_manifest(manifest)
@@ -258,14 +266,8 @@ def create_onnx_prototype_manifest(
     if not prototypes_path.exists():
         raise FileNotFoundError(f"Prototype file not found in deployment dir: {prototypes_path}")
 
-    normalize_value = str(normalize or "no").lower()
-    preprocessing: Dict[str, Any] = {
-        "resize": list(input_size),
-        "resize_mode": "app_64_then_size",
-        "color_mode": "RGB",
-        "normalize": normalize_value,
-        "normalization": "per_image" if normalize_value in {"yes", "true", "1", "per_image"} else "none",
-    }
+    preprocessing = image_preprocessing_manifest(input_size, normalize=normalize)
+    transforms_file = write_current_transforms(preprocessing)
 
     manifest = {
         "deployment_id": "current",
@@ -288,11 +290,13 @@ def create_onnx_prototype_manifest(
         "files": {
             "model": model_path.name,
             "prototypes": prototypes_path.name,
+            "transforms": transforms_file,
             "manifest": "manifest.json",
         },
         "sha256": {
             "model": sha256_file(model_path),
             "prototypes": sha256_file(prototypes_path),
+            "transforms": sha256_file(CURRENT_DIR / transforms_file),
         },
     }
     write_current_manifest(manifest)

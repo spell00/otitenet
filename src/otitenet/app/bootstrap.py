@@ -31,50 +31,72 @@ from .database import (
 def initialize_database():
     from .database import (
         create_db,
+        get_db_connection,
         ensure_results_model_id,
         ensure_results_class_scores,
         ensure_best_models_registry_nsize,
         ensure_registry_metrics_columns,
+        cleanup_duplicate_best_models_registry,
+        cleanup_incompatible_best_models_registry,
+        cleanup_duplicate_registry_csvs,
+        is_mysql_connection_lost_error,
     )
+
+    def _refresh_connection():
+        try:
+            get_db_connection.clear()
+        except Exception:
+            pass
+        return create_db()
+
+    def _run_db_step(name, fn, conn, cursor):
+        try:
+            try:
+                conn.ping(reconnect=True, attempts=2, delay=1)
+            except Exception:
+                conn, cursor = _refresh_connection()
+            fn(conn, cursor)
+        except Exception as e:
+            print(f"[bootstrap] Warning: {name} failed: {e}")
+            if is_mysql_connection_lost_error(e):
+                try:
+                    conn, cursor = _refresh_connection()
+                except Exception as refresh_error:
+                    print(f"[bootstrap] Warning: database reconnect after {name} failed: {refresh_error}")
+        return conn, cursor
 
     conn, cursor = create_db()
 
-    try:
-        ensure_results_model_id(conn, cursor)
-    except Exception as e:
-        print(f"[bootstrap] Warning: ensure_results_model_id failed: {e}")
+    conn, cursor = _run_db_step("ensure_results_model_id", ensure_results_model_id, conn, cursor)
+    conn, cursor = _run_db_step("ensure_results_class_scores", ensure_results_class_scores, conn, cursor)
+    conn, cursor = _run_db_step("ensure_best_models_registry_nsize", ensure_best_models_registry_nsize, conn, cursor)
+    conn, cursor = _run_db_step("ensure_registry_metrics_columns", ensure_registry_metrics_columns, conn, cursor)
+    conn, cursor = _run_db_step("cleanup_incompatible_best_models_registry", cleanup_incompatible_best_models_registry, conn, cursor)
+    conn, cursor = _run_db_step("cleanup_duplicate_best_models_registry", cleanup_duplicate_best_models_registry, conn, cursor)
 
     try:
-        ensure_results_class_scores(conn, cursor)
+        cleanup_duplicate_registry_csvs()
     except Exception as e:
-        print(f"[bootstrap] Warning: ensure_results_class_scores failed: {e}")
-
-    try:
-        ensure_best_models_registry_nsize(conn, cursor)
-    except Exception as e:
-        print(f"[bootstrap] Warning: ensure_best_models_registry_nsize failed: {e}")
-
-    try:
-        ensure_registry_metrics_columns(conn, cursor)
-    except Exception as e:
-        print(f"[bootstrap] Warning: ensure_registry_metrics_columns failed: {e}")
+        print(f"[bootstrap] Warning: cleanup_duplicate_registry_csvs failed: {e}")
 
     try:
         from .database import ensure_production_model_table
-        ensure_production_model_table(conn, cursor)
+        conn, cursor = _run_db_step("ensure_production_model_table", ensure_production_model_table, conn, cursor)
     except ImportError:
         print("[bootstrap] Warning: ensure_production_model_table not found")
-    except Exception as e:
-        print(f"[bootstrap] Warning: ensure_production_model_table failed: {e}")
 
     try:
         from .database import ensure_people_user_email
-        ensure_people_user_email(conn, cursor)
+        conn, cursor = _run_db_step("ensure_people_user_email", ensure_people_user_email, conn, cursor)
     except ImportError:
         print("[bootstrap] Warning: ensure_people_user_email not found")
-    except Exception as e:
-        print(f"[bootstrap] Warning: ensure_people_user_email failed: {e}")
 
+    try:
+        conn.ping(reconnect=True, attempts=2, delay=1)
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+    except Exception:
+        conn, cursor = _refresh_connection()
     return conn, cursor
 
 # Model‑rank initialization (placeholder – actual logic lives elsewhere)
@@ -116,9 +138,19 @@ def is_current_user_admin():
 def load_production_model(cursor):
     """Load the current production model into session_state."""
     from .services.production_model_service import get_production_model, set_production_model
+    import time
     import streamlit as st
 
-    model_info = get_production_model(cursor, task=st.session_state.get("production_task", "notNormal"))
+    task = st.session_state.get("production_task", "notNormal")
+    now = time.monotonic()
+    cache_task = st.session_state.get("production_model_cache_task")
+    cache_ts = float(st.session_state.get("production_model_cache_ts", 0.0) or 0.0)
+    if cache_task == task and st.session_state.get("production_model") and now - cache_ts < 60:
+        return st.session_state["production_model"]
+
+    model_info = get_production_model(cursor, task=task)
     if model_info:
         st.session_state["production_model"] = model_info
+        st.session_state["production_model_cache_task"] = task
+        st.session_state["production_model_cache_ts"] = now
     return model_info

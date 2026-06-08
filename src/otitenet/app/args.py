@@ -8,6 +8,7 @@ keeping app.py focused on core logic.
 import os
 import argparse
 import re
+import time
 from typing import Optional
 
 import streamlit as st
@@ -20,12 +21,15 @@ from otitenet.app.utils import (
     attach_task_column,
     filter_models_df_by_task,
     get_split_mcc_metrics,
+    get_model_order_metric,
     get_model_split_config,
     is_done_manifest_model_row,
     format_classifier_config,
     parse_classifier_config,
     resolve_best_classifier_config,
     enumerate_classification_heads,
+    _optimization_cache_file_paths,
+    sort_dataframe_by_model_metric,
     ensure_int,
     normalize_train_datasets,
     split_config_key,
@@ -40,6 +44,7 @@ from otitenet.app.artifact_registry import (
     load_best_models_registry,
     preferred_model_artifact_dir,
 )
+from otitenet.app.background import clear_completed, get_completed_result, submit_once
 from otitenet.app.utils_dataset_names import get_short_dataset_name, get_short_dataset_names
 from otitenet.data.labels import label_scheme_for_task
 from otitenet.data.dataset_paths import infer_output_subdir_from_split_datasets
@@ -75,9 +80,43 @@ def _infer_new_size_from_dataset_path(dataset_path: str, default: int = 224) -> 
 
 def _canonical_dataset_path(dataset_path: str) -> str:
     text = str(dataset_path or "").strip().replace("\\", "/")
-    if text.endswith("_inference"):
-        return text[: -len("_inference")]
     return text
+
+
+def _progress_manifest_dataset_paths(task: str = "", model_name: str = "") -> list[str]:
+    """Return dataset paths recorded by launcher progress manifests."""
+    task_text = str(task or "").strip()
+    if not task_text:
+        return []
+
+    root = os.path.join("logs", "progresses", task_text)
+    if not os.path.isdir(root):
+        return []
+
+    values = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        if f"PROD_{task_text}_job_manifest.csv" not in filenames:
+            continue
+        manifest_path = os.path.join(dirpath, f"PROD_{task_text}_job_manifest.csv")
+        try:
+            df = pd.read_csv(manifest_path, dtype=str).fillna("")
+        except Exception:
+            continue
+        if model_name and "model" in df.columns:
+            df = df[df["model"].astype(str) == str(model_name)]
+        for col in ["dataset_name", "dataset_key"]:
+            if col not in df.columns:
+                continue
+            for value in df[col].astype(str).tolist():
+                value = value.strip().replace("\\", "/")
+                if not value:
+                    continue
+                if "/" not in value and value.startswith("otite_ds_"):
+                    parts = value.split("_", 3)
+                    if len(parts) == 4:
+                        value = f"{parts[0]}_{parts[1]}_{parts[2]}/{parts[3]}"
+                values.append(_canonical_dataset_path(value))
+    return _unique_preserve_order([v for v in values if v])
 
 
 def _best_model_registry_paths(task: str = "", model_name: str = "") -> list[str]:
@@ -85,14 +124,15 @@ def _best_model_registry_paths(task: str = "", model_name: str = "") -> list[str
     try:
         df = load_best_models_registry()
     except Exception:
-        return []
+        return _progress_manifest_dataset_paths(task, model_name)
     if df.empty or "dataset_path" not in df.columns:
-        return []
+        return _progress_manifest_dataset_paths(task, model_name)
     if task and "task" in df.columns:
         df = df[df["task"].astype(str) == str(task)]
     if model_name and "model_name" in df.columns:
         df = df[df["model_name"].astype(str) == str(model_name)]
     values = [_canonical_dataset_path(str(v).strip().replace("\\", "/")) for v in df["dataset_path"].tolist()]
+    values.extend(_progress_manifest_dataset_paths(task, model_name))
     return sorted(dict.fromkeys([v for v in values if v]))
 
 
@@ -168,7 +208,100 @@ def _split_combos_for_task_model(cursor, task: str, model_name: str) -> list[str
     except Exception:
         pass
 
+    try:
+        root = os.path.join("logs", "progresses", str(task or ""))
+        if os.path.isdir(root):
+            for dirpath, _dirnames, filenames in os.walk(root):
+                manifest_name = f"PROD_{task}_job_manifest.csv"
+                if manifest_name not in filenames:
+                    continue
+                df = pd.read_csv(os.path.join(dirpath, manifest_name), dtype=str).fillna("")
+                if model_name and "model" in df.columns:
+                    df = df[df["model"].astype(str) == str(model_name)]
+                for _, row in df.iterrows():
+                    key = split_config_key(row.get("train_datasets"), row.get("valid_dataset"), row.get("test_dataset"))
+                    if key.replace("|", "").strip():
+                        combos.append(key)
+    except Exception:
+        pass
+
     return _unique_preserve_order(combos)
+
+
+def _progress_manifest_model_rows(task: str = "", model_name: str = "") -> pd.DataFrame:
+    """Return done launcher manifest jobs in the Quick Model Selection row shape."""
+    task_text = str(task or "").strip()
+    if not task_text:
+        return pd.DataFrame()
+
+    root = os.path.join("logs", "progresses", task_text)
+    if not os.path.isdir(root):
+        return pd.DataFrame()
+
+    rows = []
+    manifest_name = f"PROD_{task_text}_job_manifest.csv"
+    for dirpath, _dirnames, filenames in os.walk(root):
+        if manifest_name not in filenames:
+            continue
+        manifest_path = os.path.join(dirpath, manifest_name)
+        try:
+            df = pd.read_csv(manifest_path, dtype=str).fillna("")
+        except Exception:
+            continue
+        if model_name and "model" in df.columns:
+            df = df[df["model"].astype(str) == str(model_name)]
+        if "job_state" in df.columns:
+            df = df[df["job_state"].astype(str).str.lower() == "done"]
+        for _, row in df.iterrows():
+            dataset = str(row.get("dataset_name") or row.get("dataset_key") or "").strip().replace("\\", "/")
+            if dataset and "/" not in dataset and dataset.startswith("otite_ds_"):
+                parts = dataset.split("_", 3)
+                if len(parts) == 4:
+                    dataset = f"{parts[0]}_{parts[1]}_{parts[2]}/{parts[3]}"
+            dataset = _canonical_dataset_path(dataset)
+
+            task_value = str(row.get("task") or task_text).strip() or task_text
+            uuid = str(row.get("uuid") or "").strip()
+            source_run_path = os.path.join("logs", task_value, uuid) if uuid else ""
+            if source_run_path and not os.path.isdir(source_run_path):
+                source_run_path = ""
+            log_path = source_run_path or str(row.get("stdout_file") or row.get("log_file") or "").strip()
+            classif_loss = str(row.get("classif_loss") or "").strip() or str(row.get("loss") or "").strip()
+            split_key = split_config_key(row.get("train_datasets"), row.get("valid_dataset"), row.get("test_dataset"))
+            rows.append(
+                {
+                    "Model ID": str(row.get("exp_id") or row.get("job_id") or uuid or "").strip(),
+                    "Model Name": str(row.get("model") or model_name or "").strip(),
+                    "NSize": str(row.get("new_size") or "").strip(),
+                    "FGSM": str(row.get("fgsm") or "").strip(),
+                    "Prototypes": str(row.get("prototype") or row.get("prototypes") or "").strip(),
+                    "NPos": str(row.get("n_positives") or "").strip(),
+                    "NNeg": str(row.get("n_negatives") or "").strip(),
+                    "DLoss": str(row.get("dloss") or "").strip(),
+                    "Dist_Fct": str(row.get("dist_fct") or "").strip(),
+                    "Classif_Loss": classif_loss,
+                    "N_Calibration": str(row.get("n_calibration") or "").strip(),
+                    "Accuracy": pd.NA,
+                    "MCC": pd.NA,
+                    "Normalize": str(row.get("normalize") or "").strip(),
+                    "N_Neighbors": str(row.get("knn") or row.get("n_neighbors") or "").strip(),
+                    "Log Path": log_path,
+                    "Proto_Strat": str(row.get("prototype_strategy") or "").strip(),
+                    "Proto_Comp": str(row.get("prototype_components") or "").strip(),
+                    "train_datasets": str(row.get("train_datasets") or "").strip(),
+                    "valid_dataset": str(row.get("valid_dataset") or "").strip(),
+                    "test_dataset": str(row.get("test_dataset") or "").strip(),
+                    "split_config_key": split_key,
+                    "Artifact ID": uuid,
+                    "Best Model Dir": source_run_path or log_path,
+                    "Source Run Path": source_run_path,
+                    "Artifact Dataset": dataset,
+                    "Combo Dataset": dataset,
+                    "Dataset": dataset,
+                    "Task": task_value,
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def _prefer_source_artifact_paths(df: pd.DataFrame) -> pd.DataFrame:
@@ -281,7 +414,7 @@ def _args_namespace_from_model_row(model_row: dict) -> argparse.Namespace:
 def _render_classification_head_selector(model_row: dict, model_selection_key: str) -> Optional[str]:
     """Show classification-head selectbox for the current Quick Model Selection row."""
     tmp_args = _args_namespace_from_model_row(model_row)
-    heads = enumerate_classification_heads(tmp_args)
+    heads = _enumerate_classification_heads_cached(tmp_args, model_selection_key)
     if not heads:
         st.caption("No learned-embedding heads cached. Run optimization in Tab 1.")
         return None
@@ -327,6 +460,71 @@ from otitenet.utils.update_model_ranks import update_model_ranks
 
 
 DEFAULT_APP_TRAIN_DATASETS = "Banque_Calaman_USA_2020_trie_CM,Banque_Comert_Turquie_2020_jpg"
+MODEL_RANK_REFRESH_SECONDS = 300
+
+
+def _refresh_model_ranks_maybe(force: bool = False) -> bool:
+    """Refresh persisted model ranks at most once per short interval."""
+    now = time.monotonic()
+    last_refresh = float(st.session_state.get("model_rank_last_refresh_ts", 0.0) or 0.0)
+    if not force and last_refresh and now - last_refresh < MODEL_RANK_REFRESH_SECONDS:
+        return False
+    update_model_ranks()
+    st.session_state["model_rank_last_refresh_ts"] = now
+    return True
+
+
+def _optimization_cache_signature(tmp_args) -> tuple:
+    signature = []
+    for path in _optimization_cache_file_paths(tmp_args):
+        try:
+            stat = os.stat(path)
+            signature.append((path, stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            signature.append((path, None, None))
+    return tuple(signature)
+
+
+def _enumerate_classification_heads_cached(tmp_args, model_selection_key: str) -> list[dict]:
+    """Cache sidebar head choices across Streamlit reruns."""
+    cache = st.session_state.setdefault("sidebar_classification_heads_cache", {})
+    signature = _optimization_cache_signature(tmp_args)
+    metric = str(st.session_state.get("model_order_metric", ""))
+    prefetch_key = (
+        "sidebar_heads_prefetch",
+        str(model_selection_key),
+        signature,
+        metric,
+    )
+    cache_key = (
+        str(model_selection_key),
+        signature,
+        metric,
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    prefetched = get_completed_result(prefetch_key)
+    if prefetched is not None:
+        cache.clear()
+        cache[cache_key] = prefetched
+        return prefetched
+    heads = enumerate_classification_heads(tmp_args)
+    cache.clear()
+    cache[cache_key] = heads
+    return heads
+
+
+def _prefetch_classification_heads(model_selection_key: str, model_row: dict, metric: str) -> None:
+    """Warm classifier-head caches for likely next selections in the background."""
+    tmp_args = _args_namespace_from_model_row(model_row)
+    cache_key = (
+        "sidebar_heads_prefetch",
+        str(model_selection_key),
+        _optimization_cache_signature(tmp_args),
+        str(metric),
+    )
+    submit_once(cache_key, enumerate_classification_heads, tmp_args)
 
 
 def _split_combo_key_from_values(train_datasets, valid_dataset, test_dataset) -> str:
@@ -593,7 +791,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
             use_db_rank = False
             # Try to use model_rank if available
             try:
-                update_model_ranks()
+                _refresh_model_ranks_maybe()
                 try:
                     cursor.execute(
                         """
@@ -661,23 +859,34 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                     model_rows = [tuple(list(row) + [None, None, None, None, None, None, None]) for row in (cursor.fetchall() or [])]
                 use_db_rank = False
 
-            if model_rows:
-                # Align columns with the database query (19 columns)
+            _manifest_model_df = _progress_manifest_model_rows(task, model_name)
+            _df = pd.DataFrame()
+            if model_rows or not _manifest_model_df.empty:
+                # Align columns with the database query.
+                _cols = [
+                    "Model ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg", "DLoss", "Dist_Fct",
+                    "Classif_Loss", "N_Calibration", "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path",
+                    "Proto_Strat", "Proto_Comp", "train_datasets", "valid_dataset", "test_dataset", "split_config_key",
+                    "Artifact ID", "Best Model Dir", "Source Run Path",
+                ]
                 if use_db_rank:
-                    _cols = [
-                        "Model ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg", "DLoss", "Dist_Fct",
-                        "Classif_Loss", "N_Calibration", "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path", 
-                        "#", "Proto_Strat", "Proto_Comp", "train_datasets", "valid_dataset", "test_dataset", "split_config_key",
-                        "Artifact ID", "Best Model Dir", "Source Run Path",
-                    ]
-                else:
-                    _cols = [
-                        "Model ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg", "DLoss", "Dist_Fct",
-                        "Classif_Loss", "N_Calibration", "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path",
-                        "Proto_Strat", "Proto_Comp", "train_datasets", "valid_dataset", "test_dataset", "split_config_key",
-                        "Artifact ID", "Best Model Dir", "Source Run Path",
-                    ]
-                _df = pd.DataFrame(model_rows, columns=_cols)
+                    _cols = _cols[:16] + ["#"] + _cols[16:]
+                if model_rows:
+                    _df = pd.DataFrame(model_rows, columns=_cols)
+                if not _manifest_model_df.empty:
+                    for col in _cols:
+                        if col not in _manifest_model_df.columns:
+                            _manifest_model_df[col] = pd.NA
+                    if _df.empty:
+                        _df = _manifest_model_df.copy()
+                    else:
+                        for col in _manifest_model_df.columns:
+                            if col not in _df.columns:
+                                _df[col] = pd.NA
+                        for col in _df.columns:
+                            if col not in _manifest_model_df.columns:
+                                _manifest_model_df[col] = pd.NA
+                        _df = pd.concat([_df, _manifest_model_df[_df.columns]], ignore_index=True)
                 _df["Artifact Dataset"] = _df.apply(
                     lambda row: _canonical_dataset_path(
                         extract_params_from_log_path(
@@ -686,6 +895,10 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                             or row.get("Source Run Path")
                             or ""
                         ).get("Dataset", "")
+                        or row.get("Artifact Dataset")
+                        or row.get("Dataset")
+                        or row.get("Combo Dataset")
+                        or ""
                     ),
                     axis=1,
                 )
@@ -720,6 +933,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                     )
                 _df = _task_filtered_df
                 
+                _df_from_leaderboard = False
                 if not _df.empty:
                     _df["_split_combo_key"] = _df.apply(_split_combo_key_from_row, axis=1)
                     split_options = _unique_preserve_order(
@@ -776,6 +990,45 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                         )
 
                 if not _df.empty:
+                    try:
+                        from otitenet.app.pages.leaderboard import load_best_models_table
+
+                        leaderboard_df = load_best_models_table(cursor, task=task)
+                        if leaderboard_df is not None and not leaderboard_df.empty:
+                            leaderboard_df = attach_task_column(leaderboard_df)
+                            leaderboard_df["Artifact Dataset"] = leaderboard_df.apply(
+                                lambda row: _canonical_dataset_path(
+                                    extract_params_from_log_path(
+                                        row.get("Best Model Dir")
+                                        or row.get("Log Path")
+                                        or row.get("Source Run Path")
+                                        or ""
+                                    ).get("Dataset", "")
+                                ),
+                                axis=1,
+                            )
+                            leaderboard_df["Dataset"] = leaderboard_df["Artifact Dataset"]
+                            for idx, row in leaderboard_df.iterrows():
+                                combo_key = _split_combo_key_from_row(leaderboard_df.loc[idx])
+                                inferred_dataset = _dataset_path_for_split_combo(combo_key, physical_datasets)
+                                leaderboard_df.at[idx, "Combo Dataset"] = inferred_dataset
+                                if inferred_dataset:
+                                    leaderboard_df.at[idx, "Dataset"] = inferred_dataset
+                            if dataset_segment:
+                                selected_dataset_key = _canonical_dataset_path(dataset_segment)
+                                leaderboard_df = leaderboard_df[
+                                    leaderboard_df["Dataset"].astype(str).map(_canonical_dataset_path) == selected_dataset_key
+                                ]
+                            if selected_split_key:
+                                leaderboard_df = leaderboard_df[
+                                    leaderboard_df.apply(_split_combo_key_from_row, axis=1) == selected_split_key
+                                ]
+                            if not leaderboard_df.empty:
+                                _df = leaderboard_df.reset_index(drop=True)
+                                _df_from_leaderboard = True
+                    except Exception:
+                        pass
+
                     _group_cols = [
                         "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
                         "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration", "Normalize", "N_Neighbors",
@@ -790,12 +1043,17 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                     _df = _df[_df["Log Path"].astype(str) != ""]
                     _df = _df.reset_index(drop=True)
                     
-                    # Attach split metrics so ranking can use validation MCC
-                    _df["Valid MCC"] = pd.NA
-                    for idx, row in _df.iterrows():
-                        split_metrics = get_split_mcc_metrics(row.get("Log Path"))
-                        if split_metrics:
-                            _df.at[idx, "Valid MCC"] = split_metrics.get('valid_mcc', pd.NA)
+                    if not _df_from_leaderboard:
+                        # Attach split metrics so ranking can use the configured validation metric.
+                        _df["Valid MCC"] = pd.NA
+                        _df["Valid Accuracy"] = pd.NA
+                        _df["Valid AUC"] = pd.NA
+                        for idx, row in _df.iterrows():
+                            split_metrics = get_split_mcc_metrics(row.get("Log Path"))
+                            if split_metrics:
+                                _df.at[idx, "Valid MCC"] = split_metrics.get('valid_mcc', pd.NA)
+                                _df.at[idx, "Valid Accuracy"] = split_metrics.get('valid_accuracy', pd.NA)
+                                _df.at[idx, "Valid AUC"] = split_metrics.get('valid_auc', pd.NA)
 
                     # Sort by validation MCC first (fallback to MCC), then re-number rows
                     valid_sort = pd.to_numeric(_df.get("Valid MCC"), errors="coerce")
@@ -826,6 +1084,8 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                             f"#{model_num}: {rd.get('Model ID')}"
                         )
                     st.session_state['model_number_map'] = model_number_map
+                    st.session_state['best_models_table'] = _df.copy()
+                    st.session_state['best_models_table_metric'] = get_model_order_metric()
                 else:
                     st.info("No models in Quick Model Selection match a manifest row with job_state='done'.")
                     st.session_state['model_number_map'] = {}
@@ -867,6 +1127,15 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                         st.warning(f"Could not auto-apply best model: {auto_exc}")
 
                 sidebar_options = _unique_preserve_order(list(key_to_row.keys()))
+                try:
+                    clear_completed()
+                    active_metric = get_model_order_metric()
+                    for prefetch_key in sidebar_options[:5]:
+                        row_for_prefetch = key_to_row.get(prefetch_key)
+                        if row_for_prefetch:
+                            _prefetch_classification_heads(prefetch_key, row_for_prefetch, active_metric)
+                except Exception:
+                    pass
 
                 # Sync this widget to the canonical selection (log_path)
                 canonical_key = st.session_state.get('selected_model_selection_key')

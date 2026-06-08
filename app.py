@@ -27,7 +27,7 @@ from otitenet.app.components.account_sidebar import (
     require_login,
 )
 from otitenet.app.context import AppContext
-from otitenet.app.navigation import create_tabs
+from otitenet.app.navigation import select_page
 from otitenet.app.services.production_model_service import apply_production_model_to_args
 from otitenet.app.pages import (
     admin_analytics,
@@ -147,58 +147,37 @@ ctx = AppContext(
 # -------------------------------------------------
 # 4️⃣ Navigation
 # -------------------------------------------------
-tabs = create_tabs(is_admin)
-
-if is_admin:
-    (
-        tab_leaderboard,
-        tab_learned_embedding,
-        tab_past_results,
-        tab_new_analysis,
-        tab_ensemble,
-        tab_gradcam_gallery,
-        tab_raw_pixel,
-        tab_admin_analytics,
-        tab_inference_results,
-    ) = tabs
-else:
-    (
-        tab_past_results,
-        tab_new_analysis,
-        tab_inference_results,
-    ) = tabs
+active_page = select_page(is_admin)
 
 
 # -------------------------------------------------
-# 5️⃣ Render pages
+# 5️⃣ Render selected page
 # -------------------------------------------------
-if is_admin:
-    with tab_leaderboard:
-        leaderboard.render(ctx)
+if is_admin and active_page == "leaderboard":
+    leaderboard.render(ctx)
 
-    with tab_learned_embedding:
-        learned_embedding.render(ctx)
+elif is_admin and active_page == "learned_embedding":
+    learned_embedding.render(ctx)
 
-with tab_past_results:
+elif active_page == "past_results":
     past_results.render(ctx)
 
-with tab_new_analysis:
+elif active_page == "new_analysis":
     new_analysis.render(ctx)
 
-if is_admin:
-    with tab_ensemble:
-        ensemble.render(ctx)
+elif is_admin and active_page == "ensemble":
+    ensemble.render(ctx)
 
-    with tab_gradcam_gallery:
-        gradcam_gallery.render(ctx)
+elif is_admin and active_page == "gradcam_gallery":
+    gradcam_gallery.render(ctx)
 
-    with tab_raw_pixel:
-        raw_pixel_classification.render(ctx)
+elif is_admin and active_page == "raw_pixel":
+    raw_pixel_classification.render(ctx)
 
-    with tab_admin_analytics:
-        admin_analytics.render(ctx)
+elif is_admin and active_page == "admin_analytics":
+    admin_analytics.render(ctx)
 
-with tab_inference_results:
+elif active_page == "inference_results":
     if selected_person_id is None:
         st.warning(
             "Please create or select a family member from the sidebar before viewing inference results."

@@ -16,12 +16,82 @@ import random
 import hashlib
 import re
 import glob
+from functools import lru_cache
 import numpy as np
 import pandas as pd
 import streamlit as st
 import pickle
 
 from otitenet.app.artifact_registry import preferred_model_artifact_dir
+
+
+def normalize_model_order_metric(metric=None) -> str:
+    text = str(metric or os.environ.get("OTITENET_BEST_MODEL_METRIC") or "valid_mcc").strip().lower()
+    aliases = {
+        "mcc": "valid_mcc",
+        "valid mcc": "valid_mcc",
+        "valid_mcc": "valid_mcc",
+        "val_mcc": "valid_mcc",
+        "auc": "valid_auc",
+        "valid auc": "valid_auc",
+        "valid_auc": "valid_auc",
+        "val_auc": "valid_auc",
+        "accuracy": "valid_accuracy",
+        "acc": "valid_accuracy",
+        "valid accuracy": "valid_accuracy",
+        "valid_accuracy": "valid_accuracy",
+    }
+    return aliases.get(text, text if text in {"test_mcc", "test_auc", "train_mcc", "train_auc"} else "valid_mcc")
+
+
+def get_model_order_metric() -> str:
+    return normalize_model_order_metric(st.session_state.get("best_model_order_metric"))
+
+
+def metric_value_from_mapping(mapping, metric=None, default=np.nan):
+    if mapping is None:
+        return default
+    metric = normalize_model_order_metric(metric or get_model_order_metric())
+    candidates = {
+        "valid_mcc": ["Valid MCC", "valid_mcc", "Best Valid MCC", "Best Head MCC", "mcc", "MCC"],
+        "valid_auc": ["Valid AUC", "valid_auc", "Best Valid AUC", "Best Head AUC", "auc", "AUC"],
+        "valid_accuracy": ["Valid Accuracy", "valid_accuracy", "Accuracy", "accuracy"],
+        "test_mcc": ["Test MCC", "test_mcc"],
+        "test_auc": ["Test AUC", "test_auc"],
+        "train_mcc": ["Train MCC", "train_mcc"],
+        "train_auc": ["Train AUC", "train_auc"],
+    }.get(metric, [metric])
+    getter = mapping.get if hasattr(mapping, "get") else lambda _key, _default=None: _default
+    for key in candidates:
+        value = getter(key)
+        try:
+            if value is not None and not pd.isna(value):
+                return float(value)
+        except Exception:
+            try:
+                return float(value)
+            except Exception:
+                continue
+    return default
+
+
+def sort_dataframe_by_model_metric(df, metric=None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    metric = normalize_model_order_metric(metric or get_model_order_metric())
+    out = df.copy()
+    out["_model_order_score"] = out.apply(
+        lambda row: metric_value_from_mapping(row, metric=metric, default=float("-inf")),
+        axis=1,
+    )
+    if "Valid MCC" in out.columns:
+        out["_model_order_valid_mcc"] = pd.to_numeric(out["Valid MCC"], errors="coerce").fillna(float("-inf"))
+    elif "MCC" in out.columns:
+        out["_model_order_valid_mcc"] = pd.to_numeric(out["MCC"], errors="coerce").fillna(float("-inf"))
+    else:
+        out["_model_order_valid_mcc"] = float("-inf")
+    out = out.sort_values(["_model_order_score", "_model_order_valid_mcc"], ascending=[False, False])
+    return out.drop(columns=["_model_order_score", "_model_order_valid_mcc"], errors="ignore")
 
 # ---- String/Filename Utilities ---- #
 
@@ -175,11 +245,11 @@ def get_model_params_path(_args):
         proto_val = proto_val[len("prototypes_"):]
     
     # Get distance function and normalize values
-    dist_fct_val = str(getattr(_args, 'dist_fct', 'euclidean'))
+    dist_fct_val = str(getattr(_args, 'dist_fct', 'none') or 'none').strip() or 'none'
     normalize_val = str(getattr(_args, 'normalize', 'no'))
     
     # Strategy and components for prototypes
-    proto_strat = getattr(_args, 'prototype_strategy', 'mean')
+    proto_strat = str(getattr(_args, 'prototype_strategy', 'mean') or 'mean').strip() or 'mean'
     proto_comp = getattr(_args, 'prototype_components', 1)
 
     split_segment = ""
@@ -570,20 +640,26 @@ LEADERBOARD_CAL_POS_LABEL = "NotNormal"
 LEADERBOARD_CAL_N_BINS = 10
 
 
-def _resolve_valid_predictions_csv(log_path: str):
-    """Return the best available path to validation predictions, if any."""
+def _resolve_predictions_csv(log_path: str, split: str = "valid"):
+    """Return the best available path to split predictions, if any."""
     if not log_path:
         return None
 
-    direct_csv_path = os.path.join(log_path, "valid_predictions.csv")
+    split = str(split or "valid").strip().lower()
+    direct_csv_path = os.path.join(log_path, f"{split}_predictions.csv")
     if os.path.exists(direct_csv_path):
         return direct_csv_path
 
-    metadata_csv_path = _resolve_predictions_csv_from_metadata(log_path, "valid")
+    metadata_csv_path = _resolve_predictions_csv_from_metadata(log_path, split)
     if metadata_csv_path:
         return metadata_csv_path
 
-    return _resolve_predictions_csv_from_models_csv(log_path, "valid")
+    return _resolve_predictions_csv_from_models_csv(log_path, split)
+
+
+def _resolve_valid_predictions_csv(log_path: str):
+    """Return the best available path to validation predictions, if any."""
+    return _resolve_predictions_csv(log_path, "valid")
 
 
 def _resolve_predictions_csv_from_metadata(log_path: str, split: str):
@@ -724,8 +800,8 @@ def _resolve_predictions_csv_from_models_csv(log_path: str, split: str):
     return scored_rows[0][1]
 
 
-def _compute_calibration_metrics(log_path: str):
-    """Compute calibration metrics from the saved validation predictions."""
+def _compute_calibration_metrics(log_path: str, split: str = "valid"):
+    """Compute calibration metrics from the saved split predictions."""
     from sklearn.calibration import calibration_curve
 
     from otitenet.logging.metrics import expected_calibration_error, brier_score
@@ -733,7 +809,8 @@ def _compute_calibration_metrics(log_path: str):
     if not log_path:
         return None
 
-    csv_path = _resolve_valid_predictions_csv(log_path)
+    split = str(split or "valid").strip().lower()
+    csv_path = _resolve_predictions_csv(log_path, split)
     if csv_path is None:
         return None
 
@@ -779,7 +856,7 @@ def _compute_calibration_metrics(log_path: str):
         y_prob_filt = np.clip(probs[:, pos_idx], 0.0, 1.0)
         if set(np.unique(y_true_filt)) != {0, 1}:
             return {
-                "error": "Calibration requires both binary classes in validation labels",
+                "error": f"Calibration requires both binary classes in {split} labels",
                 "n_samples": int(len(y_true_filt)),
             }
     else:
@@ -787,7 +864,7 @@ def _compute_calibration_metrics(log_path: str):
         y_true_filt = (np.argmax(probs, axis=1) == y_idx).astype(int)
         if len(np.unique(y_true_filt)) < 2:
             return {
-                "error": "Multiclass calibration requires at least one correct and one incorrect validation prediction",
+                "error": f"Multiclass calibration requires at least one correct and one incorrect {split} prediction",
                 "n_samples": int(len(y_true_filt)),
             }
 
@@ -816,18 +893,22 @@ def _compute_calibration_metrics(log_path: str):
         "n_samples": int(len(y_true_filt)),
         "n_classes": int(len(labels)),
         "class_labels": labels,
+        "split": split,
+        "path": csv_path,
     }
 
 
-def get_calibration_metrics(log_path: str):
+def get_calibration_metrics(log_path: str, split: str = "valid"):
     """Return cached calibration metrics for a given log path, computing if needed."""
     if not log_path:
         return None
+    split = str(split or "valid").strip().lower()
     cache = st.session_state.setdefault(LEADERBOARD_CAL_CACHE_KEY, {})
-    if log_path in cache:
-        return cache[log_path]
-    metrics = _compute_calibration_metrics(log_path)
-    cache[log_path] = metrics
+    cache_key = f"{split}|{log_path}"
+    if cache_key in cache:
+        return cache[cache_key]
+    metrics = _compute_calibration_metrics(log_path, split=split)
+    cache[cache_key] = metrics
     return metrics
 
 
@@ -1245,10 +1326,29 @@ def _lookup_model_number(mapping_rd: dict, model_number_map: dict) -> str:
 
 def _ensure_model_number_map(cursor):
     """Ensure model_number_map and best_models_table exist in session state."""
+    active_metric = get_model_order_metric()
     model_number_map = st.session_state.get('model_number_map', {})
     best_models_table = st.session_state.get('best_models_table', None)
-    if model_number_map and best_models_table is not None:
-        return model_number_map, best_models_table
+    cached_metric = st.session_state.get("best_models_table_metric")
+    if model_number_map and best_models_table is not None and cached_metric == active_metric:
+        try:
+            cached_df = sort_dataframe_by_model_metric(pd.DataFrame(best_models_table)).reset_index(drop=True)
+            cached_df["#"] = np.arange(1, len(cached_df) + 1)
+            refreshed_map = {}
+            for _, row in cached_df.iterrows():
+                rd = row.to_dict()
+                refreshed_map[_make_model_selection_key(rd)] = rd.get("#", "?")
+            st.session_state['model_number_map'] = refreshed_map
+            st.session_state['best_models_table'] = cached_df.copy()
+            return refreshed_map, cached_df.copy()
+        except Exception:
+            return model_number_map, best_models_table
+    if cached_metric is not None and cached_metric != active_metric:
+        model_number_map = {}
+        best_models_table = None
+        st.session_state.pop('model_number_map', None)
+        st.session_state.pop('best_models_table', None)
+        st.session_state.pop('best_models_table_metric', None)
 
     try:
         try:
@@ -1381,15 +1481,21 @@ def _ensure_model_number_map(cursor):
                     if metric_name not in df.columns:
                         df[metric_name] = np.nan
                     df.at[idx, metric_name] = metric_value
+        head_metrics = best_cached_head_metrics_for_model_row(row.to_dict())
+        if head_metrics:
+            for metric_name, metric_value in head_metrics.items():
+                if metric_value is None:
+                    continue
+                if metric_name not in df.columns:
+                    df[metric_name] = np.nan
+                df.at[idx, metric_name] = metric_value
 
-    valid_sort = pd.to_numeric(df.get("Valid MCC"), errors="coerce")
-    mcc_sort = pd.to_numeric(df.get("MCC"), errors="coerce")
-    df = df.assign(
-        _valid_sort=valid_sort.fillna(-np.inf),
-        _mcc_sort=mcc_sort.fillna(-np.inf),
+    df = sort_dataframe_by_model_metric(df).reset_index(drop=True)
+    df = apply_selection_keys_to_models_df(
+        df,
+        st.session_state.get("top_models_filtered_selection_keys"),
+        filters_active=bool(st.session_state.get("top_models_filters_active")),
     )
-    df = df.sort_values(["_valid_sort", "_mcc_sort"], ascending=[False, False]).reset_index(drop=True)
-    df = df.drop(columns=["_valid_sort", "_mcc_sort"])
 
     df["#"] = np.arange(1, len(df) + 1)
     preferred_metrics = [
@@ -1416,6 +1522,23 @@ def _ensure_model_number_map(cursor):
     st.session_state['model_number_map'] = model_number_map
     st.session_state['best_models_table'] = df.copy()
     return model_number_map, df.copy()
+
+
+def apply_selection_keys_to_models_df(
+    df: pd.DataFrame,
+    selection_keys,
+    filters_active: bool = False,
+) -> pd.DataFrame:
+    """Filter a model dataframe by stable model selection keys."""
+    if df is None or df.empty:
+        return df
+    if selection_keys is None:
+        return df
+    if not selection_keys and filters_active:
+        return df.iloc[0:0].copy()
+    key_set = {str(key) for key in selection_keys}
+    mask = df.apply(lambda row: _make_model_selection_key(row.to_dict()) in key_set, axis=1)
+    return df[mask].reset_index(drop=True)
 
 
 _BASELINE_DISPLAY_NAMES = {
@@ -1451,8 +1574,10 @@ def format_classifier_config(best_config) -> str:
     if best_k_str.startswith('kde'):
         return f"KDE ({best_k_str})"
     try:
-        int(best_k_str)
-        return f"KNN (k={best_k_str})"
+        k_val = int(float(best_k_str))
+        if k_val >= 1:
+            return f"KNN (k={k_val})"
+        return best_k_str
     except ValueError:
         return best_k_str
 
@@ -1477,6 +1602,208 @@ def best_display_classifier_heads(rows: list[dict]) -> list[dict]:
         .first()
         .to_dict("records")
     )
+
+
+def _row_candidate_log_paths(row_dict: dict) -> list[str]:
+    """Return unique model artifact path candidates stored in a registry row."""
+    candidates = []
+    for key in ["Log Path", "log_path", "Artifact Log Path", "Best Model Dir", "best_model_dir", "Source Run Path", "source_run_log_path"]:
+        value = row_dict.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {"none", "nan", "null"} and text not in candidates:
+            candidates.append(text)
+    return candidates
+
+
+def _candidate_head_cache_paths_for_row(row_dict: dict) -> list[str]:
+    """Return likely knn_optimization_cache.pkl locations for a model row."""
+    candidates = []
+
+    def _add(path):
+        if not path:
+            return
+        normalized = os.path.normpath(str(path))
+        if normalized not in candidates:
+            candidates.append(normalized)
+
+    for path in _row_candidate_log_paths(row_dict):
+        cursor_path = path
+        if os.path.isfile(cursor_path):
+            cursor_path = os.path.dirname(cursor_path)
+        _add(os.path.join(cursor_path, "knn_optimization_cache.pkl"))
+
+        parts = cursor_path.replace("\\", "/").split("/")
+        for idx, part in enumerate(parts):
+            if part.startswith("dist_") or part.startswith("knn"):
+                parent = "/".join(parts[:idx])
+                _add(os.path.join(parent, "knn_optimization_cache.pkl") if parent else "knn_optimization_cache.pkl")
+                break
+
+        parent = cursor_path
+        for _ in range(5):
+            parent = os.path.dirname(parent)
+            if not parent or parent == "." or parent == os.path.dirname(parent):
+                break
+            _add(os.path.join(parent, "knn_optimization_cache.pkl"))
+            _add(os.path.join(parent, "normyes", "knn_optimization_cache.pkl"))
+            _add(os.path.join(parent, "normno", "knn_optimization_cache.pkl"))
+
+    return candidates
+
+
+def _best_head_from_cache_result(result: dict, n_aug=None) -> dict | None:
+    best = None
+    best_score = float("-inf")
+
+    def _consider(config, metrics):
+        nonlocal best, best_score
+        if config is None:
+            return
+        if not isinstance(metrics, dict):
+            metrics = {"valid_mcc": metrics}
+        score = metric_value_from_mapping(metrics, default=float("-inf"))
+        if score <= best_score:
+            return
+        best_score = score
+        best = {
+            "config": str(config),
+            "label": format_classifier_config(config),
+            "n_aug": n_aug,
+            "train_mcc": metrics.get("train_mcc"),
+            "valid_mcc": metrics.get("valid_mcc", metrics.get("mcc", metrics.get("best_mcc"))),
+            "test_mcc": metrics.get("test_mcc"),
+            "all_mcc": metrics.get("all_mcc"),
+            "valid_accuracy": metrics.get("valid_accuracy"),
+            "train_auc": metrics.get("train_auc"),
+            "valid_auc": metrics.get("valid_auc", metrics.get("auc")),
+            "test_auc": metrics.get("test_auc"),
+            "all_auc": metrics.get("all_auc"),
+        }
+
+    baselines = result.get("baselines") or {}
+    if isinstance(baselines, dict):
+        for baseline_name, baseline_data in baselines.items():
+            if isinstance(baseline_data, dict):
+                _consider(f"baseline_{baseline_name}", baseline_data)
+
+    knn_data = result.get("knn") or {}
+    if isinstance(knn_data, dict):
+        for idx, item in enumerate(knn_data.get("mcc_per_k", []) or []):
+            if isinstance(item, dict):
+                _consider(item.get("k", idx + 1), item)
+            else:
+                _consider(idx + 1, {"valid_mcc": item})
+
+    proto_data = result.get("prototypes") or {}
+    if isinstance(proto_data, dict):
+        for strategy, strategy_data in proto_data.items():
+            if isinstance(strategy_data, dict):
+                n_comp = strategy_data.get("best_n_components", 1)
+                _consider(f"protot_{strategy}_{n_comp}", strategy_data)
+
+    if result.get("best_config") is not None:
+        _consider(result.get("best_config"), result.get("best_head_metrics") or {"valid_mcc": result.get("best_mcc")})
+    elif result.get("best_k") is not None:
+        _consider(result.get("best_k"), {"valid_mcc": result.get("best_mcc")})
+
+    return best
+
+
+def _best_cached_head_metrics_from_files(row_dict: dict) -> dict | None:
+    best = None
+    best_score = float("-inf")
+    for cache_path in _candidate_head_cache_paths_for_row(row_dict):
+        if not os.path.exists(cache_path):
+            continue
+        try:
+            with open(cache_path, "rb") as f:
+                cache = pickle.load(f)
+        except Exception:
+            continue
+        if not isinstance(cache, dict):
+            continue
+        for n_aug, result in cache.items():
+            if not isinstance(result, dict):
+                continue
+            candidate = _best_head_from_cache_result(result, n_aug=n_aug)
+            if not candidate:
+                continue
+            score = metric_value_from_mapping(candidate, default=float("-inf"))
+            if score > best_score:
+                best = candidate
+                best_score = score
+    return best
+
+
+def best_cached_head_metrics_for_model_row(row_dict: dict, base_args=None) -> dict | None:
+    """Load the best persisted learned-head metrics for a model row.
+
+    This intentionally does not depend on Streamlit session state. It lets
+    leaderboards recover classifier-head MCC/AUC after an app/session reset
+    from the durable knn_optimization_cache.pkl files.
+    """
+    if not isinstance(row_dict, dict):
+        return None
+
+    try:
+        from argparse import Namespace
+        from otitenet.app.services.embedding_optimization_service import args_from_model_row
+    except Exception:
+        return None
+
+    base_args = base_args if base_args is not None else Namespace()
+    best = None
+    best_score = float("-inf")
+
+    candidate_rows = [dict(row_dict)]
+    for path in _row_candidate_log_paths(row_dict):
+        candidate = dict(row_dict)
+        candidate["Log Path"] = path
+        candidate_rows.append(candidate)
+
+    seen_paths = set()
+    for candidate in candidate_rows:
+        path_key = str(candidate.get("Log Path") or "").strip()
+        if path_key in seen_paths:
+            continue
+        seen_paths.add(path_key)
+        try:
+            model_args = args_from_model_row(base_args, candidate)
+            heads = enumerate_classification_heads(model_args, include_all_n_aug=True) or []
+        except Exception:
+            continue
+        for head in heads:
+            if not isinstance(head, dict):
+                continue
+            score = metric_value_from_mapping(head, default=float("-inf"))
+            if score > best_score:
+                best = dict(head)
+                best_score = score
+
+    if best is None:
+        best = _best_cached_head_metrics_from_files(row_dict)
+    if best is None:
+        return None
+
+    config = best.get("config") or best.get("Config")
+    return {
+        "Config": config,
+        "Head Config": config,
+        "Head": best.get("label") or best.get("Head") or format_classifier_config(config),
+        "Head Family": parse_classifier_config(config).get("family"),
+        "Head N Aug": best.get("n_aug", best.get("N Aug")),
+        "Train MCC": best.get("train_mcc", best.get("Train MCC")),
+        "Valid MCC": best.get("valid_mcc", best.get("Valid MCC", best.get("mcc"))),
+        "Test MCC": best.get("test_mcc", best.get("Test MCC")),
+        "All MCC": best.get("all_mcc", best.get("All MCC")),
+        "Valid Accuracy": best.get("valid_accuracy", best.get("Valid Accuracy")),
+        "Train AUC": best.get("train_auc", best.get("Train AUC")),
+        "Valid AUC": best.get("valid_auc", best.get("Valid AUC")),
+        "Test AUC": best.get("test_auc", best.get("Test AUC")),
+        "All AUC": best.get("all_auc", best.get("All AUC")),
+    }
 
 
 def parse_classifier_config(best_config) -> dict:
@@ -1510,7 +1837,10 @@ def parse_classifier_config(best_config) -> dict:
         return {"config": config, "family": "kde"}
 
     try:
-        return {"config": config, "family": "knn", "k": int(config)}
+        k_val = int(float(config))
+        if k_val >= 1:
+            return {"config": str(k_val), "family": "knn", "k": k_val}
+        return {"config": config, "family": "unknown"}
     except ValueError:
         return {"config": config, "family": "unknown"}
 
@@ -1532,6 +1862,23 @@ def get_optimization_cache_file_path(_args) -> str:
 def _optimization_cache_file_paths(_args) -> list[str]:
     """Return split-aware and legacy optimization cache locations for an args namespace."""
     paths = [get_optimization_cache_file_path(_args)]
+
+    proto_comp = getattr(_args, "prototype_components", 1)
+    proto_strat = str(getattr(_args, "prototype_strategy", "mean") or "mean")
+
+    def add_path(path: str):
+        if path and path not in paths:
+            paths.append(path)
+
+    # Older mirrored artifacts sometimes stored blank prototype aggregation as
+    # `protoagg__1` while current args normalize the missing strategy to `mean`.
+    # Check that legacy cache location too.
+    for path in list(paths):
+        legacy_protoagg = f"protoagg__{proto_comp}"
+        current_protoagg = f"protoagg_{proto_strat}_{proto_comp}"
+        if current_protoagg in path:
+            add_path(path.replace(current_protoagg, legacy_protoagg))
+
     if bool(getattr(_args, "split_config_in_path", False) or getattr(_args, "_split_config_in_path", False)):
         old_split_flag = getattr(_args, "split_config_in_path", False)
         old_private_flag = getattr(_args, "_split_config_in_path", False)
@@ -1539,8 +1886,11 @@ def _optimization_cache_file_paths(_args) -> list[str]:
             _args.split_config_in_path = False
             _args._split_config_in_path = False
             legacy_path = get_optimization_cache_file_path(_args)
-            if legacy_path not in paths:
-                paths.append(legacy_path)
+            add_path(legacy_path)
+            legacy_protoagg = f"protoagg__{proto_comp}"
+            current_protoagg = f"protoagg_{proto_strat}_{proto_comp}"
+            if current_protoagg in legacy_path:
+                add_path(legacy_path.replace(current_protoagg, legacy_protoagg))
         finally:
             _args.split_config_in_path = old_split_flag
             _args._split_config_in_path = old_private_flag
@@ -1603,6 +1953,19 @@ def _merge_optimization_cache_entries(
     return target_cache
 
 
+@lru_cache(maxsize=256)
+def _load_pickle_cache_file_cached(cache_path: str, mtime_ns: int, size: int):
+    """Load a pickle cache file with invalidation tied to file metadata."""
+    del mtime_ns, size
+    with open(cache_path, 'rb') as f:
+        return pickle.load(f)
+
+
+def _load_pickle_cache_file(cache_path: str):
+    stat = os.stat(cache_path)
+    return _load_pickle_cache_file_cached(cache_path, stat.st_mtime_ns, stat.st_size)
+
+
 def load_optimization_cache_dict(_args) -> dict:
     """Load merged optimization cache (unified + legacy paths)."""
     import glob
@@ -1615,27 +1978,25 @@ def load_optimization_cache_dict(_args) -> dict:
         if not os.path.exists(cache_path):
             continue
         try:
-            with open(cache_path, 'rb') as f:
-                merged_cache = _merge_optimization_cache_entries(
-                    merged_cache,
-                    pickle.load(f),
-                    _args=_args,
-                    replace_existing=(cache_idx == 0),
-                    allow_no_split_fallback=(cache_idx > 0),
-                )
+            merged_cache = _merge_optimization_cache_entries(
+                merged_cache,
+                _load_pickle_cache_file(cache_path),
+                _args=_args,
+                replace_existing=(cache_idx == 0),
+                allow_no_split_fallback=(cache_idx > 0),
+            )
         except Exception as e:
             print(f"[Cache] Could not load optimization cache {cache_path}: {e}")
     for cache_dir in cache_dirs:
         legacy_pattern = os.path.join(cache_dir, 'dist_*', 'knn*', 'knn_optimization_cache.pkl')
         for legacy_file in glob.glob(legacy_pattern):
             try:
-                with open(legacy_file, 'rb') as f:
-                    merged_cache = _merge_optimization_cache_entries(
-                        merged_cache,
-                        pickle.load(f),
-                        _args=_args,
-                        allow_no_split_fallback=True,
-                    )
+                merged_cache = _merge_optimization_cache_entries(
+                    merged_cache,
+                    _load_pickle_cache_file(legacy_file),
+                    _args=_args,
+                    allow_no_split_fallback=True,
+                )
             except Exception as e:
                 print(f"[Cache] Could not load legacy cache {legacy_file}: {e}")
     return merged_cache
@@ -1924,5 +2285,11 @@ def get_model_cache_key(args):
         str(getattr(args, 'n_calibration', 0)),
         str(getattr(args, 'normalize', 'no')),
         str(getattr(args, 'n_neighbors', 5)),
+        str(
+            getattr(args, 'classification_head_config', None)
+            or getattr(args, 'best_classifier_config', None)
+            or getattr(args, 'head_config', None)
+            or ''
+        ),
     ]
     return "|".join(params)

@@ -11,6 +11,7 @@ from matplotlib import pyplot as plt
 from PIL import Image
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
+from sklearn.preprocessing import LabelEncoder
 
 try:
     from umap import UMAP
@@ -37,6 +38,7 @@ def _run_comprehensive_eda(_args):
         train.n_cats = len(unique_labels)
         train.unique_batches = unique_batches
         train.unique_labels = unique_labels
+        train._batch_encoder = LabelEncoder().fit(np.asarray(unique_batches))
         train.epoch = 1
         train.model = model
         train.params = {'n_neighbors': int(_args.n_neighbors)}
@@ -48,6 +50,7 @@ def _run_comprehensive_eda(_args):
         samples_weights=None, epoch=1, unique_labels=unique_labels,
         triplet_dloss=_args.dloss, bs=_args.bs, prototypes_to_use=_args.prototypes_to_use,
         prototypes=prototypes, size=_args.new_size, normalize=_args.normalize,
+        batch_encoder=train._batch_encoder,
     )
 
     # Encode all sets
@@ -308,6 +311,5 @@ def render(ctx):
                     st.error(f"EDA failed: {e}")
                     import traceback
                     st.error(traceback.format_exc())
-
 
 

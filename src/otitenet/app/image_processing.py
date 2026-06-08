@@ -23,8 +23,8 @@ def _resize_for_model(img: Image.Image, size: int) -> Image.Image:
 
 def _per_image_normalize_array(array: np.ndarray) -> np.ndarray:
     mean = array.mean(axis=(1, 2), keepdims=True)
-    std = array.std(axis=(1, 2), keepdims=True)
-    return (array - mean) / (std + 1e-8)
+    std = array.std(axis=(1, 2), keepdims=True, ddof=1)
+    return (array - mean) / (std + 1e-6)
 
 
 def image_to_chw_array(img: Image.Image, size: int, normalize="no") -> np.ndarray:

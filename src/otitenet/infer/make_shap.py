@@ -88,6 +88,7 @@ if __name__ == '__main__':
     }
 
     loaders = get_images_loaders(data=data,
+                                    batch_encoder=None,
                                     random_recs=args.random_recs,
                                     weighted_sampler=0,
                                     is_transform=0,

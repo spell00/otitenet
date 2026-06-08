@@ -459,6 +459,16 @@ def _row_get(row: Dict[str, Any], *keys, default=None):
     return default
 
 
+def _coerce_int_or_default(value, default=None):
+    text = str(value or "").strip()
+    if text == "" or text.lower() in {"none", "nan", "null"}:
+        return default
+    try:
+        return int(float(text))
+    except Exception:
+        return default
+
+
 def args_from_inference_row(base_args, row_dict: Dict[str, Any]):
     """
     Build a model args namespace from a leaderboard/inference row.
@@ -494,7 +504,8 @@ def args_from_inference_row(base_args, row_dict: Dict[str, Any]):
         "n_neighbors": ("N_Neighbors", "n_neighbors"),
         "path": ("Path", "path", "Dataset", "Artifact Dataset", "Combo Dataset"),
         "task": ("Task", "task"),
-        "log_path": ("Artifact Log Path", "Log Path", "log_path"),
+        "log_path": ("Artifact Log Path", "Log Path", "source_run_log_path", "Source Run Path", "log_path"),
+        "source_run_log_path": ("Source Run Path", "source_run_log_path", "Log Path"),
         "prototype_strategy": ("Proto_Strat", "prototype_strategy"),
         "prototype_components": ("Proto_Comp", "prototype_components"),
         "valid_mcc": ("Valid MCC", "valid_mcc"),
@@ -518,10 +529,10 @@ def args_from_inference_row(base_args, row_dict: Dict[str, Any]):
             continue
 
         if attr in {"new_size", "n_neighbors", "n_positives", "n_negatives", "prototype_components"}:
-            try:
-                value = int(float(value))
-            except Exception:
-                pass
+            fallback = getattr(args, attr, None)
+            value = _coerce_int_or_default(value, fallback)
+            if value is None:
+                continue
         elif attr in {"valid_mcc", "mcc", "valid_auc", "test_mcc", "test_auc"}:
             try:
                 value = float(value)

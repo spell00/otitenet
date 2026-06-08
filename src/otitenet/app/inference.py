@@ -13,6 +13,68 @@ import numpy as np
 from otitenet.utils.kde import make_kde_classifier
 
 
+def _prototype_min_distances(
+    embedding_tensor: torch.Tensor,
+    class_prototypes: dict,
+    dist_fct_name: str = 'euclidean',
+) -> dict:
+    """Return each class distance to its closest prototype."""
+    emb = embedding_tensor.detach().cpu()
+    if emb.ndim == 1:
+        emb = emb.unsqueeze(0)
+
+    distances = {}
+    for label, proto in (class_prototypes or {}).items():
+        if proto is None:
+            continue
+        proto_t = torch.as_tensor(proto, dtype=emb.dtype)
+        if proto_t.ndim == 1:
+            proto_t = proto_t.unsqueeze(0)
+        elif proto_t.ndim > 2:
+            proto_t = proto_t.reshape(proto_t.shape[0], -1)
+        if proto_t.numel() == 0:
+            continue
+
+        if str(dist_fct_name).lower() == 'cosine':
+            emb_norm = torch.nn.functional.normalize(emb, p=2, dim=1)
+            proto_norm = torch.nn.functional.normalize(proto_t, p=2, dim=1)
+            distances[label] = float((1.0 - torch.mm(emb_norm, proto_norm.T)).min().item())
+        else:
+            distances[label] = float(torch.cdist(emb, proto_t, p=2).min().item())
+    return distances
+
+
+def prototype_distance_probabilities_from_distances(
+    distances: dict,
+    temperature: float | None = None,
+) -> dict:
+    """Convert closest-prototype distances into probabilities.
+
+    Uses softmax(-distance / temperature), so nearer prototypes get higher
+    probability while preserving a calibrated confidence-like ranking.
+    """
+    finite = {
+        label: float(dist)
+        for label, dist in (distances or {}).items()
+        if np.isfinite(float(dist))
+    }
+    if not finite:
+        return {label: 0.0 for label in (distances or {})}
+
+    values = np.array(list(finite.values()), dtype=float)
+    if temperature is None:
+        spread = float(np.std(values))
+        temperature = spread if spread > 1e-8 else 1.0
+    temperature = max(float(temperature), 1e-8)
+    logits = -values / temperature
+    logits = logits - np.max(logits)
+    probs = np.exp(logits)
+    probs = probs / max(float(np.sum(probs)), 1e-12)
+    out = {label: 0.0 for label in (distances or {})}
+    out.update({label: float(prob) for label, prob in zip(finite.keys(), probs)})
+    return out
+
+
 def predict_label_from_prototypes(
     embedding_tensor: torch.Tensor,
     class_prototypes: dict,
@@ -32,37 +94,9 @@ def predict_label_from_prototypes(
         Predicted class label, or None on error
     """
     try:
-        emb = embedding_tensor.detach().cpu()
-        if emb.ndim == 1:
-            emb = emb.unsqueeze(0)
-
-        # For cosine, we maximize similarity; for euclidean, we minimize distance
-        best_label = None
-        best_score = -float('inf') if dist_fct_name == 'cosine' else float('inf')
-
-        if str(dist_fct_name).lower() == 'cosine':
-            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
-
-        for label, proto in class_prototypes.items():
-            if proto is None:
-                continue
-            proto_t = torch.as_tensor(proto, dtype=emb.dtype)
-            if proto_t.ndim == 1:
-                proto_t = proto_t.unsqueeze(0)
-
-            if str(dist_fct_name).lower() == 'cosine':
-                proto_t = torch.nn.functional.normalize(proto_t, p=2, dim=1)
-                sim = torch.mm(emb, proto_t.T).mean().item()
-                if sim > best_score:
-                    best_score = sim
-                    best_label = label
-            else:
-                dist = torch.cdist(emb, proto_t, p=2).mean().item()
-                if dist < best_score:
-                    best_score = dist
-                    best_label = label
-
-        return best_label
+        distances = _prototype_min_distances(embedding_tensor, class_prototypes, dist_fct_name)
+        probas = prototype_distance_probabilities_from_distances(distances)
+        return max(probas, key=probas.get) if probas else None
     except Exception:
         return None
 
@@ -74,8 +108,8 @@ def predict_with_prototype_distance_ratio(
 ):
     """Predict using distance ratio to class prototypes.
     
-    Probability is calculated as inverse distance ratio:
-    prob(class) = (1/dist_to_proto) / sum(1/dist_to_all_protos)
+    Probability is calculated as softmax over negative closest-prototype
+    distances, so the nearest prototype gets highest priority.
     
     Args:
         embedding_tensor: Input embedding tensor
@@ -86,28 +120,7 @@ def predict_with_prototype_distance_ratio(
         Class with highest probability, or None on error
     """
     try:
-        emb = embedding_tensor.detach().cpu()
-        if emb.ndim == 1:
-            emb = emb.unsqueeze(0)
-
-        # Compute distances to each class prototype
-        distances = {}
-        for label, proto in class_prototypes.items():
-            if proto is None:
-                continue
-            proto_t = torch.as_tensor(proto, dtype=emb.dtype)
-            if proto_t.ndim == 1:
-                proto_t = proto_t.unsqueeze(0)
-
-            if str(dist_fct_name).lower() == 'cosine':
-                emb_norm = torch.nn.functional.normalize(emb, p=2, dim=1)
-                proto_norm = torch.nn.functional.normalize(proto_t, p=2, dim=1)
-                sim = torch.mm(emb_norm, proto_norm.T).mean().item()
-                distances[label] = 1.0 - sim  # Convert similarity to distance
-            else:
-                dist = torch.cdist(emb, proto_t, p=2).mean().item()
-                distances[label] = dist
-
+        distances = _prototype_min_distances(embedding_tensor, class_prototypes, dist_fct_name)
         probas = prototype_distance_probabilities_from_distances(distances)
         return max(probas, key=probas.get)
     except Exception as e:
@@ -115,41 +128,14 @@ def predict_with_prototype_distance_ratio(
         return None
 
 
-def prototype_distance_probabilities_from_distances(distances: dict) -> dict:
-    inv_distances = {label: 1.0 / (float(dist) + 1e-8) for label, dist in distances.items()}
-    total_inv = sum(inv_distances.values())
-    if total_inv <= 0:
-        return {label: 0.0 for label in distances}
-    return {label: inv_dist / total_inv for label, inv_dist in inv_distances.items()}
-
-
 def predict_with_prototype_distance_ratio_proba(
     embedding_tensor: torch.Tensor,
     class_prototypes: dict,
     dist_fct_name: str = 'euclidean'
 ):
-    """Return both predicted label and inverse-distance prototype probabilities."""
+    """Return both predicted label and softmax closest-prototype probabilities."""
     try:
-        emb = embedding_tensor.detach().cpu()
-        if emb.ndim == 1:
-            emb = emb.unsqueeze(0)
-
-        distances = {}
-        for label, proto in class_prototypes.items():
-            if proto is None:
-                continue
-            proto_t = torch.as_tensor(proto, dtype=emb.dtype)
-            if proto_t.ndim == 1:
-                proto_t = proto_t.unsqueeze(0)
-
-            if str(dist_fct_name).lower() == 'cosine':
-                emb_norm = torch.nn.functional.normalize(emb, p=2, dim=1)
-                proto_norm = torch.nn.functional.normalize(proto_t, p=2, dim=1)
-                sim = torch.mm(emb_norm, proto_norm.T).mean().item()
-                distances[label] = 1.0 - sim
-            else:
-                distances[label] = torch.cdist(emb, proto_t, p=2).mean().item()
-
+        distances = _prototype_min_distances(embedding_tensor, class_prototypes, dist_fct_name)
         probas = prototype_distance_probabilities_from_distances(distances)
         if not probas:
             return None, {}

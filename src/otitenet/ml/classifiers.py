@@ -32,11 +32,24 @@ def fit_knn_classifier(train_encs: np.ndarray, train_cats: np.ndarray,
     Returns:
         Fitted KNN classifier
     """
-    # Ensure k doesn't exceed number of samples
-    n_neighbors = min(n_neighbors, train_encs.shape[0])
+    n_samples = int(train_encs.shape[0])
+    if n_samples < 1:
+        raise ValueError("Cannot fit KNN classifier without training samples.")
+
+    try:
+        n_neighbors = int(float(n_neighbors))
+    except (TypeError, ValueError):
+        n_neighbors = 1
+    n_neighbors = max(1, min(n_neighbors, n_samples))
+
     params = {'n_neighbors': n_neighbors, 'metric': metric}
     if knn_params:
         params.update(knn_params)
+    try:
+        params['n_neighbors'] = int(float(params.get('n_neighbors', n_neighbors)))
+    except (TypeError, ValueError):
+        params['n_neighbors'] = n_neighbors
+    params['n_neighbors'] = max(1, min(params['n_neighbors'], n_samples))
     knn = KNN(**params)
     knn.fit(train_encs, train_cats)
     return knn

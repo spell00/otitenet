@@ -2,7 +2,8 @@
 
 import numpy as np
 import torch
-import torchvision.transforms as transforms
+from torchvision.transforms import v2 as transforms
+from torch import nn
 from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
 
@@ -10,7 +11,8 @@ from sklearn.mixture import GaussianMixture
 def get_base_transform():
     """Get base transform (no augmentation) for inference and validation/test encoding."""
     return transforms.Compose([
-        transforms.ToTensor()
+        transforms.ToImage(),
+        transforms.ToDtype(torch.float32, scale=True),
     ])
 
 
@@ -24,16 +26,21 @@ def get_knn_augmentation_transform(image_size: int):
         Composed transform with random flips, rotations, and crops
     """
     return transforms.Compose([
-        transforms.ToTensor(),
+        transforms.ToImage(),
+        transforms.ToDtype(torch.float32, scale=True),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
         transforms.RandomRotation(degrees=(-180, 180)),
         transforms.RandomApply(
-            [transforms.RandomResizedCrop(
-                size=image_size,
-                scale=(0.8, 1.0),
-                ratio=(0.8, 1.2)
-            )], p=0.5),
+            nn.ModuleList([
+                transforms.RandomResizedCrop(
+                    size=image_size,
+                    scale=(0.8, 1.0),
+                    ratio=(0.8, 1.2),
+                )
+            ]),
+            p=0.5,
+        ),
     ])
 
 

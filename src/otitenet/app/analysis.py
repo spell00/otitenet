@@ -9,10 +9,17 @@ import os
 import json
 import pickle
 import numpy as np
+import pandas as pd
 import torch
 import streamlit as st
 from datetime import datetime
 from sklearn.preprocessing import LabelEncoder
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.linear_model import RidgeClassifier
 
 from otitenet.train.train_triplet_new import TrainAE
 from otitenet.data.data_getters import PerImageNormalize, get_images_loaders
@@ -28,6 +35,7 @@ from otitenet.app.utils import (
     dataset_path_segment,
     _make_model_selection_key,
     _ensure_model_number_map,
+    format_classifier_config,
 )
 from otitenet.app.inference import (
     predict_label_from_prototypes as _predict_label_from_prototypes,
@@ -38,8 +46,32 @@ from otitenet.app.inference import (
 from otitenet.ml import fit_knn_classifier, fit_linearsvc_classifier, fit_logreg_classifier
 from otitenet.app.utils import get_model_cache_key
 
+_PROTOTYPE_SKIP_MESSAGE_PRINTED = False
+
 
 from contextlib import contextmanager, nullcontext
+
+
+def _positive_int(value, default=1):
+    """Return a positive int, falling back for blank, invalid, or non-positive values."""
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 1 else default
+
+
+def _valid_path_text(value) -> str:
+    """Return a usable path string, or empty for missing/pandas-null values."""
+    try:
+        if value is None or pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value or "").strip()
+    if text.lower() in {"", "none", "nan", "null", "—"}:
+        return ""
+    return text
 
 
 def _normalize_probability_map(probas, labels):
@@ -107,27 +139,74 @@ def _head_config_from_args(_args):
         or getattr(_args, "head_config", None)
     )
     if config is not None and str(config).strip() not in {"", "None", "nan", "—"}:
-        return str(config).strip()
+        config_text = str(config).strip()
+        try:
+            parsed_k = int(float(config_text))
+            if parsed_k >= 1:
+                return str(parsed_k)
+        except (TypeError, ValueError):
+            return config_text
 
     mode = str(getattr(_args, "siamese_inference", "linearsvc")).strip().lower()
     if mode == "linearsvc":
         return "baseline_linear_svc"
     if mode == "logisticregression":
         return "baseline_logreg"
-    return str(getattr(_args, "n_neighbors", 1))
+    return str(_positive_int(getattr(_args, "n_neighbors", 1), default=1))
 
 
 def _classifier_kind_from_config(config):
     config = str(config or "").strip().lower()
-    if config in {"linearsvc", "linear_svc", "baseline_linearsvc", "baseline_linear_svc"}:
-        return "linearsvc"
-    if config in {"logisticregression", "logistic_regression", "logreg", "baseline_logreg", "baseline_logistic_regression"}:
-        return "logisticregression"
-    if config.startswith("baseline_linear_svc"):
-        return "linearsvc"
-    if config.startswith("baseline_logreg") or config.startswith("baseline_logistic_regression"):
-        return "logisticregression"
+    if config.startswith("protot_"):
+        return "prototype"
+    if config.startswith("kde"):
+        return "kde"
+    if config.startswith("baseline_"):
+        return config.replace("baseline_", "", 1)
+    if config in {"linearsvc", "linear_svc"}:
+        return "linear_svc"
+    if config in {"logisticregression", "logistic_regression", "logreg"}:
+        return "logreg"
     return "knn"
+
+
+def _fit_embedding_classifier_for_kind(classifier_kind, train_encs, train_cats, _args, head_config=None):
+    if classifier_kind in {"linear_svc", "linearsvc"}:
+        print(f"Using LinearSVC classifier on embeddings (train_n={train_encs.shape[0]})")
+        return fit_linearsvc_classifier(train_encs, train_cats)
+    if classifier_kind in {"logreg", "logisticregression", "logistic_regression"}:
+        print(f"Using LogisticRegression classifier on embeddings (train_n={train_encs.shape[0]})")
+        return fit_logreg_classifier(train_encs, train_cats)
+    if classifier_kind == "ridge":
+        print(f"Using Ridge classifier on embeddings (train_n={train_encs.shape[0]})")
+        clf = RidgeClassifier()
+    elif classifier_kind == "naive_bayes":
+        print(f"Using Naive Bayes classifier on embeddings (train_n={train_encs.shape[0]})")
+        clf = GaussianNB()
+    elif classifier_kind == "rbf_svc":
+        print(f"Using RBF SVC classifier on embeddings (train_n={train_encs.shape[0]})")
+        clf = SVC(kernel="rbf", probability=True, random_state=1)
+    elif classifier_kind == "random_forest":
+        print(f"Using Random Forest classifier on embeddings (train_n={train_encs.shape[0]})")
+        clf = RandomForestClassifier(n_estimators=100, random_state=1)
+    elif classifier_kind == "gradient_boosting":
+        print(f"Using Gradient Boosting classifier on embeddings (train_n={train_encs.shape[0]})")
+        clf = GradientBoostingClassifier(n_estimators=100, random_state=1)
+    elif classifier_kind == "decision_tree":
+        print(f"Using Decision Tree classifier on embeddings (train_n={train_encs.shape[0]})")
+        clf = DecisionTreeClassifier(random_state=1)
+    elif classifier_kind == "lda":
+        print(f"Using Linear Discriminant Analysis classifier on embeddings (train_n={train_encs.shape[0]})")
+        clf = LinearDiscriminantAnalysis()
+    elif classifier_kind == "qda":
+        print(f"Using Quadratic Discriminant Analysis classifier on embeddings (train_n={train_encs.shape[0]})")
+        clf = QuadraticDiscriminantAnalysis()
+    else:
+        nn_count = _positive_int(head_config, default=0) or _positive_int(getattr(_args, "n_neighbors", 1), default=1)
+        print(f"Using KNN classifier on embeddings (k={nn_count}, train_n={train_encs.shape[0]})")
+        return fit_knn_classifier(train_encs, train_cats, n_neighbors=nn_count, metric="minkowski")
+    clf.fit(train_encs, train_cats)
+    return clf
 
 
 @contextmanager
@@ -169,40 +248,96 @@ def _fit_batch_encoder(unique_batches):
     return encoder
 
 
+def _embedding_classifier_cache_key(_args, head_config=None):
+    """Return the session-state cache key for a model/head embedding classifier."""
+    resolved_head_config = head_config if head_config is not None else _head_config_from_args(_args)
+    return f"{get_model_cache_key(_args)}|head={resolved_head_config}"
+
+
+def clear_embedding_classifier_cache_for_args(_args, head_config=None) -> bool:
+    """Remove a fitted embedding classifier cache entry for this model/head."""
+    cache = st.session_state.setdefault('embedding_classifier_cache', {})
+    key = _embedding_classifier_cache_key(_args, head_config=head_config)
+    return cache.pop(key, None) is not None
+
+
 def get_or_build_embedding_classifier(_args, data, unique_labels, unique_batches, prototypes):
     """Return a cached embedding classifier for the selected model/head."""
-    use_prototypes = (_args.prototypes_to_use in ['combined', 'class'])
-    if use_prototypes:
-        print("⏭️  Skipping embedding classifier: using prototype-based classification instead")
-        return None, unique_labels
+    global _PROTOTYPE_SKIP_MESSAGE_PRINTED
 
     head_config = _head_config_from_args(_args)
     classifier_kind = _classifier_kind_from_config(head_config)
+    use_prototypes = (
+        classifier_kind == "prototype"
+        and _args.prototypes_to_use in ['combined', 'class']
+    )
+    if use_prototypes:
+        if not _PROTOTYPE_SKIP_MESSAGE_PRINTED:
+            print("Skipping embedding classifier: using prototype-based classification instead")
+            _PROTOTYPE_SKIP_MESSAGE_PRINTED = True
+        return None, unique_labels
 
     cache = st.session_state.setdefault('embedding_classifier_cache', {})
-    key = f"{get_model_cache_key(_args)}|head={head_config}"
+    key = _embedding_classifier_cache_key(_args, head_config=head_config)
     if key in cache:
         print(f"♻️  Using cached {cache[key].get('classifier_kind', 'embedding')} classifier")
         return cache[key]['classifier'], cache[key]['unique_labels']
 
     def _candidate_train_encoding_paths():
         candidates = []
+
+        def _add_candidate(path):
+            if path:
+                candidates.append(path)
+
+        def _add_candidate_variants(path):
+            if not path:
+                return
+            variants = []
+            seen_variants = set()
+            queue = [path]
+            while queue:
+                current = queue.pop(0)
+                if current in seen_variants:
+                    continue
+                seen_variants.add(current)
+                variants.append(current)
+                replacements = []
+                if "protoagg__" in current:
+                    replacements.append(current.replace("protoagg__", "protoagg_mean_"))
+                if "/dist_/" in current:
+                    replacements.append(current.replace("/dist_/", "/dist_none/"))
+                if "/prototypes_no/" in current:
+                    replacements.append(current.replace("/prototypes_no/", "/prototypes_class/"))
+                if "/prototypes_class/" in current:
+                    replacements.append(current.replace("/prototypes_class/", "/prototypes_no/"))
+                queue.extend(replacements)
+            for variant in variants:
+                _add_candidate(variant)
+
         for attr in ["train_encodings_path", "Train Encodings Path"]:
-            value = getattr(_args, attr, None)
+            value = _valid_path_text(getattr(_args, attr, None))
             if value:
-                candidates.append(str(value))
+                _add_candidate_variants(value)
 
         for attr in ["log_path", "best_model_dir", "Artifact Log Path", "Best Model Dir"]:
-            value = getattr(_args, attr, None)
+            value = _valid_path_text(getattr(_args, attr, None))
             if not value:
                 continue
-            path = str(value)
+            path = value
             if os.path.isfile(path):
                 path = os.path.dirname(path)
-            candidates.append(os.path.join(path, "train_encodings.npz"))
+            _add_candidate_variants(os.path.join(path, "train_encodings.npz"))
 
         model_params = get_model_params_path(_args)
-        candidates.append(
+        try:
+            from otitenet.app.utils import get_optimization_cache_file_path
+
+            cache_dir = os.path.dirname(get_optimization_cache_file_path(_args))
+            _add_candidate_variants(os.path.join(cache_dir, "train_encodings.npz"))
+        except Exception:
+            pass
+        _add_candidate_variants(
             os.path.join(
                 f'logs/best_models/{_args.task}/{_args.model_name}',
                 model_params,
@@ -217,7 +352,7 @@ def get_or_build_embedding_classifier(_args, data, unique_labels, unique_batches
                 _args.split_config_in_path = False
                 _args._split_config_in_path = False
                 legacy_params = get_model_params_path(_args)
-                candidates.append(
+                _add_candidate_variants(
                     os.path.join(
                         f'logs/best_models/{_args.task}/{_args.model_name}',
                         legacy_params,
@@ -336,19 +471,7 @@ def get_or_build_embedding_classifier(_args, data, unique_labels, unique_batches
         train_encs = np.concatenate(lists['train']['encoded_values'])
         train_cats = np.concatenate(lists['train']['cats'])
     
-    if classifier_kind == "linearsvc":
-        classifier = fit_linearsvc_classifier(train_encs, train_cats)
-        print(f"Using LinearSVC classifier on embeddings (train_n={train_encs.shape[0]})")
-    elif classifier_kind == "logisticregression":
-        classifier = fit_logreg_classifier(train_encs, train_cats)
-        print(f"Using LogisticRegression classifier on embeddings (train_n={train_encs.shape[0]})")
-    elif _args.classif_loss not in ['ce', 'hinge']:
-        nn_count = int(_args.n_neighbors)
-        classifier = fit_knn_classifier(train_encs, train_cats, n_neighbors=nn_count, metric='minkowski')
-        print(f"Using KNN classifier on embeddings (k={nn_count}, train_n={train_encs.shape[0]})")
-    else:
-        classifier = fit_knn_classifier(train_encs, train_cats, n_neighbors=1, metric='minkowski')
-        print(f"Using KNN classifier on embeddings (k=1, train_n={train_encs.shape[0]})")
+    classifier = _fit_embedding_classifier_for_kind(classifier_kind, train_encs, train_cats, _args, head_config=head_config)
 
     cache[key] = {'classifier': classifier, 'unique_labels': unique_labels, 'classifier_kind': classifier_kind}
     st.session_state['train_embeddings'] = train_encs
@@ -612,7 +735,7 @@ def _run_analysis_on_file_impl(
                 
                 embedding = emb_tensor.detach().cpu().numpy()
                 
-                if use_kde:
+                if classifier_kind == "kde" and use_kde:
                     # Use KDE classifier
                     if 'train_embeddings' not in st.session_state or 'train_labels' not in st.session_state:
                         # Fallback to prototype distance if KDE data not available
@@ -639,7 +762,7 @@ def _run_analysis_on_file_impl(
                             pred_confidence = 0.0
                         pred_probas = {str(pred_label): float(pred_confidence)}
                 
-                elif use_prototypes:
+                elif classifier_kind == "prototype" and use_prototypes:
                     # Use prototype distance classification
                     class_protos = prototypes.get('class', {}).get('train', {})
                     pred_lbl, pred_probas = _predict_with_prototype_distance_ratio_proba(
@@ -658,6 +781,11 @@ def _run_analysis_on_file_impl(
                 else:
                     # Use the selected embedding classifier head.
                     embedding_classifier = nets['embedding_classifier']
+                    if embedding_classifier is None:
+                        raise RuntimeError(
+                            "No embedding classifier was available for the selected learned-embedding head "
+                            f"({format_classifier_config(_head_config_from_args(_args))})."
+                        )
                     if hasattr(embedding_classifier, "predict_proba"):
                         pred_probs = embedding_classifier.predict_proba(embedding)
                     elif hasattr(embedding_classifier, "decision_function"):
@@ -697,10 +825,8 @@ def _run_analysis_on_file_impl(
             method_label = f"KDE ({getattr(_args, 'kde_kernel', 'gaussian')} kernel)"
         elif use_prototypes:
             method_label = f"Prototype-based ({getattr(_args, 'prototype_kind', 'distance')})"
-        elif _classifier_kind_from_config(_head_config_from_args(_args)) == "linearsvc":
-            method_label = "LinearSVC"
-        elif _classifier_kind_from_config(_head_config_from_args(_args)) == "logisticregression":
-            method_label = "LogisticRegression"
+        elif _classifier_kind_from_config(_head_config_from_args(_args)) != "knn":
+            method_label = format_classifier_config(_head_config_from_args(_args))
         else:
             method_label = f"KNN (k={_args.n_neighbors})"
         

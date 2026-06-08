@@ -271,14 +271,40 @@ def has_model_artifacts(path: str | Path) -> bool:
     return (root / "model.pth").is_file() and (root / "prototypes.pkl").is_file()
 
 
+def is_source_run_artifact_dir(path: str | Path) -> bool:
+    """Return True for primary run artifact dirs: logs/<task>/<uuid>."""
+    if not path:
+        return False
+    text = str(path).strip().replace("\\", "/").rstrip("/")
+    parts = text.split("/")
+    if "logs" in parts:
+        parts = parts[parts.index("logs") :]
+    return (
+        len(parts) >= 3
+        and parts[0] == "logs"
+        and parts[1] != "best_models"
+        and has_model_artifacts(text)
+    )
+
+
+def allow_legacy_best_models_artifacts() -> bool:
+    return str(os.environ.get("OTITENET_ALLOW_LEGACY_BEST_MODELS", "")).strip().lower() in {"1", "true", "yes"}
+
+
 def preferred_model_artifact_dir(row: dict[str, object]) -> str:
-    """Prefer original source-run artifacts, then best-model mirror artifacts."""
+    """Prefer original source-run artifacts; best_models is legacy opt-in only."""
     for key in ("source_run_log_path", "Source Run Path", "run_log_path", "Run Log Path"):
         value = str(row.get(key, "") or "").strip()
-        if value and has_model_artifacts(value):
+        if value and is_source_run_artifact_dir(value):
             return value
+    for key in ("log_path", "Log Path"):
+        value = str(row.get(key, "") or "").strip()
+        if value and is_source_run_artifact_dir(value):
+            return value
+    if not allow_legacy_best_models_artifacts():
+        return ""
     for key in ("best_model_dir", "Best Model Dir", "model_dir", "Model Dir", "log_path", "Log Path"):
         value = str(row.get(key, "") or "").strip()
         if value and has_model_artifacts(value):
             return value
-    return str(row.get("log_path") or row.get("Log Path") or row.get("model_dir") or "").strip()
+    return ""

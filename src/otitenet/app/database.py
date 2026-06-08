@@ -14,6 +14,7 @@ import mysql.connector
 from mysql.connector import Error
 import os
 import json
+from pathlib import Path
 from otitenet.app.utils import (
     LEGACY_TRAIN_DATASETS,
     LEGACY_VALID_DATASET,
@@ -36,6 +37,48 @@ def _mysql_value(x):
 def _mysql_values(values):
     return tuple(_mysql_value(v) for v in values)
 
+
+def is_mysql_connection_lost_error(exc) -> bool:
+    """Return True for MySQL errors that mean the cursor/connection is unusable."""
+    errno = getattr(exc, "errno", None)
+    if errno in {2006, 2013, 2055}:
+        return True
+    msg = str(exc).lower()
+    return any(
+        marker in msg
+        for marker in (
+            "mysql server has gone away",
+            "lost connection",
+            "bad file descriptor",
+            "eof occurred in violation of protocol",
+            "decryption_failed_or_bad_record_mac",
+            "bad record mac",
+        )
+    )
+
+
+def _safe_rollback(conn):
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
+def _table_row_count(cursor, table_name: str) -> int | None:
+    try:
+        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        row = cursor.fetchone()
+        return int(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def _dedupe_max_rows() -> int:
+    try:
+        return int(os.environ.get("OTITENET_DEDUPE_MAX_ROWS", "10000"))
+    except Exception:
+        return 10000
+
 @st.cache_resource
 def get_db_connection():
     """Create and cache a MySQL database connection."""
@@ -50,6 +93,7 @@ def get_db_connection():
             # Avoid sporadic C-extension parsing issues seen as
             # "bytearray index out of range" on some environments.
             use_pure=True,
+            ssl_disabled=True,
         )
         return conn
     except Error as e:
@@ -96,6 +140,7 @@ def create_db():
                     buffered=True,
                     autocommit=True,
                     use_pure=True,
+                    ssl_disabled=True,
                 )
                 if not conn.is_connected():
                     conn.reconnect(attempts=3, delay=1)
@@ -110,6 +155,224 @@ def create_db():
                 else:
                     st.error(f"❌ Database error: {e3}")
                 st.stop()
+
+
+def cleanup_duplicate_results_rows(conn, cursor):
+    """Keep one latest inference result per exact image/person/model tuple."""
+    row_count = _table_row_count(cursor, "results")
+    max_rows = _dedupe_max_rows()
+    if row_count is not None and row_count > max_rows:
+        print(
+            f"[database] Skipping results duplicate cleanup: {row_count} rows exceeds "
+            f"OTITENET_DEDUPE_MAX_ROWS={max_rows}"
+        )
+        return
+
+    try:
+        cursor.execute(
+            """
+            DELETE r1 FROM results r1
+            JOIN results r2
+              ON COALESCE(r1.filename, '') = COALESCE(r2.filename, '')
+             AND COALESCE(r1.person_id, -1) = COALESCE(r2.person_id, -1)
+             AND COALESCE(r1.model_id, -1) = COALESCE(r2.model_id, -1)
+             AND (
+                    COALESCE(r1.timestamp, '1970-01-01') < COALESCE(r2.timestamp, '1970-01-01')
+                 OR (
+                        COALESCE(r1.timestamp, '1970-01-01') = COALESCE(r2.timestamp, '1970-01-01')
+                    AND r1.id < r2.id
+                    )
+                 )
+            WHERE r1.id <> r2.id
+              AND r1.model_id IS NOT NULL
+            """
+        )
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn)
+        if is_mysql_connection_lost_error(e):
+            raise
+
+    # Legacy fallback for rows without model_id: exact same parameter tuple.
+    try:
+        cursor.execute(
+            """
+            DELETE r1 FROM results r1
+            JOIN results r2
+              ON COALESCE(r1.filename, '') = COALESCE(r2.filename, '')
+             AND COALESCE(r1.person_id, -1) = COALESCE(r2.person_id, -1)
+             AND COALESCE(r1.model_name, '') = COALESCE(r2.model_name, '')
+             AND COALESCE(r1.task, '') = COALESCE(r2.task, '')
+             AND COALESCE(r1.path, '') = COALESCE(r2.path, '')
+             AND COALESCE(r1.n_neighbors, '') = COALESCE(r2.n_neighbors, '')
+             AND COALESCE(r1.nsize, '') = COALESCE(r2.nsize, '')
+             AND COALESCE(r1.fgsm, '') = COALESCE(r2.fgsm, '')
+             AND COALESCE(r1.normalize, '') = COALESCE(r2.normalize, '')
+             AND COALESCE(r1.n_calibration, '') = COALESCE(r2.n_calibration, '')
+             AND COALESCE(r1.classif_loss, '') = COALESCE(r2.classif_loss, '')
+             AND COALESCE(r1.dloss, '') = COALESCE(r2.dloss, '')
+             AND COALESCE(r1.dist_fct, '') = COALESCE(r2.dist_fct, '')
+             AND COALESCE(r1.prototypes, '') = COALESCE(r2.prototypes, '')
+             AND COALESCE(r1.npos, '') = COALESCE(r2.npos, '')
+             AND COALESCE(r1.nneg, '') = COALESCE(r2.nneg, '')
+             AND (
+                    COALESCE(r1.timestamp, '1970-01-01') < COALESCE(r2.timestamp, '1970-01-01')
+                 OR (
+                        COALESCE(r1.timestamp, '1970-01-01') = COALESCE(r2.timestamp, '1970-01-01')
+                    AND r1.id < r2.id
+                    )
+                 )
+            WHERE r1.id <> r2.id
+              AND r1.model_id IS NULL
+              AND r2.model_id IS NULL
+            """
+        )
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn)
+        if is_mysql_connection_lost_error(e):
+            raise
+
+
+def cleanup_duplicate_best_models_registry(conn, cursor):
+    """Keep one best row for each exact best-model configuration."""
+    row_count = _table_row_count(cursor, "best_models_registry")
+    max_rows = _dedupe_max_rows()
+    if row_count is not None and row_count > max_rows:
+        print(
+            f"[database] Skipping best_models_registry duplicate cleanup: {row_count} rows exceeds "
+            f"OTITENET_DEDUPE_MAX_ROWS={max_rows}"
+        )
+        return
+
+    columns = [
+        "task", "model_name", "nsize", "fgsm", "prototypes", "npos", "nneg",
+        "dloss", "dist_fct", "classif_loss", "n_calibration", "normalize",
+        "n_neighbors", "prototype_strategy", "prototype_components",
+        "train_datasets", "valid_dataset", "test_dataset", "split_config_key",
+    ]
+    join_clause = " AND ".join([f"b1.{col} <=> b2.{col}" for col in columns])
+    try:
+        cursor.execute(
+            f"""
+            DELETE b1 FROM best_models_registry b1
+            JOIN best_models_registry b2
+              ON {join_clause}
+             AND b1.id <> b2.id
+             AND (
+                    COALESCE(b2.valid_mcc, b2.mcc, -9999) > COALESCE(b1.valid_mcc, b1.mcc, -9999)
+                 OR (
+                        COALESCE(b2.valid_mcc, b2.mcc, -9999) = COALESCE(b1.valid_mcc, b1.mcc, -9999)
+                    AND COALESCE(b2.valid_auc, -9999) > COALESCE(b1.valid_auc, -9999)
+                    )
+                 OR (
+                        COALESCE(b2.valid_mcc, b2.mcc, -9999) = COALESCE(b1.valid_mcc, b1.mcc, -9999)
+                    AND COALESCE(b2.valid_auc, -9999) = COALESCE(b1.valid_auc, -9999)
+                    AND b2.id > b1.id
+                    )
+                 )
+            """
+        )
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn)
+        if is_mysql_connection_lost_error(e):
+            raise
+
+
+def cleanup_incompatible_best_models_registry(conn, cursor):
+    """Remove app-incompatible registry rows that do not have primary run artifacts."""
+    from otitenet.app.artifact_registry import is_source_run_artifact_dir
+
+    try:
+        cursor.execute(
+            """
+            SELECT id, log_path, source_run_log_path
+            FROM best_models_registry
+            """
+        )
+        rows = cursor.fetchall() or []
+    except Exception as e:
+        _safe_rollback(conn)
+        if is_mysql_connection_lost_error(e):
+            raise
+        return
+
+    delete_ids = []
+    for row in rows:
+        row_id = row[0]
+        log_path = row[1] if len(row) > 1 else ""
+        source_run_log_path = row[2] if len(row) > 2 else ""
+        if is_source_run_artifact_dir(source_run_log_path) or is_source_run_artifact_dir(log_path):
+            continue
+        delete_ids.append(row_id)
+
+    if not delete_ids:
+        return
+
+    try:
+        placeholders = ",".join(["%s"] * len(delete_ids))
+        cursor.execute(
+            f"DELETE FROM best_models_registry WHERE id IN ({placeholders})",
+            tuple(delete_ids),
+        )
+        conn.commit()
+        print(f"[database] Removed {len(delete_ids)} incompatible best_models_registry row(s).")
+    except Exception as e:
+        _safe_rollback(conn)
+        if is_mysql_connection_lost_error(e):
+            raise
+
+
+def cleanup_duplicate_registry_csvs():
+    """Deduplicate local registry CSVs by exact model/config keys."""
+    try:
+        import pandas as pd
+    except Exception:
+        return
+
+    paths = [Path("configs/best_models.csv")]
+    paths.extend(Path("logs/best_models").glob("*/models.csv"))
+    key_candidates = [
+        "task", "model_name", "dataset_path", "nsize", "fgsm", "n_calibration",
+        "classif_loss", "dloss", "prototypes", "npos", "nneg",
+        "prototype_strategy", "prototype_components", "normalize", "dist_fct",
+        "n_neighbors", "train_datasets", "valid_dataset", "test_dataset",
+        "split_config_key",
+    ]
+
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_csv(path, dtype=str).fillna("")
+            if df.empty:
+                continue
+            key_cols = [col for col in key_candidates if col in df.columns]
+            if not key_cols:
+                key_cols = [col for col in ["model_dir", "log_path", "run_log_path"] if col in df.columns]
+            if not key_cols:
+                continue
+            metric_cols = [col for col in ["valid_mcc", "mcc", "valid_auc"] if col in df.columns]
+            if metric_cols:
+                sort_df = df.copy()
+                for col in metric_cols:
+                    sort_df[col] = pd.to_numeric(sort_df[col], errors="coerce")
+                sort_df["_original_order"] = range(len(sort_df))
+                sort_df = sort_df.sort_values(
+                    metric_cols + ["_original_order"],
+                    ascending=[False] * len(metric_cols) + [False],
+                    na_position="last",
+                )
+                deduped = sort_df.drop_duplicates(subset=key_cols, keep="first")
+                deduped = deduped.sort_values("_original_order").drop(columns=["_original_order"])
+                deduped = deduped[df.columns]
+            else:
+                deduped = df.drop_duplicates(subset=key_cols, keep="last")
+            if len(deduped) != len(df):
+                deduped.to_csv(path, index=False)
+        except Exception:
+            continue
 
 
 def ensure_results_model_id(conn, cursor):
@@ -136,10 +399,14 @@ def ensure_results_model_id(conn, cursor):
                     ON DELETE SET NULL
                     """
                 )
-            except Exception:
+            except Exception as e:
                 # If FK already exists or add fails, continue without blocking runtime
+                if is_mysql_connection_lost_error(e):
+                    raise
                 pass
             conn.commit()
+
+        cleanup_duplicate_results_rows(conn, cursor)
 
         # Older databases made inference results unique by a coarse parameter
         # tuple. Several ranked registry rows can share those parameters, which
@@ -161,17 +428,18 @@ def ensure_results_model_id(conn, cursor):
             if has_old_unique:
                 cursor.execute("ALTER TABLE results DROP INDEX unique_analysis")
                 conn.commit()
-        except Exception:
+        except Exception as e:
             # Duplicate historical rows or limited DB privileges should not stop
             # the app; the model_id-first lookup below still fixes reads where
             # distinct rows already exist.
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-    except Exception:
+            _safe_rollback(conn)
+            if is_mysql_connection_lost_error(e):
+                raise
+    except Exception as e:
         # Soft-fail: do not crash app if schema check fails
-        conn.rollback()
+        _safe_rollback(conn)
+        if is_mysql_connection_lost_error(e):
+            raise
 
 
 def ensure_results_class_scores(conn, cursor):
@@ -190,12 +458,11 @@ def ensure_results_class_scores(conn, cursor):
         if not has_col:
             cursor.execute("ALTER TABLE results ADD COLUMN class_scores TEXT NULL AFTER confidence")
             conn.commit()
-    except Exception:
+    except Exception as e:
         # Soft-fail: preserve app availability if migration cannot run.
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        _safe_rollback(conn)
+        if is_mysql_connection_lost_error(e):
+            raise
 
 
 def ensure_registry_metrics_columns(conn, cursor):
@@ -241,6 +508,9 @@ def ensure_registry_metrics_columns(conn, cursor):
                 conn.commit()
         except Exception as e:
             print(f"Migration error for {col}: {e}")
+            _safe_rollback(conn)
+            if is_mysql_connection_lost_error(e):
+                raise
 
     try:
         legacy_train = LEGACY_TRAIN_DATASETS
@@ -264,6 +534,9 @@ def ensure_registry_metrics_columns(conn, cursor):
         conn.commit()
     except Exception as e:
         print(f"Migration error while backfilling legacy split config: {e}")
+        _safe_rollback(conn)
+        if is_mysql_connection_lost_error(e):
+            raise
 
 
 def ensure_best_models_registry_nsize(conn, cursor):
@@ -282,19 +555,20 @@ def ensure_best_models_registry_nsize(conn, cursor):
             """
         )
         has_col = cursor.fetchone()[0] > 0
-    except Exception:
+    except Exception as e:
         # If schema introspection fails, do not block the app
+        if is_mysql_connection_lost_error(e):
+            raise
         return
 
     if not has_col:
         try:
             cursor.execute("ALTER TABLE best_models_registry ADD COLUMN nsize INT NULL")
             conn.commit()
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+        except Exception as e:
+            _safe_rollback(conn)
+            if is_mysql_connection_lost_error(e):
+                raise
             # Could not add column; bail out quietly
             return
 
@@ -320,11 +594,10 @@ def ensure_best_models_registry_nsize(conn, cursor):
                 continue
         if rows:
             conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+    except Exception as e:
+        _safe_rollback(conn)
+        if is_mysql_connection_lost_error(e):
+            raise
 
 
 def check_ds_exists(cursor, filename, args):
@@ -669,10 +942,9 @@ def ensure_production_model_table(conn, cursor):
             _ensure_column("prototype_components", "prototype_components INT NULL AFTER prototype_strategy")
     except Exception as e:
         print(f"Error creating production_model table: {e}")
-        try:
-            conn.rollback()
-        except:
-            pass
+        _safe_rollback(conn)
+        if is_mysql_connection_lost_error(e):
+            raise
 
 
 def get_production_model(cursor, label_scheme: str | None = None):
@@ -782,10 +1054,7 @@ def set_production_model(cursor, conn, model_dict, set_by_email):
         return True
     except Exception as e:
         print(f"Error setting production model: {e}")
-        try:
-            conn.rollback()
-        except:
-            pass
+        _safe_rollback(conn)
         return False
 
 def ensure_people_user_email(conn, cursor):
@@ -819,16 +1088,14 @@ def ensure_people_user_email(conn, cursor):
                 """
             )
             conn.commit()
-        except Exception:
+        except Exception as e:
             # index probably already exists
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+            _safe_rollback(conn)
+            if is_mysql_connection_lost_error(e):
+                raise
 
     except Exception as e:
         print(f"Could not ensure people.user_email column: {e}")
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        _safe_rollback(conn)
+        if is_mysql_connection_lost_error(e):
+            raise

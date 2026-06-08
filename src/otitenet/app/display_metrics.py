@@ -114,11 +114,9 @@ def _best_head_entry_for_args_global(args):
             config = str(resolve_best_classifier_config(args, use_optimized=True))
         except Exception:
             config = str(getattr(args, "n_neighbors", 1))
-        score = (
-            getattr(args, "valid_mcc", None)
-            if getattr(args, "valid_mcc", None) is not None
-            else getattr(args, "mcc", None)
-        )
+        from otitenet.app.utils import metric_value_from_mapping
+
+        score = metric_value_from_mapping(vars(args), default=None)
         return {
             "config": config,
             "label": _head_config_label_global(config),
