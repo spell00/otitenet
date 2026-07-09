@@ -146,9 +146,6 @@ def get_images(path, normalize, size=224, train_datasets=None, valid_dataset=Non
     groups = []
 
     infos = pd.read_csv(f"{path}/infos.csv")
-    per_image_normalize = PerImageNormalize()
-    normalize_flag = str(normalize).lower() in ['yes', 'true', '1']
-    
     for i, row in infos.iterrows():
         im = row['name']
         if im == ".DS_Store":
@@ -163,14 +160,6 @@ def get_images(path, normalize, size=224, train_datasets=None, valid_dataset=Non
         arr = np.array(png, dtype=np.float32) / 255.0  # Convert to [0,1] float
         if arr.ndim == 2:  # grayscale fallback
             arr = np.stack([arr] * 3, axis=-1)
-        
-        # Normalize per-image if requested
-        if normalize_flag:
-            # Convert HWC to CHW for normalization
-            arr_chw = torch.from_numpy(arr.transpose(2, 0, 1))
-            arr_chw = per_image_normalize(arr_chw)
-            # Convert back to HWC numpy
-            arr = arr_chw.permute(1, 2, 0).numpy()
         
         try:
             pngs += [arr]
@@ -188,7 +177,7 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                        is_transform, samples_weights, epoch, 
                        unique_labels, triplet_dloss, prototypes_to_use, batch_encoder,
                        n_positives=1, n_negatives=1,
-                       prototypes=None, bs=64, size=224, normalize='no', n_aug=1,
+                       prototypes=None, bs=64, size=224, normalize='yes', n_aug=1,
                        num_workers=0):
     """
 
@@ -230,9 +219,9 @@ def get_images_loaders(data, random_recs, weighted_sampler,
     n_aug = max(1, int(n_aug))
     
     # Shared transform definitions keep training loaders and encoding utilities equivalent.
-    # Normalization is handled in get_images if requested.
-    transform_train = get_knn_augmentation_transform(size)
-    transform = get_base_transform()
+    # Normalization is handled by torchvision transforms, not by pre-normalizing arrays.
+    transform_train = get_knn_augmentation_transform(size, normalize=normalize)
+    transform = get_base_transform(normalize=normalize)
 
     # Use provided batch_encoder or create a new one
     if batch_encoder is None:

@@ -7,30 +7,71 @@ from torch import nn
 from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
 
+from otitenet.data.transforms_manifest import (
+    TORCHVISION_NORMALIZE_MEAN,
+    TORCHVISION_NORMALIZE_STD,
+    normalize_mode,
+)
 
-def get_base_transform():
+
+class PerImageNormalizeTransform(nn.Module):
+    """Per-image CHW tensor normalization retained for explicit legacy runs."""
+
+    def forward(self, img: torch.Tensor) -> torch.Tensor:
+        mean = img.mean(dim=(-2, -1), keepdim=True)
+        std = img.std(dim=(-2, -1), keepdim=True) + 1e-6
+        return (img - mean) / std
+
+
+def normalize_transform(normalize):
+    mode = normalize_mode(normalize)
+    if mode == "imagenet":
+        return transforms.Normalize(
+            mean=TORCHVISION_NORMALIZE_MEAN,
+            std=TORCHVISION_NORMALIZE_STD,
+        )
+    if mode == "per_image":
+        return PerImageNormalizeTransform()
+    return None
+
+
+def _append_normalize_transform(ops: list, normalize) -> list:
+    norm = normalize_transform(normalize)
+    if norm is not None:
+        ops.append(norm)
+    return ops
+
+
+def get_base_transform(normalize='yes'):
     """Get base transform (no augmentation) for inference and validation/test encoding."""
-    return transforms.Compose([
+    ops = [
         transforms.ToImage(),
         transforms.ToDtype(torch.float32, scale=True),
-    ])
+    ]
+    return transforms.Compose(_append_normalize_transform(ops, normalize))
 
 
-def get_knn_augmentation_transform(image_size: int):
+def get_knn_augmentation_transform(image_size: int, normalize='yes', translate: float = 0.10):
     """Get augmentation transform for KNN expansion (train set only).
     
     Args:
         image_size: Target image size for RandomResizedCrop
+        normalize: no|yes/imagenet|per_image normalization mode
+        translate: max RandomAffine translation fraction per axis
         
     Returns:
-        Composed transform with random flips, rotations, and crops
+        Composed transform with random flips, rotations, translation, crops, and optional normalization
     """
-    return transforms.Compose([
+    ops = [
         transforms.ToImage(),
         transforms.ToDtype(torch.float32, scale=True),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
         transforms.RandomRotation(degrees=(-180, 180)),
+        transforms.RandomAffine(
+            degrees=0,
+            translate=(float(translate), float(translate)),
+        ),
         transforms.RandomApply(
             nn.ModuleList([
                 transforms.RandomResizedCrop(
@@ -41,7 +82,8 @@ def get_knn_augmentation_transform(image_size: int):
             ]),
             p=0.5,
         ),
-    ])
+    ]
+    return transforms.Compose(_append_normalize_transform(ops, normalize))
 
 
 def encode_split_with_augmentation(
@@ -49,7 +91,8 @@ def encode_split_with_augmentation(
     model, device, batch_size,
     split_name: str = 'train',
     n_aug: int = 0,
-    image_size: int = 224
+    image_size: int = 224,
+    normalize='yes',
 ):
     """Encode a data split with optional augmentation for train only.
     
@@ -73,8 +116,8 @@ def encode_split_with_augmentation(
         encodings: (N, D) array of encoded vectors
         labels_out: (N,) array of labels (repeated per augmentation)
     """
-    base_transform = get_base_transform()
-    knn_aug_transform = get_knn_augmentation_transform(image_size)
+    base_transform = get_base_transform(normalize=normalize)
+    knn_aug_transform = get_knn_augmentation_transform(image_size, normalize=normalize)
     
     encs = []
     labs = []

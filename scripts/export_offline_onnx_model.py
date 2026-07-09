@@ -56,7 +56,16 @@ def _manifest_uses_web_head(manifest: dict) -> bool:
     params = manifest.get("production_params", {}) or {}
     prototypes = str(params.get("prototypes_to_use") or params.get("prototypes") or "").lower()
     head = str(params.get("head") or manifest.get("head") or manifest.get("head_type") or "").lower()
-    return prototypes not in {"", "none", "no", "nan"} or "prototype" in head or "knn" in head
+    head_type = str(manifest.get("head_type") or "").lower()
+    family = str(params.get("head_family") or manifest.get("head_family") or "").lower()
+    return (
+        prototypes not in {"", "none", "no", "nan"}
+        or head_type in {"prototype", "knn", "baseline"}
+        or family in {"prototype", "knn", "baseline"}
+        or "prototype" in head
+        or "knn" in head
+        or head.startswith("baseline_")
+    )
 
 
 def _check_onnx_export(wrapper: torch.nn.Module, onnx_path: Path, dummy: torch.Tensor) -> float:
@@ -147,10 +156,15 @@ def update_manifest(
     manifest = load_manifest(deployment_dir)
     updated = copy.deepcopy(manifest)
 
-    if embedding_output and _manifest_uses_web_head(manifest):
+    head_type = str(manifest.get("head_type") or "").lower()
+    if embedding_output and head_type == "prototype":
         updated["model_type"] = "onnx_embedding_prototype"
         updated["runtime"] = "onnxruntime"
         updated["head_type"] = "prototype"
+    elif embedding_output and head_type == "baseline":
+        updated["model_type"] = "onnx_embedding_baseline"
+        updated["runtime"] = "onnxruntime"
+        updated["head_type"] = "baseline"
     else:
         updated["model_type"] = "onnx_classifier"
         updated["runtime"] = "onnxruntime"
@@ -158,9 +172,13 @@ def update_manifest(
     updated["quantization"] = quantization
     updated.setdefault("files", {})
     updated["files"]["model"] = onnx_path.name
+    if embedding_output:
+        updated["files"]["embedding_model"] = onnx_path.name
     updated["files"]["manifest"] = "manifest.json"
     updated.setdefault("sha256", {})
     updated["sha256"]["model"] = sha256_file(onnx_path)
+    if embedding_output:
+        updated["sha256"]["embedding_model"] = sha256_file(onnx_path)
 
     if not keep_pytorch:
         old_model = OfflineDeployment(root=deployment_dir, manifest=manifest).model_file
@@ -169,7 +187,11 @@ def update_manifest(
 
     manifest_path = deployment_dir / "manifest.json"
     backup_path = deployment_dir / "manifest.pytorch.json"
-    if not backup_path.exists():
+    source_model = OfflineDeployment(root=deployment_dir, manifest=manifest).model_file
+    source_is_pytorch = source_model.suffix.lower() not in {".onnx"}
+    if source_is_pytorch:
+        shutil.copy2(manifest_path, backup_path)
+    elif not backup_path.exists():
         shutil.copy2(manifest_path, backup_path)
 
     with manifest_path.open("w", encoding="utf-8") as f:

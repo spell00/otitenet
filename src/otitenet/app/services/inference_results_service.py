@@ -480,9 +480,44 @@ def args_from_inference_row(base_args, row_dict: Dict[str, Any]):
     except Exception:
         args = base_args
 
-    row = dict(row_dict or {})
+    # A row-specific args object must not inherit the sidebar-selected model/head.
+    # Each caller applies the row/default head explicitly after this point.
+    for attr in (
+        "best_classifier_config",
+        "classification_head_config",
+        "classifier_head_config",
+        "head_config",
+        "classification_head_family",
+        "learned_classifier_label",
+        "n_aug",
+        "prototype_strategy",
+        "prototype_components",
+        "prototypes_to_use",
+        "n_neighbors",
+        "siamese_inference",
+    ):
+        try:
+            if hasattr(args, attr):
+                delattr(args, attr)
+        except Exception:
+            pass
 
-    model_id = _row_get(row, "Model ID", "model_id", "id")
+    row = dict(row_dict or {})
+    row_log_path = _row_get(row, "Artifact Log Path", "Log Path", "source_run_log_path", "Source Run Path", "log_path")
+    if row_log_path:
+        try:
+            from otitenet.app.utils import extract_params_from_log_path
+
+            parsed = extract_params_from_log_path(row_log_path)
+            for key, value in parsed.items():
+                if value is not None and row.get(key) is None:
+                    row[key] = value
+        except Exception:
+            pass
+
+    model_id = _row_get(row, "Registry ID", "DB Model ID", "model_id", "id")
+    if model_id is None and "Registry ID" not in row:
+        model_id = _row_get(row, "Model ID")
     if model_id is not None:
         try:
             args.model_id = int(model_id)
@@ -522,6 +557,7 @@ def args_from_inference_row(base_args, row_dict: Dict[str, Any]):
         "test_encodings_path": ("test_encodings_path", "Test Encodings Path"),
         "best_model_dir": ("Best Model Dir", "best_model_dir", "model_dir"),
     }
+    row_path_value = _row_get(row, *mapping["path"])
 
     for attr, keys in mapping.items():
         value = _row_get(row, *keys)
@@ -529,7 +565,13 @@ def args_from_inference_row(base_args, row_dict: Dict[str, Any]):
             continue
 
         if attr in {"new_size", "n_neighbors", "n_positives", "n_negatives", "prototype_components"}:
-            fallback = getattr(args, attr, None)
+            fallback = {
+                "new_size": 224,
+                "n_neighbors": 1,
+                "n_positives": 1,
+                "n_negatives": 1,
+                "prototype_components": 1,
+            }.get(attr)
             value = _coerce_int_or_default(value, fallback)
             if value is None:
                 continue
@@ -548,7 +590,21 @@ def args_from_inference_row(base_args, row_dict: Dict[str, Any]):
         args.split_config_in_path = True
         args._split_config_in_path = True
 
-    # Some rows only have log_path, not path. Leave path unchanged unless row has path.
+    # Some rows only have log_path, not path. Recover the model dataset from
+    # the artifact path so preprocessing can use otite_ds_<N> as the first resize.
+    path_text = str(getattr(args, "path", "") or "").strip()
+    row_had_path = row_path_value is not None and str(row_path_value).strip().lower() not in {"", "none", "nan", "null"}
+    if not row_had_path or not path_text or path_text.lower() in {"none", "nan", "null"}:
+        try:
+            from otitenet.app.utils import extract_params_from_log_path
+
+            parsed = extract_params_from_log_path(getattr(args, "log_path", None) or row.get("Log Path") or "")
+            dataset = parsed.get("Dataset")
+            if dataset:
+                args.path = dataset if str(dataset).startswith("data/") else os.path.join("data", str(dataset))
+        except Exception:
+            pass
+
     if not hasattr(args, "bs"):
         args.bs = 32
     if not hasattr(args, "groupkfold"):
@@ -557,6 +613,16 @@ def args_from_inference_row(base_args, row_dict: Dict[str, Any]):
         args.random_recs = 0
     if not hasattr(args, "task"):
         args.task = "otite"
+    if not hasattr(args, "n_neighbors"):
+        args.n_neighbors = 1
+    if not hasattr(args, "prototypes_to_use"):
+        args.prototypes_to_use = "class"
+    if not hasattr(args, "prototype_strategy"):
+        args.prototype_strategy = "mean"
+    if not hasattr(args, "prototype_components"):
+        args.prototype_components = 1
+    if not hasattr(args, "siamese_inference"):
+        args.siamese_inference = "knn"
 
     return args
 

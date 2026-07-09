@@ -924,8 +924,8 @@ def _collect_prediction_data(split_policy_cutoff=None):
     # Build info_map: sample-name → batch/dataset label, used for batch-effect metrics.
     info_map = {}
     for info_candidate in [
-        "data/otite_ds_64/infos.csv",
-        "data/otite_ds_224/infos.csv",
+        "data/otite_ds_64/USA_Turquie_Chili_GMFUNL_inference/infos.csv",
+        "data/otite_ds_224/USA_Turquie_Chili_GMFUNL_inference/infos.csv",
     ]:
         if os.path.exists(info_candidate):
             try:
@@ -1093,9 +1093,9 @@ def _collect_prediction_data(split_policy_cutoff=None):
     return df, manifest_df, runtime_df
 
 def do_eda(out_dir):
-    csv_path = "data/otite_ds_64/infos.csv"
+    csv_path = "data/otite_ds_64/USA_Turquie_Chili_GMFUNL_inference/infos.csv"
     if not os.path.exists(csv_path):
-        csv_path = "data/otite_ds_224/infos.csv" # Fallback
+        csv_path = "data/otite_ds_224/USA_Turquie_Chili_GMFUNL_inference/infos.csv" # Fallback
     
     if os.path.exists(csv_path):
         df_info = pd.read_csv(csv_path)
@@ -1111,6 +1111,18 @@ def do_eda(out_dir):
         plt.tight_layout()
         plt.savefig(f"{out_dir}/0_dataset_eda.png", dpi=300)
         plt.close()
+        
+        # New: Class distribution per dataset (grouped barplot)
+        plt.figure(figsize=(12, 6))
+        sns.countplot(data=df_info, x='label', hue='dataset', palette='deep')
+        plt.title("Class Distribution per Dataset")
+        plt.xlabel("Class")
+        plt.ylabel("Count")
+        plt.legend(title="Dataset", bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.tight_layout()
+        plt.savefig(f"{out_dir}/0_class_distribution_per_dataset.png", dpi=300)
+        plt.close()
+        
         return True
     return False
 
@@ -1320,7 +1332,7 @@ def do_pareto_frontier(df, out_dir):
         plt.close()
         return
     # Accuracy vs Batch Entropy Pareto Front
-    df_plot = df.dropna(subset=['accuracy', 'batch_entropy_norm']).copy()
+    df_plot = df.dropna(subset=['valid_accuracy', 'batch_entropy_norm']).copy()
     df_plot = df_plot.sort_values('batch_entropy_norm')
     if df_plot.empty:
         plt.figure(figsize=(10, 7))
@@ -1332,11 +1344,11 @@ def do_pareto_frontier(df, out_dir):
         plt.close()
         return
     plt.figure(figsize=(10, 7))
-    sns.scatterplot(data=df_plot, x='batch_entropy_norm', y='accuracy', hue='model_name',
+    sns.scatterplot(data=df_plot, x='batch_entropy_norm', y='valid_accuracy', hue='model_name',
                     style='classif_loss' if 'classif_loss' in df_plot.columns else None,
                     s=100, alpha=0.6)
     # Simple Pareto implementation
-    pts = df_plot[['batch_entropy_norm', 'accuracy']].values
+    pts = df_plot[['batch_entropy_norm', 'valid_accuracy']].values
     pareto_mask = np.ones(len(pts), dtype=bool)
     for i, p in enumerate(pts):
         for j, q in enumerate(pts):
@@ -1344,7 +1356,7 @@ def do_pareto_frontier(df, out_dir):
                 pareto_mask[i] = False
                 break
     frontier = df_plot[pareto_mask].sort_values('batch_entropy_norm')
-    plt.plot(frontier['batch_entropy_norm'], frontier['accuracy'], 'r--', alpha=0.8, label='Pareto Frontier')
+    plt.plot(frontier['batch_entropy_norm'], frontier['valid_accuracy'], 'r--', alpha=0.8, label='Pareto Frontier')
     plt.title("The Generalization Pareto Frontier (Accuracy vs Invariance)")
     plt.xlabel("Normalized Batch Entropy (Domain Invariance)")
     plt.ylabel("Accuracy (Performance)")
@@ -1411,7 +1423,7 @@ def do_hparam_parallel(df, out_dir, tag='all_runs', dedupe_latest=False):
         'classif_loss', 'BER', 'prototypes', 'n_positives', 'n_negatives',
         'prototype_agg', 'normalize', 'dist_fct', 'knn'
     ]
-    score_candidates = [c for c in ['valid_mcc', 'mcc', 'test_mcc', 'accuracy'] if c in df.columns]
+    score_candidates = [c for c in ['valid_mcc', 'mcc', 'test_mcc', 'valid_accuracy'] if c in df.columns]
     if not score_candidates:
         print("Skipping parallel coordinates: no score column among valid_mcc/mcc/test_mcc/accuracy.")
         return
@@ -1990,7 +2002,7 @@ def generate_core_figures_and_tables(df, out_dir):
     plt.close()
 
     # Instead of using only the dataframe, rebuild all_models.csv from manifest and logs for completeness
-    manifest_path = 'logs/progresses/notNormal/otite_ds_64/csv/PROD_notNormal_job_manifest.csv'
+    manifest_path = 'logs/progresses/otitis_four_class/otite_ds_64_USA_Turquie_Chili_GMFUNL_inference/csv/PROD_otitis_four_class_job_manifest.csv'
     all_csv_path = f"{out_dir}/all_models.csv"
     build_all_models_from_manifest_and_logs(manifest_path, all_csv_path)
 
@@ -2194,9 +2206,9 @@ def run_analysis():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Generate paper analysis from training outputs.')
-    parser.add_argument('--task', type=str, default='notNormal', help='Target task directory under logs/ (e.g., notNormal, otitis, multi).')
+    parser.add_argument('--task', type=str, default='otitis_four_class', help='Target task directory under logs/ (e.g., notNormal, otitis, multi).')
     parser.add_argument('--test', action='store_true', help='Analyze only test/smoke runs (launch --test / run_tag containing test).')
-    parser.add_argument('--dataset', type=str, default='otite_ds_64', help='Dataset subdirectory under logs/progresses/{task}/ (e.g., otite_ds_64).')
+    parser.add_argument('--dataset', type=str, default='otite_ds_64_USA_Turquie_Chili_GMFUNL_inference', help='Dataset subdirectory under logs/progresses/{task}/ (e.g., otite_ds_64_USA_Turquie_Chili_GMFUNL_inference).')
     
     args = parser.parse_args()
 

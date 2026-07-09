@@ -33,7 +33,6 @@ from otitenet.app.pages import (
     admin_analytics,
     ensemble,
     gradcam_gallery,
-    inference_results,
     leaderboard,
     learned_embedding,
     new_analysis,
@@ -85,7 +84,7 @@ with st.sidebar.expander("Production decision settings", expanded=False):
         "Selected model confidence threshold",
         min_value=0.0,
         max_value=1.0,
-        value=float(st.session_state.get("production_selected_confidence_threshold", 0.50)),
+        value=float(st.session_state.get("production_selected_confidence_threshold", 0.0)),
         step=0.01,
         key="production_selected_confidence_threshold_widget",
     )
@@ -93,7 +92,7 @@ with st.sidebar.expander("Production decision settings", expanded=False):
         "Top-N ensemble vote threshold (%)",
         min_value=0.0,
         max_value=100.0,
-        value=float(st.session_state.get("production_ensemble_vote_threshold_pct", 80.0)),
+        value=float(st.session_state.get("production_ensemble_vote_threshold_pct", 0.0)),
         step=1.0,
         key="production_ensemble_vote_threshold_pct_widget",
     )
@@ -177,10 +176,11 @@ elif is_admin and active_page == "raw_pixel":
 elif is_admin and active_page == "admin_analytics":
     admin_analytics.render(ctx)
 
-elif active_page == "inference_results":
+elif is_admin and active_page == "inference_results":
     if selected_person_id is None:
         st.warning(
             "Please create or select a family member from the sidebar before viewing inference results."
         )
     else:
+        from otitenet.app.pages import inference_results
         inference_results.render(ctx)

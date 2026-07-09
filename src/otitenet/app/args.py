@@ -18,6 +18,7 @@ from otitenet.app.utils import (
     extract_params_from_log_path,
     _make_model_selection_key,
     _unique_preserve_order,
+    assign_stable_model_ids,
     attach_task_column,
     filter_models_df_by_task,
     get_split_mcc_metrics,
@@ -38,18 +39,25 @@ from otitenet.app.utils import (
     split_config_segment,
 )
 
-from otitenet.app.database import set_production_model
 from otitenet.app.artifact_registry import (
     available_dataset_paths_from_registry,
     load_best_models_registry,
     preferred_model_artifact_dir,
 )
-from otitenet.app.background import clear_completed, get_completed_result, submit_once
+from otitenet.app.background import clear_completed
+from otitenet.app.services.production_model_service import set_production_model
 from otitenet.app.utils_dataset_names import get_short_dataset_name, get_short_dataset_names
 from otitenet.data.labels import label_scheme_for_task
 from otitenet.data.dataset_paths import infer_output_subdir_from_split_datasets
 
 
+def _preserve_active_page_for_sidebar_rerun() -> None:
+    active_page = st.session_state.get("active_page_id")
+    if active_page:
+        st.session_state["_restore_active_page_id"] = active_page
+
+
+@st.cache_data(ttl=300)
 def _available_dataset_paths(data_dir: str) -> list[str]:
     """Return dataset folders under data_dir, including nested folders with infos.csv."""
     registry_paths = available_dataset_paths_from_registry(data_dir)
@@ -270,7 +278,7 @@ def _progress_manifest_model_rows(task: str = "", model_name: str = "") -> pd.Da
             split_key = split_config_key(row.get("train_datasets"), row.get("valid_dataset"), row.get("test_dataset"))
             rows.append(
                 {
-                    "Model ID": str(row.get("exp_id") or row.get("job_id") or uuid or "").strip(),
+                    "exp ID": str(row.get("exp_id") or row.get("job_id") or uuid or "").strip(),
                     "Model Name": str(row.get("model") or model_name or "").strip(),
                     "NSize": str(row.get("new_size") or "").strip(),
                     "FGSM": str(row.get("fgsm") or "").strip(),
@@ -490,12 +498,6 @@ def _enumerate_classification_heads_cached(tmp_args, model_selection_key: str) -
     cache = st.session_state.setdefault("sidebar_classification_heads_cache", {})
     signature = _optimization_cache_signature(tmp_args)
     metric = str(st.session_state.get("model_order_metric", ""))
-    prefetch_key = (
-        "sidebar_heads_prefetch",
-        str(model_selection_key),
-        signature,
-        metric,
-    )
     cache_key = (
         str(model_selection_key),
         signature,
@@ -504,11 +506,6 @@ def _enumerate_classification_heads_cached(tmp_args, model_selection_key: str) -
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
-    prefetched = get_completed_result(prefetch_key)
-    if prefetched is not None:
-        cache.clear()
-        cache[cache_key] = prefetched
-        return prefetched
     heads = enumerate_classification_heads(tmp_args)
     cache.clear()
     cache[cache_key] = heads
@@ -516,19 +513,126 @@ def _enumerate_classification_heads_cached(tmp_args, model_selection_key: str) -
 
 
 def _prefetch_classification_heads(model_selection_key: str, model_row: dict, metric: str) -> None:
-    """Warm classifier-head caches for likely next selections in the background."""
-    tmp_args = _args_namespace_from_model_row(model_row)
-    cache_key = (
-        "sidebar_heads_prefetch",
-        str(model_selection_key),
-        _optimization_cache_signature(tmp_args),
-        str(metric),
-    )
-    submit_once(cache_key, enumerate_classification_heads, tmp_args)
+    """Background prefetch is disabled because head enumeration touches Streamlit caches."""
+    return None
 
 
 def _split_combo_key_from_values(train_datasets, valid_dataset, test_dataset) -> str:
     return split_config_key(train_datasets, valid_dataset, test_dataset)
+
+
+def _resolve_production_head_config(row: dict, selected_head_config=None):
+    if selected_head_config is not None and str(selected_head_config).strip() not in {"", "None", "nan", "—"}:
+        return selected_head_config
+    row = row or {}
+    return (
+        row.get('Best Head Config')
+        or row.get('Head Config')
+        or row.get('head_config')
+        or row.get('classification_head_config')
+        or row.get('best_classifier_config')
+        or "baseline_linear_svc"
+    )
+
+
+def _resolve_production_head_n_aug(row: dict, selected_head_n_aug=None):
+    if selected_head_n_aug is not None and str(selected_head_n_aug).strip() not in {"", "None", "nan", "—"}:
+        return selected_head_n_aug
+    row = row or {}
+    return (
+        row.get('Head N Aug')
+        or row.get('Best Head N Aug')
+        or row.get('best_head_n_aug')
+        or row.get('N Aug')
+        or row.get('n_aug')
+    )
+
+
+def _set_distance_aliases(model_dict: dict, distance: str | None) -> dict:
+    """Keep production distance aliases synchronized before persistence/export."""
+    if distance is None or str(distance).strip() in {"", "None", "none", "nan", "NaN", "—"}:
+        return model_dict
+    distance = str(distance).strip().lower()
+    if distance not in {"euclidean", "cosine"}:
+        return model_dict
+    model_dict["Dist_Fct"] = distance
+    model_dict["dist_fct"] = distance
+    model_dict["dist_metric"] = distance
+    model_dict["Distance"] = distance
+    return model_dict
+
+
+def _best_head_metadata_for_model_row(row: dict, selection_key: str | None = None):
+    row = row or {}
+    selection_key = selection_key or _make_model_selection_key(row)
+    selected_head_model_key = st.session_state.get('sidebar_classification_head_model_key')
+    selected_head_config = None
+    selected_head_n_aug = None
+    if selected_head_model_key == selection_key:
+        selected_head_config = st.session_state.get('sidebar_classification_head_config')
+        selected_head_n_aug = st.session_state.get('sidebar_classification_head_n_aug')
+
+    if selected_head_config is not None and str(selected_head_config).strip() not in {"", "None", "nan", "—"}:
+        head_config = str(selected_head_config)
+        head_n_aug = _resolve_production_head_n_aug(row, selected_head_n_aug)
+        return head_config, head_n_aug
+
+    try:
+        heads = _enumerate_classification_heads_cached(
+            _args_namespace_from_model_row(row),
+            selection_key,
+        )
+        if heads:
+            best_head = max(heads, key=lambda h: h.get("valid_mcc", h.get("mcc", float("-inf"))))
+            return str(best_head.get("config")), best_head.get("n_aug")
+    except Exception:
+        pass
+
+    return _resolve_production_head_config(row), _resolve_production_head_n_aug(row)
+
+
+def _apply_head_metadata_to_model_dict(model_dict: dict, source_row: dict, selection_key: str | None = None) -> dict:
+    """Persist the resolved learned-embedding head alongside a selected model."""
+    head_config, head_n_aug = _best_head_metadata_for_model_row(source_row, selection_key)
+    if head_config is None or str(head_config).strip() in {"", "None", "nan", "—"}:
+        return model_dict
+
+    head_config = str(head_config)
+    head_label = format_classifier_config(head_config)
+    head_meta = parse_classifier_config(head_config)
+    model_dict['Best Head Config'] = head_config
+    model_dict['Head Config'] = head_config
+    model_dict['head_config'] = head_config
+    model_dict['classification_head_config'] = head_config
+    model_dict['best_classifier_config'] = head_config
+    model_dict['Head'] = head_label
+    model_dict['head_name'] = head_label
+    model_dict['learned_classifier_label'] = head_label
+    model_dict['head_family'] = head_meta.get('family')
+    for key, value in head_meta.items():
+        if value is not None:
+            model_dict[key] = value
+    if head_meta.get("family") == "prototype":
+        model_dict["Prototypes"] = "class"
+        model_dict["prototypes_to_use"] = "class"
+        if head_meta.get("strategy") is not None:
+            model_dict["prototype_strategy"] = head_meta.get("strategy")
+            model_dict["Proto_Strat"] = head_meta.get("strategy")
+        if head_meta.get("components") is not None:
+            model_dict["prototype_components"] = head_meta.get("components")
+            model_dict["Proto_Comp"] = head_meta.get("components")
+    elif head_meta.get("family") == "knn" and head_meta.get("k") is not None:
+        model_dict["N_Neighbors"] = head_meta.get("k")
+        model_dict["n_neighbors"] = head_meta.get("k")
+
+    if head_n_aug is not None and str(head_n_aug).strip() not in {"", "None", "nan", "—"}:
+        model_dict['Head N Aug'] = head_n_aug
+        model_dict['Best Head N Aug'] = head_n_aug
+        model_dict['N Aug'] = head_n_aug
+        model_dict['n_aug'] = head_n_aug
+        model_dict['head_n_aug'] = head_n_aug
+
+    return model_dict
 
 
 def _split_combo_key_from_row(row) -> str:
@@ -632,7 +736,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
             groupkfold=1,
             random_recs=0,
             seed=42,
-            normalize='no',
+            normalize='yes',
             train_datasets=DEFAULT_APP_TRAIN_DATASETS,
             test_dataset='Banque_Viscaino_Chili_2020',
             model_id=None,
@@ -711,6 +815,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                 "best_models_table",
             ]:
                 st.session_state.pop(key, None)
+            _preserve_active_page_for_sidebar_rerun()
             st.rerun()
 
         model_dir = os.path.join(task_root, task)
@@ -780,8 +885,14 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                 "sidebar_classification_head_n_aug",
                 "optimized_k_value",
                 "k_opt_current_selection",
+                "sidebar_split_combo_key",
+                "sidebar_split_combo_last_key",
+                "sidebar_split_combo_options",
+                "sidebar_split_combo_labels",
+                "top_models_filtered_selection_keys",
             ]:
                 st.session_state.pop(key, None)
+            st.session_state["top_models_filters_active"] = False
         st.session_state["sidebar_dataset_last_key"] = dataset_segment
 
         # ---- Model Selection from Leaderboard ---- #
@@ -873,6 +984,10 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                     _cols = _cols[:16] + ["#"] + _cols[16:]
                 if model_rows:
                     _df = pd.DataFrame(model_rows, columns=_cols)
+                    if "Registry ID" not in _df.columns and "Model ID" in _df.columns:
+                        _df["Registry ID"] = _df["Model ID"]
+                    if "exp ID" not in _df.columns:
+                        _df["exp ID"] = ""
                 if not _manifest_model_df.empty:
                     for col in _cols:
                         if col not in _manifest_model_df.columns:
@@ -886,7 +1001,57 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                         for col in _df.columns:
                             if col not in _manifest_model_df.columns:
                                 _manifest_model_df[col] = pd.NA
-                        _df = pd.concat([_df, _manifest_model_df[_df.columns]], ignore_index=True)
+            
+            # Add toggle to choose data source
+            data_source_option = st.radio(
+                "Data Source",
+                options=["Database + Manifest (done jobs only)", "Database + Log Tree (all jobs)"],
+                key="sidebar_data_source_toggle",
+                help="Choose which data source to use for model selection. 'Database + Manifest' shows only completed jobs, while 'Database + Log Tree' shows all available models."
+            )
+            previous_data_source_option = st.session_state.get("sidebar_data_source_last_key")
+            if previous_data_source_option is not None and previous_data_source_option != data_source_option:
+                selected_params = {}
+                should_sync = False
+                for key in [
+                    "selected_model_params",
+                    "selected_params_version",
+                    "selected_params_last_sync",
+                    "selected_model_log_path",
+                    "selected_model_selection_key",
+                    "selected_model_version",
+                    "sidebar_best_model_key",
+                    "sidebar_best_model_last_sync",
+                    "sidebar_classification_head_config",
+                    "sidebar_classification_head_model_key",
+                    "sidebar_classification_head_n_aug",
+                    "optimized_k_value",
+                    "k_opt_current_selection",
+                    "sidebar_split_combo_key",
+                    "sidebar_split_combo_last_key",
+                    "sidebar_split_combo_options",
+                    "sidebar_split_combo_labels",
+                    "top_models_filtered_selection_keys",
+                ]:
+                    st.session_state.pop(key, None)
+                st.session_state["top_models_filters_active"] = False
+            st.session_state["sidebar_data_source_last_key"] = data_source_option
+            use_log_tree = "Log Tree" in data_source_option
+            
+            if use_log_tree:
+                # Use database + log tree (same as Top Models table)
+                # Load directly from leaderboard, skip local processing
+                try:
+                    from otitenet.app.pages.leaderboard import load_best_models_table
+                    _df = load_best_models_table(cursor, task=task, include_sidebar_split=False)
+                    _df_from_leaderboard = True
+                except Exception as e:
+                    st.warning(f"Could not load from leaderboard ({e}), falling back to database+manifest")
+                    _df = pd.concat([_df, _manifest_model_df[_df.columns]], ignore_index=True)
+                    _df_from_leaderboard = False
+            else:
+                # Use database + manifest (local processing)
+                _df = pd.concat([_df, _manifest_model_df[_df.columns]], ignore_index=True)
                 _df["Artifact Dataset"] = _df.apply(
                     lambda row: _canonical_dataset_path(
                         extract_params_from_log_path(
@@ -916,7 +1081,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                 _df = attach_task_column(_df)
                 _df = _prefer_source_artifact_paths(_df)
                 _df = filter_models_df_by_task(_df, task)
-                if dataset_segment:
+                if dataset_segment and "Dataset" in _df.columns:
                     selected_dataset_key = _canonical_dataset_path(dataset_segment)
                     _df = _df[_df["Dataset"].astype(str).map(_canonical_dataset_path) == selected_dataset_key]
                     if _df.empty:
@@ -932,247 +1097,355 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                         "showing all registry models so dataset-specific synced metrics remain available."
                     )
                 _df = _task_filtered_df
-                
                 _df_from_leaderboard = False
-                if not _df.empty:
-                    _df["_split_combo_key"] = _df.apply(_split_combo_key_from_row, axis=1)
-                    split_options = _unique_preserve_order(
-                        [str(v) for v in _df["_split_combo_key"].tolist() if str(v).strip()]
+                
+            if not _df.empty:
+                _df["_split_combo_key"] = _df.apply(_split_combo_key_from_row, axis=1)
+                split_options = _unique_preserve_order(
+                    [str(v) for v in _df["_split_combo_key"].tolist() if str(v).strip()]
+                )
+                split_labels = {key: _split_combo_label(key) for key in split_options}
+                st.session_state["sidebar_split_combo_options"] = split_options
+                st.session_state["sidebar_split_combo_labels"] = split_labels
+                selected_split_key = None
+                if split_options:
+                    pending_split_key = st.session_state.pop("pending_sidebar_split_combo_key", None)
+                    if pending_split_key in split_options:
+                        st.session_state["sidebar_split_combo_key"] = pending_split_key
+                    current_split_key = st.session_state.get("sidebar_split_combo_key")
+                    default_split_key = current_split_key if current_split_key in split_options else split_options[0]
+                    if st.session_state.get("sidebar_split_combo_key") not in split_options:
+                        st.session_state["sidebar_split_combo_key"] = default_split_key
+
+                    selected_split_key = st.selectbox(
+                        "Datasets",
+                        options=split_options,
+                        format_func=lambda key: split_labels.get(key, key),
+                        key="sidebar_split_combo_key",
+                        help="Available train/valid/test combinations from the registry.",
                     )
-                    split_labels = {key: _split_combo_label(key) for key in split_options}
-                    st.session_state["sidebar_split_combo_options"] = split_options
-                    st.session_state["sidebar_split_combo_labels"] = split_labels
-                    selected_split_key = None
-                    if split_options:
-                        pending_split_key = st.session_state.pop("pending_sidebar_split_combo_key", None)
-                        if pending_split_key in split_options:
-                            st.session_state["sidebar_split_combo_key"] = pending_split_key
-                        current_split_key = st.session_state.get("sidebar_split_combo_key")
-                        default_split_key = current_split_key if current_split_key in split_options else split_options[0]
-                        if st.session_state.get("sidebar_split_combo_key") not in split_options:
-                            st.session_state["sidebar_split_combo_key"] = default_split_key
 
-                        selected_split_key = st.selectbox(
-                            "Datasets",
-                            options=split_options,
-                            format_func=lambda key: split_labels.get(key, key),
-                            key="sidebar_split_combo_key",
-                            help="Available train/valid/test combinations from the registry.",
-                        )
+                    previous_split_key = st.session_state.get("sidebar_split_combo_last_key")
+                    if previous_split_key is not None and previous_split_key != selected_split_key:
+                        selected_params = {}
+                        should_sync = False
+                        for key in [
+                            "selected_model_params",
+                            "selected_params_version",
+                            "selected_params_last_sync",
+                            "selected_model_log_path",
+                            "selected_model_selection_key",
+                            "selected_model_version",
+                            "sidebar_best_model_key",
+                            "sidebar_best_model_last_sync",
+                            "sidebar_classification_head_config",
+                            "sidebar_classification_head_model_key",
+                            "sidebar_classification_head_n_aug",
+                        ]:
+                            st.session_state.pop(key, None)
+                    st.session_state["sidebar_split_combo_last_key"] = selected_split_key
 
-                        previous_split_key = st.session_state.get("sidebar_split_combo_last_key")
-                        if previous_split_key is not None and previous_split_key != selected_split_key:
-                            selected_params = {}
-                            should_sync = False
-                            for key in [
-                                "selected_model_params",
-                                "selected_params_version",
-                                "selected_params_last_sync",
-                                "selected_model_log_path",
-                                "selected_model_selection_key",
-                                "selected_model_version",
-                                "sidebar_best_model_key",
-                                "sidebar_best_model_last_sync",
-                                "sidebar_classification_head_config",
-                                "sidebar_classification_head_model_key",
-                                "sidebar_classification_head_n_aug",
-                            ]:
-                                st.session_state.pop(key, None)
-                        st.session_state["sidebar_split_combo_last_key"] = selected_split_key
+                    _df = _df[_df["_split_combo_key"] == selected_split_key].drop(columns=["_split_combo_key"])
+                    if _df.empty:
+                        st.info("No models found for the selected train/valid/test dataset combination.")
+                else:
+                    st.warning(
+                        "No train/valid/test metadata found for these registry rows yet. "
+                        "Rebuild the registries after training or backfill split metadata in best_models_registry."
+                    )
 
-                        _df = _df[_df["_split_combo_key"] == selected_split_key].drop(columns=["_split_combo_key"])
-                        if _df.empty:
-                            st.info("No models found for the selected train/valid/test dataset combination.")
-                    else:
-                        st.warning(
-                            "No train/valid/test metadata found for these registry rows yet. "
-                            "Rebuild the registries after training or backfill split metadata in best_models_registry."
-                        )
+                # Skip duplicate leaderboard loading since we already loaded above based on use_log_tree
 
-                if not _df.empty:
+            _group_cols = [
+                "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
+                "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration", "Normalize", "N_Neighbors",
+                "train_datasets", "valid_dataset", "test_dataset",
+            ]
+            _dedupe_frame = _df[_group_cols].copy().fillna("").astype(str)
+            # Use row-wise join to ensure a Series (avoids pandas agg returning a DataFrame)
+            _df["_dedupe_key"] = _dedupe_frame.apply(lambda r: "|".join(r.values.tolist()), axis=1)
+            _df = _df.sort_values("MCC", ascending=False)
+            _df = _df.drop_duplicates(subset=["_dedupe_key"], keep="first").drop(columns=["_dedupe_key"])
+            _df = _df.dropna(subset=["Log Path"])
+            _df = _df[_df["Log Path"].astype(str) != ""]
+            _df = _df.reset_index(drop=True)
+            
+            if not _df_from_leaderboard:
+                # Attach split metrics so ranking can use the configured validation metric.
+                _df["Valid MCC"] = pd.NA
+                _df["Valid Accuracy"] = pd.NA
+                _df["Valid AUC"] = pd.NA
+                for idx, row in _df.iterrows():
+                    split_metrics = get_split_mcc_metrics(row.get("Log Path"))
+                    if split_metrics:
+                        _df.at[idx, "Valid MCC"] = split_metrics.get('valid_mcc', pd.NA)
+                        _df.at[idx, "Valid Accuracy"] = split_metrics.get('valid_accuracy', pd.NA)
+                        _df.at[idx, "Valid AUC"] = split_metrics.get('valid_auc', pd.NA)
+
+            if "#" in _df.columns and "Registry Rank" not in _df.columns:
+                _df["Registry Rank"] = _df["#"]
+
+            # Sort by validation MCC first (fallback to MCC), keeping the registry
+            # rank as the displayed model number when available.
+            valid_sort = pd.to_numeric(_df.get("Valid MCC"), errors="coerce")
+            mcc_sort = pd.to_numeric(_df.get("MCC"), errors="coerce")
+            _df = _df.assign(
+                _valid_sort=valid_sort.fillna(float('-inf')),
+                _mcc_sort=mcc_sort.fillna(float('-inf')),
+            )
+            _df = _df.sort_values(["_valid_sort", "_mcc_sort"], ascending=[False, False]).reset_index(drop=True)
+            _df = _df.drop(columns=["_valid_sort", "_mcc_sort"])
+
+            if "Registry Rank" in _df.columns and pd.to_numeric(_df["Registry Rank"], errors="coerce").notna().any():
+                _df["#"] = _df["Registry Rank"]
+                missing_rank = pd.to_numeric(_df["#"], errors="coerce").isna()
+                if missing_rank.any():
+                    used_ranks = pd.to_numeric(_df.loc[~missing_rank, "#"], errors="coerce").dropna()
+                    next_rank = int(used_ranks.max()) + 1 if not used_ranks.empty else 1
+                    _df.loc[missing_rank, "#"] = list(range(next_rank, next_rank + int(missing_rank.sum())))
+            else:
+                _df["#"] = range(1, len(_df) + 1)
+            _df = assign_stable_model_ids(_df)
+            cols = ["#"] + [col for col in _df.columns if col != "#"]
+            _df = _df[cols]
+
+            key_to_row = {}
+            key_to_label = {}
+            model_number_map = {}
+            for _, r in _df.iterrows():
+                rd = r.to_dict()
+                selection_key = _make_model_selection_key(rd)
+                model_id = rd.get("Model ID")
+                if selection_key in key_to_row:
+                    continue
+                key_to_row[selection_key] = rd
+                model_num = rd.get("#", "?")
+                model_number_map[selection_key] = model_num
+                # Show Model ID in the label if available
+                if model_id is not None and not pd.isna(model_id):
+                    key_to_label[selection_key] = f"Model ID: {model_id} (#{model_num})"
+                else:
+                    key_to_label[selection_key] = f"#{model_num}"
+            st.session_state['model_number_map'] = model_number_map
+            st.session_state['best_models_table'] = _df.copy()
+            st.session_state['best_models_table_metric'] = get_model_order_metric()
+
+            # Auto-apply the top-ranked model so defaults come from Quick Model Selection
+            if not selected_params and len(_df) > 0:
+                try:
+                    best_row = _df.iloc[0].to_dict()
+                    parse_path = best_row.get("Best Model Dir") or best_row.get("Log Path")
+                    compatible_dataset = best_row.get("Dataset")
+                    best_row.update(extract_params_from_log_path(parse_path))
+                    if compatible_dataset:
+                        best_row["Dataset"] = compatible_dataset
+                    best_row = _validate_and_resolve_dataset(best_row, data_dir)
+                    best_row["Task"] = best_row.get("Task") or active_task
+                    if "N_Neighbors" in best_row:
+                        best_row["n_neighbors"] = best_row["N_Neighbors"]
+                    if "NSize" in best_row:
+                        best_row["new_size"] = best_row["NSize"]
+                    if "Dist_Fct" in best_row:
+                        best_row["dist_fct"] = best_row["Dist_Fct"]
+                    if "Classif_Loss" in best_row:
+                        best_row["classif_loss"] = best_row["Classif_Loss"]
+                    best_row["model_id"] = best_row.get("Registry ID")
+
+                    best_key = _make_model_selection_key(best_row)
+                    best_row = _apply_head_metadata_to_model_dict(best_row, best_row, best_key)
+                    selected_params = best_row
+                    st.session_state.selected_model_params = best_row
+                    st.session_state.selected_params_version = st.session_state.get('selected_params_version', 0) + 1
+                    st.session_state.selected_model_log_path = best_row.get('Log Path')
+                    st.session_state.selected_model_selection_key = best_key
+                    st.session_state.selected_model_version = st.session_state.get('selected_model_version', 0) + 1
+                    st.session_state.sidebar_best_model_key = best_key
+                    should_sync = True
+                    # Classification head widget renders after model selectbox
+                except Exception as auto_exc:
+                    st.warning(f"Could not auto-apply best model: {auto_exc}")
+
+            sidebar_options = _unique_preserve_order(list(key_to_row.keys()))
+            
+            try:
+                clear_completed()
+                active_metric = get_model_order_metric()
+                for prefetch_key in sidebar_options[:5]:
+                    row_for_prefetch = key_to_row.get(prefetch_key)
+                    if row_for_prefetch:
+                        _prefetch_classification_heads(prefetch_key, row_for_prefetch, active_metric)
+            except Exception:
+                pass
+
+            # Sync this widget to the canonical selection (log_path)
+            canonical_key = st.session_state.get('selected_model_selection_key')
+            if canonical_key and canonical_key in sidebar_options:
+                last = st.session_state.get('sidebar_best_model_last_sync')
+                ver = st.session_state.get('selected_model_version')
+                if ver is not None and ver != last:
+                    st.session_state['sidebar_best_model_key'] = canonical_key
+                    st.session_state['sidebar_best_model_last_sync'] = ver
+
+            # Ensure the selectbox value is valid before rendering to avoid "not in iterable" errors.
+            current_sidebar_key = st.session_state.get('sidebar_best_model_key')
+            if current_sidebar_key not in sidebar_options:
+                st.session_state['sidebar_best_model_key'] = sidebar_options[0] if sidebar_options else None
+
+            selected_key = st.selectbox(
+                "Select from best models:",
+                options=sidebar_options,
+                format_func=lambda k: key_to_label.get(k, str(k)),
+                index=0,
+                key="sidebar_best_model_key",
+            )
+
+            if selected_key and selected_key in key_to_row:
+                try:
+                    _render_classification_head_selector(key_to_row[selected_key], selected_key)
+                except Exception as clf_exc:
+                    st.warning(f"Could not load classification heads: {clf_exc}")
+
+            if selected_key and st.button("✅ Apply Selected Model", key="apply_sidebar_model"):
+                rd = key_to_row.get(selected_key)
+                if rd:
+                    model_dict = {
+                        '#': rd.get('#'),
+                        'model_number': rd.get('#'),
+                        'Model ID': rd.get('Model ID'),
+                        'Registry ID': rd.get('Registry ID'),
+                        'model_id': rd.get('Registry ID'),
+                        'exp ID': rd.get('exp ID'),
+                        'Model Name': rd.get('Model Name'),
+                        'NSize': rd.get('NSize'),
+                        'FGSM': rd.get('FGSM'),
+                        'Prototypes': rd.get('Prototypes'),
+                        'NPos': rd.get('NPos'),
+                        'NNeg': rd.get('NNeg'),
+                        'DLoss': rd.get('DLoss'),
+                        'Dist_Fct': rd.get('Dist_Fct'),
+                        'Classif_Loss': rd.get('Classif_Loss'),
+                        'N_Calibration': rd.get('N_Calibration'),
+                        'Accuracy': rd.get('Accuracy'),
+                        'MCC': rd.get('MCC'),
+                        'Normalize': rd.get('Normalize'),
+                        'N_Neighbors': rd.get('N_Neighbors'),
+                        'prototype_strategy': rd.get('Proto_Strat'),
+                        'prototype_components': rd.get('Proto_Comp'),
+                        'train_datasets': rd.get('train_datasets'),
+                        'valid_dataset': rd.get('valid_dataset'),
+                        'test_dataset': rd.get('test_dataset'),
+                        'split_config_key': rd.get('split_config_key'),
+                        'Dataset': rd.get('Dataset'),
+                        'Artifact Dataset': rd.get('Artifact Dataset'),
+                        'Combo Dataset': rd.get('Combo Dataset'),
+                        'Log Path': rd.get('Log Path'),
+                        'Artifact Log Path': rd.get('Artifact Log Path'),
+                        'Best Model Dir': rd.get('Best Model Dir'),
+                        'Source Run Path': rd.get('Source Run Path'),
+                        'Artifact ID': rd.get('Artifact ID'),
+                    }
+                    parse_path = model_dict.get("Best Model Dir") or model_dict.get("Log Path")
+                    compatible_dataset = model_dict.get("Dataset")
+                    model_dict.update(extract_params_from_log_path(parse_path))
+                    if compatible_dataset:
+                        model_dict["Dataset"] = compatible_dataset
+                    model_dict = _validate_and_resolve_dataset(model_dict, data_dir)
+                    model_dict["Task"] = model_dict.get("Task") or active_task
+                    if "N_Neighbors" in model_dict:
+                        model_dict["n_neighbors"] = model_dict["N_Neighbors"]
+                    if "NSize" in model_dict:
+                        model_dict["new_size"] = model_dict["NSize"]
+                    if "Dist_Fct" in model_dict:
+                        model_dict["dist_fct"] = model_dict["Dist_Fct"]
+                        model_dict = _set_distance_aliases(model_dict, model_dict["Dist_Fct"])
+                    if "Classif_Loss" in model_dict:
+                        model_dict["classif_loss"] = model_dict["Classif_Loss"]
+
+                    model_dict = _apply_head_metadata_to_model_dict(model_dict, rd, selected_key)
+                    st.session_state.selected_model_params = model_dict
+                    st.session_state.selected_params_version = st.session_state.get('selected_params_version', 0) + 1
+                    st.session_state.selected_model_log_path = model_dict.get('Log Path')
+                    st.session_state.selected_model_selection_key = selected_key
+                    st.session_state.selected_model_version = st.session_state.get('selected_model_version', 0) + 1
+                    if model_dict.get('best_classifier_config') is not None:
+                        st.session_state['sidebar_classification_head_model_key'] = selected_key
+                        st.session_state['sidebar_classification_head_config'] = str(model_dict.get('best_classifier_config'))
+                        st.session_state['optimized_k_value'] = str(model_dict.get('best_classifier_config'))
+                        st.session_state['learned_classifier_label'] = model_dict.get('learned_classifier_label')
+                    if model_dict.get('Head N Aug') is not None:
+                        st.session_state['sidebar_classification_head_n_aug'] = model_dict.get('Head N Aug')
+
+                    # Eagerly sync key UI widgets so the next run reflects selection immediately
                     try:
-                        from otitenet.app.pages.leaderboard import load_best_models_table
-
-                        leaderboard_df = load_best_models_table(cursor, task=task)
-                        if leaderboard_df is not None and not leaderboard_df.empty:
-                            leaderboard_df = attach_task_column(leaderboard_df)
-                            leaderboard_df["Artifact Dataset"] = leaderboard_df.apply(
-                                lambda row: _canonical_dataset_path(
-                                    extract_params_from_log_path(
-                                        row.get("Best Model Dir")
-                                        or row.get("Log Path")
-                                        or row.get("Source Run Path")
-                                        or ""
-                                    ).get("Dataset", "")
-                                ),
-                                axis=1,
-                            )
-                            leaderboard_df["Dataset"] = leaderboard_df["Artifact Dataset"]
-                            for idx, row in leaderboard_df.iterrows():
-                                combo_key = _split_combo_key_from_row(leaderboard_df.loc[idx])
-                                inferred_dataset = _dataset_path_for_split_combo(combo_key, physical_datasets)
-                                leaderboard_df.at[idx, "Combo Dataset"] = inferred_dataset
-                                if inferred_dataset:
-                                    leaderboard_df.at[idx, "Dataset"] = inferred_dataset
-                            if dataset_segment:
-                                selected_dataset_key = _canonical_dataset_path(dataset_segment)
-                                leaderboard_df = leaderboard_df[
-                                    leaderboard_df["Dataset"].astype(str).map(_canonical_dataset_path) == selected_dataset_key
-                                ]
-                            if selected_split_key:
-                                leaderboard_df = leaderboard_df[
-                                    leaderboard_df.apply(_split_combo_key_from_row, axis=1) == selected_split_key
-                                ]
-                            if not leaderboard_df.empty:
-                                _df = leaderboard_df.reset_index(drop=True)
-                                _df_from_leaderboard = True
+                        _ds_val = model_dict.get('Dataset')
+                        _all_ds = [d for d in _available_dataset_paths(data_dir) if d != 'otite_ds_-1']
+                        if _ds_val and _ds_val in _all_ds:
+                            st.session_state['dataset_selectbox'] = _ds_val
+                        elif _all_ds:
+                            # Resolved dataset not in session yet — wipe stale value so choose_dataset picks correctly
+                            st.session_state.pop('dataset_selectbox', None)
                     except Exception:
                         pass
-
-                    _group_cols = [
-                        "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
-                        "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration", "Normalize", "N_Neighbors",
-                        "train_datasets", "valid_dataset", "test_dataset",
-                    ]
-                    _dedupe_frame = _df[_group_cols].copy().fillna("").astype(str)
-                    # Use row-wise join to ensure a Series (avoids pandas agg returning a DataFrame)
-                    _df["_dedupe_key"] = _dedupe_frame.apply(lambda r: "|".join(r.values.tolist()), axis=1)
-                    _df = _df.sort_values("MCC", ascending=False)
-                    _df = _df.drop_duplicates(subset=["_dedupe_key"], keep="first").drop(columns=["_dedupe_key"])
-                    _df = _df.dropna(subset=["Log Path"])
-                    _df = _df[_df["Log Path"].astype(str) != ""]
-                    _df = _df.reset_index(drop=True)
-                    
-                    if not _df_from_leaderboard:
-                        # Attach split metrics so ranking can use the configured validation metric.
-                        _df["Valid MCC"] = pd.NA
-                        _df["Valid Accuracy"] = pd.NA
-                        _df["Valid AUC"] = pd.NA
-                        for idx, row in _df.iterrows():
-                            split_metrics = get_split_mcc_metrics(row.get("Log Path"))
-                            if split_metrics:
-                                _df.at[idx, "Valid MCC"] = split_metrics.get('valid_mcc', pd.NA)
-                                _df.at[idx, "Valid Accuracy"] = split_metrics.get('valid_accuracy', pd.NA)
-                                _df.at[idx, "Valid AUC"] = split_metrics.get('valid_auc', pd.NA)
-
-                    # Sort by validation MCC first (fallback to MCC), then re-number rows
-                    valid_sort = pd.to_numeric(_df.get("Valid MCC"), errors="coerce")
-                    mcc_sort = pd.to_numeric(_df.get("MCC"), errors="coerce")
-                    _df = _df.assign(
-                        _valid_sort=valid_sort.fillna(float('-inf')),
-                        _mcc_sort=mcc_sort.fillna(float('-inf')),
-                    )
-                    _df = _df.sort_values(["_valid_sort", "_mcc_sort"], ascending=[False, False]).reset_index(drop=True)
-                    _df = _df.drop(columns=["_valid_sort", "_mcc_sort"])
-
-                    _df["#"] = range(1, len(_df) + 1)
-                    cols = ["#"] + [col for col in _df.columns if col != "#"]
-                    _df = _df[cols]
-
-                    key_to_row = {}
-                    key_to_label = {}
-                    model_number_map = {}
-                    for _, r in _df.iterrows():
-                        rd = r.to_dict()
-                        selection_key = _make_model_selection_key(rd)
-                        if selection_key in key_to_row:
-                            continue
-                        key_to_row[selection_key] = rd
-                        model_num = rd.get("#", "?")
-                        model_number_map[selection_key] = model_num
-                        key_to_label[selection_key] = (
-                            f"#{model_num}: {rd.get('Model ID')}"
-                        )
-                    st.session_state['model_number_map'] = model_number_map
-                    st.session_state['best_models_table'] = _df.copy()
-                    st.session_state['best_models_table_metric'] = get_model_order_metric()
-                else:
-                    st.info("No models in Quick Model Selection match a manifest row with job_state='done'.")
-                    st.session_state['model_number_map'] = {}
-                    key_to_row = {}
-                    key_to_label = {}
-
-                # Auto-apply the top-ranked model so defaults come from Quick Model Selection
-                if not selected_params and len(_df) > 0:
                     try:
-                        best_row = _df.iloc[0].to_dict()
-                        parse_path = best_row.get("Best Model Dir") or best_row.get("Log Path")
-                        compatible_dataset = best_row.get("Dataset")
-                        best_row.update(extract_params_from_log_path(parse_path))
-                        if compatible_dataset:
-                            best_row["Dataset"] = compatible_dataset
-                        best_row = _validate_and_resolve_dataset(best_row, data_dir)
-                        best_row["Task"] = best_row.get("Task") or active_task
-                        if "N_Neighbors" in best_row:
-                            best_row["n_neighbors"] = best_row["N_Neighbors"]
-                        if "NSize" in best_row:
-                            best_row["new_size"] = best_row["NSize"]
-                        if "Dist_Fct" in best_row:
-                            best_row["dist_fct"] = best_row["Dist_Fct"]
-                        if "Classif_Loss" in best_row:
-                            best_row["classif_loss"] = best_row["Classif_Loss"]
-                        best_row["model_id"] = best_row.get("Model ID")
-
-                        selected_params = best_row
-                        st.session_state.selected_model_params = best_row
-                        st.session_state.selected_params_version = st.session_state.get('selected_params_version', 0) + 1
-                        st.session_state.selected_model_log_path = best_row.get('Log Path')
-                        best_key = _make_model_selection_key(best_row)
-                        st.session_state.selected_model_selection_key = best_key
-                        st.session_state.selected_model_version = st.session_state.get('selected_model_version', 0) + 1
-                        st.session_state.sidebar_best_model_key = best_key
-                        should_sync = True
-                        # Classification head widget renders after model selectbox
-                    except Exception as auto_exc:
-                        st.warning(f"Could not auto-apply best model: {auto_exc}")
-
-                sidebar_options = _unique_preserve_order(list(key_to_row.keys()))
-                try:
-                    clear_completed()
-                    active_metric = get_model_order_metric()
-                    for prefetch_key in sidebar_options[:5]:
-                        row_for_prefetch = key_to_row.get(prefetch_key)
-                        if row_for_prefetch:
-                            _prefetch_classification_heads(prefetch_key, row_for_prefetch, active_metric)
-                except Exception:
-                    pass
-
-                # Sync this widget to the canonical selection (log_path)
-                canonical_key = st.session_state.get('selected_model_selection_key')
-                if canonical_key and canonical_key in sidebar_options:
-                    last = st.session_state.get('sidebar_best_model_last_sync')
-                    ver = st.session_state.get('selected_model_version')
-                    if ver is not None and ver != last:
-                        st.session_state['sidebar_best_model_key'] = canonical_key
-                        st.session_state['sidebar_best_model_last_sync'] = ver
-
-                # Ensure the selectbox value is valid before rendering to avoid "not in iterable" errors.
-                current_sidebar_key = st.session_state.get('sidebar_best_model_key')
-                if current_sidebar_key not in sidebar_options:
-                    st.session_state['sidebar_best_model_key'] = sidebar_options[0] if sidebar_options else None
-
-                selected_key = st.selectbox(
-                    "Select from best models:",
-                    options=sidebar_options,
-                    format_func=lambda k: key_to_label.get(k, str(k)),
-                    index=0,
-                    key="sidebar_best_model_key",
-                )
-
-                if selected_key and selected_key in key_to_row:
+                        if model_dict.get('Task'):
+                            st.session_state['production_task'] = model_dict['Task']
+                    except Exception:
+                        pass
                     try:
-                        _render_classification_head_selector(key_to_row[selected_key], selected_key)
-                    except Exception as clf_exc:
-                        st.warning(f"Could not load classification heads: {clf_exc}")
+                        if model_dict.get('new_size') is not None:
+                            st.session_state['new_size_input'] = int(float(model_dict['new_size']))
+                    except Exception:
+                        pass
+                    try:
+                        if model_dict.get('n_neighbors') is not None:
+                            st.session_state['n_neighbors_input'] = int(float(model_dict['n_neighbors']))
+                    except Exception:
+                        pass
+                    try:
+                        if model_dict.get('Dist_Fct'):
+                            st.session_state['dist_fct_selectbox'] = str(model_dict.get('Dist_Fct')).strip().lower()
+                    except Exception:
+                        pass
+                    # Other selectors (best-effort; choose_dataset etc. will validate on rerun)
+                    for key_name, dict_key in [
+                        ('model_name_selectbox', 'Model Name'),
+                        ('fgsm_selectbox', 'FGSM'),
+                        ('n_calibration_selectbox', 'N_Calibration'),
+                        ('classif_loss_selectbox', 'Classif_Loss'),
+                        ('dloss_selectbox', 'DLoss'),
+                        ('prototypes_selectbox', 'Prototypes'),
+                        ('npos_selectbox', 'NPos'),
+                        ('nneg_selectbox', 'NNeg'),
+                    ]:
+                        try:
+                            v = model_dict.get(dict_key)
+                            if v is not None:
+                                st.session_state[key_name] = v
+                        except Exception:
+                            pass
+                    try:
+                        if model_dict.get('Normalize') in ['yes', 'no', 'per_image', 'imagenet']:
+                            st.session_state['normalize_input'] = model_dict.get('Normalize')
+                    except Exception:
+                        pass
+                    st.success(f"✅ Applied: {model_dict.get('Model Name')}")
+                    _preserve_active_page_for_sidebar_rerun()
+                    st.rerun()
 
-                if selected_key and st.button("✅ Apply Selected Model", key="apply_sidebar_model"):
-                    rd = key_to_row.get(selected_key)
-                    if rd:
+            # Admin: Production model control (outside the Apply button so it persists)
+            if is_admin and selected_key:
+                st.divider()
+                rd = key_to_row.get(selected_key)
+                if rd:
+                    if st.button("🚀 Set as Production Model", key="set_production_model"):
+                        production_task = active_task or rd.get("Task") or "notNormal"
                         model_dict = {
-                            '#': rd.get('#'),
-                            'model_number': rd.get('#'),
+                            'label_task': production_task,
+                            'label_scheme': label_scheme_for_task(production_task),
                             'Model ID': rd.get('Model ID'),
-                            'model_id': rd.get('Model ID'),
+                            'Registry ID': rd.get('Registry ID'),
+                            'model_id': rd.get('Registry ID'),
+                            'exp ID': rd.get('exp ID'),
                             'Model Name': rd.get('Model Name'),
                             'NSize': rd.get('NSize'),
                             'FGSM': rd.get('FGSM'),
@@ -1196,187 +1469,76 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                             'Dataset': rd.get('Dataset'),
                             'Artifact Dataset': rd.get('Artifact Dataset'),
                             'Combo Dataset': rd.get('Combo Dataset'),
-                            'Log Path': rd.get('Log Path'),
+                            'Log Path': (
+                                rd.get('Log Path')
+                                or rd.get('Artifact Log Path')
+                                or rd.get('Best Model Dir')
+                                or rd.get('Source Run Path')
+                            ),
                             'Artifact Log Path': rd.get('Artifact Log Path'),
                             'Best Model Dir': rd.get('Best Model Dir'),
                             'Source Run Path': rd.get('Source Run Path'),
                             'Artifact ID': rd.get('Artifact ID'),
+                            'model_number': st.session_state.model_number_map.get(selected_key, '?'),
                         }
-                        parse_path = model_dict.get("Best Model Dir") or model_dict.get("Log Path")
-                        compatible_dataset = model_dict.get("Dataset")
-                        model_dict.update(extract_params_from_log_path(parse_path))
-                        if compatible_dataset:
-                            model_dict["Dataset"] = compatible_dataset
-                        model_dict = _validate_and_resolve_dataset(model_dict, data_dir)
-                        model_dict["Task"] = model_dict.get("Task") or active_task
-                        if "N_Neighbors" in model_dict:
-                            model_dict["n_neighbors"] = model_dict["N_Neighbors"]
-                        if "NSize" in model_dict:
-                            model_dict["new_size"] = model_dict["NSize"]
-                        if "Dist_Fct" in model_dict:
-                            model_dict["dist_fct"] = model_dict["Dist_Fct"]
-                        if "Classif_Loss" in model_dict:
-                            model_dict["classif_loss"] = model_dict["Classif_Loss"]
+                        model_dict = _apply_head_metadata_to_model_dict(model_dict, rd, selected_key)
 
-                        st.session_state.selected_model_params = model_dict
-                        st.session_state.selected_params_version = st.session_state.get('selected_params_version', 0) + 1
-                        st.session_state.selected_model_log_path = model_dict.get('Log Path')
-                        st.session_state.selected_model_selection_key = selected_key
-                        st.session_state.selected_model_version = st.session_state.get('selected_model_version', 0) + 1
-
-                        # Eagerly sync key UI widgets so the next run reflects selection immediately
-                        try:
-                            _ds_val = model_dict.get('Dataset')
-                            _all_ds = [d for d in _available_dataset_paths(data_dir) if d != 'otite_ds_-1']
-                            if _ds_val and _ds_val in _all_ds:
-                                st.session_state['dataset_selectbox'] = _ds_val
-                            elif _all_ds:
-                                # Resolved dataset not in session yet — wipe stale value so choose_dataset picks correctly
-                                st.session_state.pop('dataset_selectbox', None)
-                        except Exception:
-                            pass
-                        try:
-                            if model_dict.get('Task'):
-                                st.session_state['production_task'] = model_dict['Task']
-                        except Exception:
-                            pass
-                        try:
-                            if model_dict.get('new_size') is not None:
-                                st.session_state['new_size_input'] = int(float(model_dict['new_size']))
-                        except Exception:
-                            pass
-                        try:
-                            if model_dict.get('n_neighbors') is not None:
-                                st.session_state['n_neighbors_input'] = int(float(model_dict['n_neighbors']))
-                        except Exception:
-                            pass
-                        try:
-                            if model_dict.get('Dist_Fct'):
-                                st.session_state['dist_fct_selectbox'] = str(model_dict.get('Dist_Fct')).strip().lower()
-                        except Exception:
-                            pass
-                        # Other selectors (best-effort; choose_dataset etc. will validate on rerun)
-                        for key_name, dict_key in [
-                            ('model_name_selectbox', 'Model Name'),
-                            ('fgsm_selectbox', 'FGSM'),
-                            ('n_calibration_selectbox', 'N_Calibration'),
-                            ('classif_loss_selectbox', 'Classif_Loss'),
-                            ('dloss_selectbox', 'DLoss'),
-                            ('prototypes_selectbox', 'Prototypes'),
-                            ('npos_selectbox', 'NPos'),
-                            ('nneg_selectbox', 'NNeg'),
-                        ]:
-                            try:
-                                v = model_dict.get(dict_key)
-                                if v is not None:
-                                    st.session_state[key_name] = v
-                            except Exception:
-                                pass
-                        try:
-                            if model_dict.get('Normalize') in ['yes', 'no']:
-                                st.session_state['normalize_input'] = model_dict.get('Normalize')
-                        except Exception:
-                            pass
-                        st.success(f"✅ Applied: {model_dict.get('Model Name')}")
-                        st.rerun()
-                
-                # Admin: Production model control (outside the Apply button so it persists)
-                if is_admin and selected_key:
-                    st.divider()
-                    rd = key_to_row.get(selected_key)
-                    if rd:
-                        if st.button("🚀 Set as Production Model", key="set_production_model"):
-                            production_task = active_task or rd.get("Task") or "notNormal"
-                            model_dict = {
-                                'label_task': production_task,
-                                'label_scheme': label_scheme_for_task(production_task),
-                                'Model ID': rd.get('Model ID'),
-                                'model_id': rd.get('Model ID'),
-                                'Model Name': rd.get('Model Name'),
-                                'NSize': rd.get('NSize'),
-                                'FGSM': rd.get('FGSM'),
-                                'Prototypes': rd.get('Prototypes'),
-                                'NPos': rd.get('NPos'),
-                                'NNeg': rd.get('NNeg'),
-                                'DLoss': rd.get('DLoss'),
-                                'Dist_Fct': rd.get('Dist_Fct'),
-                                'Classif_Loss': rd.get('Classif_Loss'),
-                                'N_Calibration': rd.get('N_Calibration'),
-                                'Accuracy': rd.get('Accuracy'),
-                                'MCC': rd.get('MCC'),
-                                'Normalize': rd.get('Normalize'),
-                                'N_Neighbors': rd.get('N_Neighbors'),
-                                'prototype_strategy': rd.get('Proto_Strat'),
-                                'prototype_components': rd.get('Proto_Comp'),
-                                'train_datasets': rd.get('train_datasets'),
-                                'valid_dataset': rd.get('valid_dataset'),
-                                'test_dataset': rd.get('test_dataset'),
-                                'split_config_key': rd.get('split_config_key'),
-                                'Dataset': rd.get('Dataset'),
-                                'Artifact Dataset': rd.get('Artifact Dataset'),
-                                'Combo Dataset': rd.get('Combo Dataset'),
-                                'Log Path': rd.get('Log Path'),
-                                'Artifact Log Path': rd.get('Artifact Log Path'),
-                                'Best Model Dir': rd.get('Best Model Dir'),
-                                'Source Run Path': rd.get('Source Run Path'),
-                                'Artifact ID': rd.get('Artifact ID'),
-                                'model_number': st.session_state.model_number_map.get(selected_key, '?'),
-                            }
-                            selected_head_model_key = st.session_state.get('sidebar_classification_head_model_key')
-                            selected_head_config = None
-                            if selected_head_model_key == selected_key:
-                                selected_head_config = st.session_state.get('sidebar_classification_head_config')
-                            if not selected_head_config:
-                                selected_head_config = "baseline_linear_svc"
-
-                            selected_head_label = format_classifier_config(selected_head_config)
-                            selected_head_meta = parse_classifier_config(selected_head_config)
-                            model_dict['Head Config'] = str(selected_head_config)
-                            model_dict['head_config'] = str(selected_head_config)
-                            model_dict['classification_head_config'] = str(selected_head_config)
-                            model_dict['best_classifier_config'] = str(selected_head_config)
-                            model_dict['Head'] = selected_head_label
-                            model_dict['head_name'] = selected_head_label
-                            model_dict['learned_classifier_label'] = selected_head_label
-                            model_dict['head_family'] = selected_head_meta.get('family')
-                            selected_head_n_aug = st.session_state.get('sidebar_classification_head_n_aug')
-                            if selected_head_n_aug is not None:
-                                model_dict['N Aug'] = selected_head_n_aug
-                                model_dict['n_aug'] = selected_head_n_aug
-                                model_dict['head_n_aug'] = selected_head_n_aug
-
-                            # Copy all relevant fields from selected_head_meta
-                            for key, value in selected_head_meta.items():
-                                if value is not None:
-                                    model_dict[key] = value
-
-                            # Allow any head to be set as production model; deployment script enforces restriction
-                            set_by_email = st.session_state.get('user_email', 'unknown')
-                            if set_production_model(cursor, conn, model_dict, set_by_email):
-                                st.session_state['production_model'] = model_dict
-                                st.success("✅ Model set as production model for this labeling scenario")
-                            else:
-                                st.error("❌ Failed to save production model to database")
-                        
-                        # Show current production model
-                        if 'production_model' in st.session_state:
-                            prod = st.session_state['production_model']
-                            prod_head = (
-                                prod.get('Head')
-                                or prod.get('head_name')
-                                or prod.get('learned_classifier_label')
-                                or format_classifier_config(
-                                    prod.get('Head Config')
-                                    or prod.get('head_config')
-                                    or prod.get('classification_head_config')
-                                    or prod.get('best_classifier_config')
-                                )
+                        # Allow any head to be set as production model; deployment script enforces restriction
+                        set_by_email = st.session_state.get('user_email', 'unknown')
+                        runtime_dist_fct = str(
+                            st.session_state.get(
+                                'dist_fct_selectbox',
+                                model_dict.get('dist_fct') or model_dict.get('Dist_Fct') or 'euclidean',
                             )
-                            if not prod_head or str(prod_head) in {'None', 'nan', '—'}:
-                                prod_head = 'head not stored yet'
-                            st.info(f"🎯 **Current Production Model:** {prod.get('Model Name')} (#{prod.get('model_number', '?')}) - {prod_head}")
+                        ).strip().lower()
+                        if runtime_dist_fct not in {'euclidean', 'cosine'}:
+                            runtime_dist_fct = str(model_dict.get('dist_fct') or model_dict.get('Dist_Fct') or 'euclidean').strip().lower()
+                        model_dict = _set_distance_aliases(model_dict, runtime_dist_fct)
+
+                        runtime_args = argparse.Namespace(
+                            dist_fct=runtime_dist_fct,
+                            dist_metric=runtime_dist_fct,
+                        )
+                        saved_model = set_production_model(
+                            model_dict,
+                            cursor=cursor,
+                            conn=conn,
+                            task=production_task,
+                            label_scheme=label_scheme_for_task(production_task),
+                            args=runtime_args,
+                        )
+                        if saved_model:
+                            st.session_state['production_model'] = saved_model
+                            st.session_state['production_model_cache_task'] = production_task
+                            st.session_state['production_model_cache_ts'] = 0.0
+                            st.session_state['new_analysis_model_source'] = "Production model"
+                            st.success("✅ Model set as production model for this labeling scenario")
                         else:
-                            st.warning("⚠️ No production model set")
+                            st.error("❌ Failed to save production model to database")
+                    
+                    # Show current production model
+                    if 'production_model' in st.session_state:
+                        prod = st.session_state['production_model']
+                        prod_head = (
+                            prod.get('Head')
+                            or prod.get('head_name')
+                            or prod.get('learned_classifier_label')
+                            or format_classifier_config(
+                                prod.get('Head Config')
+                                or prod.get('head_config')
+                                or prod.get('classification_head_config')
+                                or prod.get('best_classifier_config')
+                            )
+                        )
+                        if not prod_head or str(prod_head) in {'None', 'nan', '—'}:
+                            prod_head = 'head not stored yet'
+                        prod_n_aug = _resolve_production_head_n_aug(prod)
+                        n_aug_suffix = ""
+                        if prod_n_aug is not None and str(prod_n_aug).strip() not in {"", "None", "nan", "—"}:
+                            n_aug_suffix = f" / n_aug={prod_n_aug}"
+                        st.info(f"🎯 **Current Production Model:** {prod.get('Model Name')} (#{prod.get('model_number', '?')}) - {prod_head}{n_aug_suffix}")
+                    else:
+                        st.warning("⚠️ No production model set")
         except Exception as e:
             st.warning(f"Could not load models: {e}")
 
@@ -1550,14 +1712,15 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         n_neighbors_default_value = st.session_state.get('n_neighbors_input', 1)
         n_neighbors = st.number_input("n_neighbors", value=int(n_neighbors_default_value), step=1, key="n_neighbors_input")
 
-        normalize_default = selected_params.get("Normalize", "no")
+        normalize_options = ['yes', 'no', 'per_image', 'imagenet']
+        normalize_default = selected_params.get("Normalize", "yes")
         if should_sync and normalize_default is not None:
             st.session_state['normalize_input'] = normalize_default
-        _safe_selectbox_sync('normalize_input', ['yes', 'no'], normalize_default)
-        normalize = st.selectbox("normalize", ['yes', 'no'], key="normalize_input")
+        _safe_selectbox_sync('normalize_input', normalize_options, normalize_default)
+        normalize = st.selectbox("normalize", normalize_options, key="normalize_input")
 
         device = st.selectbox("device", ['cpu', 'cuda'], index=1, key="device_selectbox")
-        valid_dataset_default = selected_params.get('valid_dataset', 'Banque_Viscaino_Chili_2020')
+        valid_dataset_default = selected_params.get('valid_dataset', '')
         if should_sync and valid_dataset_default is not None:
             st.session_state['valid_dataset_input'] = valid_dataset_default
         valid_dataset = st.text_input("valid_dataset", value=st.session_state.get('valid_dataset_input', valid_dataset_default), key="valid_dataset_input")
@@ -1660,7 +1823,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         or selected_params.get('split_config_key')
     )
     args._split_config_in_path = args.split_config_in_path
-    args.model_id = selected_params.get('model_id') or selected_params.get('Model ID')
+    args.model_id = selected_params.get('model_id') or selected_params.get('Registry ID')
     args.log_path = (
         selected_params.get('Artifact Log Path')
         or selected_params.get('Log Path')
@@ -1691,10 +1854,31 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
     selected_head = None
     if selected_head_model_key and current_model_key and selected_head_model_key == current_model_key:
         selected_head = st.session_state.get("sidebar_classification_head_config")
+        selected_head_n_aug = st.session_state.get("sidebar_classification_head_n_aug")
+        if selected_head_n_aug is not None:
+            try:
+                args.n_aug = int(float(str(selected_head_n_aug)))
+            except Exception:
+                args.n_aug = selected_head_n_aug
     if selected_head:
         args.best_classifier_config = str(selected_head)
     else:
-        if args.siamese_inference == "linearsvc":
+        selected_params_head = (
+            selected_params.get('best_classifier_config')
+            or selected_params.get('classification_head_config')
+            or selected_params.get('Head Config')
+            or selected_params.get('Best Head Config')
+            or selected_params.get('head_config')
+        )
+        if selected_params_head is not None and str(selected_params_head).strip() not in {"", "None", "nan", "—"}:
+            args.best_classifier_config = str(selected_params_head)
+            selected_head_n_aug = _resolve_production_head_n_aug(selected_params)
+            if selected_head_n_aug is not None:
+                try:
+                    args.n_aug = int(float(str(selected_head_n_aug)))
+                except Exception:
+                    args.n_aug = selected_head_n_aug
+        elif args.siamese_inference == "linearsvc":
             args.best_classifier_config = "baseline_linear_svc"
         elif args.siamese_inference == "logisticregression":
             args.best_classifier_config = "baseline_logreg"

@@ -7,6 +7,23 @@ from typing import Any
 from otitenet.offline.deployment import OfflineDeployment
 
 
+def _infer_num_classes_from_state_dict(state_dict: dict) -> int | None:
+    for key in ("linear.weight", "classifier.weight", "fc.weight"):
+        value = state_dict.get(key)
+        if hasattr(value, "shape") and len(value.shape) >= 1:
+            return int(value.shape[0])
+
+    value = state_dict.get("linear.bias")
+    if hasattr(value, "shape") and len(value.shape) == 1:
+        return int(value.shape[0])
+
+    value = state_dict.get("subcenters")
+    if hasattr(value, "shape") and len(value.shape) >= 1:
+        return int(value.shape[0])
+
+    return None
+
+
 def _normalize_model_name(model_name: str) -> str:
     model_name = str(model_name or "resnet18")
     if model_name.endswith("_mobile"):
@@ -63,13 +80,31 @@ def load_state_dict_model(path: Path, deployment: OfflineDeployment, device: str
     import torch
 
     state_dict = torch.load(path, map_location=device, weights_only=True)
+
     if not isinstance(state_dict, dict):
         raise TypeError(f"Expected a state dict in {path}, got {type(state_dict).__name__}")
 
-    labels = deployment.labels
-    n_cats = len(labels)
-    if n_cats == 0 and "linear.weight" in state_dict:
-        n_cats = int(state_dict["linear.weight"].shape[0])
+    ckpt_num_classes = _infer_num_classes_from_state_dict(state_dict)
+
+    labels = list(getattr(deployment, "labels", []) or [])
+    manifest_num_classes = len(labels)
+
+    if ckpt_num_classes is not None and manifest_num_classes not in {0, ckpt_num_classes}:
+        raise ValueError(
+            f"Deployment/model class mismatch: manifest has {manifest_num_classes} labels "
+            f"{labels}, but checkpoint has {ckpt_num_classes} classes. "
+            "Fix the deployment manifest labels to match the trained model class order."
+        )
+
+    if manifest_num_classes > 0:
+        n_cats = manifest_num_classes
+    elif ckpt_num_classes is not None:
+        n_cats = ckpt_num_classes
+    else:
+        raise ValueError(
+            "Could not infer the number of classes. Add labels to the deployment manifest "
+            "or include linear.weight/linear.bias/subcenters in the checkpoint."
+        )
 
     n_batches = 1
     if "dann.weight" in state_dict:
@@ -87,6 +122,7 @@ def load_state_dict_model(path: Path, deployment: OfflineDeployment, device: str
         n_batches=n_batches,
         n_subcenters=n_subcenters,
     )
+
     model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()

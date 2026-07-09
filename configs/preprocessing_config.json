@@ -1,7 +1,7 @@
 {
   "source_root": "data/datasets",
   "output_base": "data/otite_ds",
-  "image_size": 64,
+  "image_size": 224,
   "split_mode": "by_dataset",
   "strict_label_map": true,
   "include_datasets": [

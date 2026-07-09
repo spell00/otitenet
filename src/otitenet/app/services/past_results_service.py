@@ -87,7 +87,7 @@ def args_from_result_row(
     if not hasattr(local_args, "groupkfold"):
         local_args.groupkfold = 1
     if not hasattr(local_args, "valid_dataset"):
-        local_args.valid_dataset = "Banque_Viscaino_Chili_2020"
+        local_args.valid_dataset = ""
     if not hasattr(local_args, "device"):
         local_args.device = device_default
 

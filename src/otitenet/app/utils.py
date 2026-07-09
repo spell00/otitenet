@@ -154,7 +154,9 @@ def normalize_train_datasets(value) -> str:
         parts = [str(x).strip() for x in value]
     else:
         parts = [x.strip() for x in str(value).replace(";", ",").split(",")]
-    return ",".join(_unique_preserve_order([x for x in parts if x and x.lower() not in {"none", "nan", "null"}]))
+    # Sort alphabetically to ensure consistent ordering regardless of input order
+    filtered = [x for x in parts if x and x.lower() not in {"none", "nan", "null"}]
+    return ",".join(sorted(filtered))
 
 
 LEGACY_TRAIN_DATASETS = "Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM"
@@ -1287,6 +1289,65 @@ def _make_model_selection_key(row_dict: dict) -> str:
     return "|".join(parts)
 
 
+def _blank_model_identifier(value) -> bool:
+    try:
+        if value is None or pd.isna(value):
+            return True
+    except Exception:
+        pass
+    return str(value).strip().lower() in {"", "none", "nan", "<na>"}
+
+
+def _int_model_identifier(value):
+    if _blank_model_identifier(value):
+        return None
+    try:
+        return int(float(str(value).strip()))
+    except Exception:
+        return None
+
+
+def stable_model_id_for_row(row_dict: dict) -> int:
+    """Return a stable numeric display id for a model row."""
+    registry_id = _int_model_identifier(
+        row_dict.get("Registry ID")
+        if "Registry ID" in row_dict
+        else row_dict.get("DB Model ID", row_dict.get("model_id", row_dict.get("id")))
+    )
+    if registry_id is not None:
+        return registry_id
+
+    selection_key = _make_model_selection_key(row_dict)
+    digest = hashlib.sha1(selection_key.encode("utf-8")).hexdigest()
+    return 900_000_000 + (int(digest[:10], 16) % 99_000_000)
+
+
+def assign_stable_model_ids(df: pd.DataFrame) -> pd.DataFrame:
+    """Populate stable `Model ID` values while preserving DB ids as `Registry ID`."""
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    if "Registry ID" not in out.columns:
+        if "Model ID" in out.columns:
+            out["Registry ID"] = out["Model ID"]
+        else:
+            out["Registry ID"] = pd.NA
+
+    used_ids = set()
+    model_ids = []
+    for _, row in out.iterrows():
+        row_dict = row.to_dict()
+        model_id = stable_model_id_for_row(row_dict)
+        while model_id in used_ids:
+            model_id += 1
+        used_ids.add(model_id)
+        model_ids.append(model_id)
+
+    out["Model ID"] = model_ids
+    return out
+
+
 def _lookup_model_number(mapping_rd: dict, model_number_map: dict) -> str:
     """Resolve the model number from the map with graceful fallback."""
     # First, attempt exact match
@@ -1999,7 +2060,148 @@ def load_optimization_cache_dict(_args) -> dict:
                 )
             except Exception as e:
                 print(f"[Cache] Could not load legacy cache {legacy_file}: {e}")
+    
+    # Fallback to database if no pickle cache found
+    if not merged_cache:
+        try:
+            from otitenet.app.database import load_learned_embedding_heads
+            import streamlit as st
+            
+            cursor = None
+            try:
+                if 'db_cursor' in st.session_state:
+                    cursor = st.session_state.db_cursor
+            except Exception:
+                pass
+            
+            if cursor:
+                log_path = getattr(_args, 'log_path', None)
+                db_heads = load_learned_embedding_heads(cursor, log_path=log_path)
+                if db_heads:
+                    # Convert database heads back to cache format
+                    merged_cache = _convert_db_heads_to_cache(db_heads, _args)
+                    print(f"[Cache] Loaded {len(db_heads)} heads from database as fallback")
+        except Exception as e:
+            print(f"[Cache] Database fallback failed: {e}")
+    
     return merged_cache
+
+
+def _convert_db_heads_to_cache(heads: list[dict], _args) -> dict:
+    """Convert database heads back to cache format for compatibility."""
+    cache = {}
+    
+    # Group by n_aug
+    by_n_aug = {}
+    for head in heads:
+        n_aug = head.get('n_aug', 0)
+        if n_aug not in by_n_aug:
+            by_n_aug[n_aug] = []
+        by_n_aug[n_aug].append(head)
+    
+    # Convert to cache format
+    for n_aug, n_aug_heads in by_n_aug.items():
+        cache_entry = {
+            'head_cache_version': 2,
+            'train_datasets': n_aug_heads[0].get('train_datasets'),
+            'valid_dataset': n_aug_heads[0].get('valid_dataset'),
+            'test_dataset': n_aug_heads[0].get('test_dataset'),
+            'knn': {'mcc_per_k': []},
+            'prototypes': {},
+            'baselines': {},
+        }
+        best_head = None
+        best_score = float("-inf")
+
+        def _score_for_head(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _remember_best(config, metrics):
+            nonlocal best_head, best_score
+            score = _score_for_head(metric_value_from_mapping(metrics))
+            if score is None:
+                score = _score_for_head(metrics.get("valid_mcc", metrics.get("mcc", metrics.get("best_mcc"))))
+            if score is None or score <= best_score:
+                return
+            best_score = score
+            best_head = (str(config), dict(metrics))
+        
+        for head in n_aug_heads:
+            config = head.get('config', '')
+            family = head.get('family', '')
+            valid_mcc = head.get('valid_mcc')
+            
+            if family == 'knn' or config.isdigit():
+                try:
+                    k = int(config) if config.isdigit() else 1
+                    metrics = {
+                        'k': k,
+                        'valid_mcc': valid_mcc,
+                        'test_mcc': head.get('test_mcc'),
+                        'valid_auc': head.get('valid_auc'),
+                        'test_auc': head.get('test_auc'),
+                    }
+                    cache_entry['knn']['mcc_per_k'].append(metrics)
+                    _remember_best(k, metrics)
+                except Exception:
+                    pass
+            elif family in ['gmm', 'kmeans', 'mean'] or 'protot' in config:
+                config_parts = str(config).lower().split('_')
+                if 'gmm' in config_parts:
+                    strategy = 'gmm'
+                elif 'kmeans' in config_parts:
+                    strategy = 'kmeans'
+                elif 'mean' in config_parts:
+                    strategy = 'mean'
+                else:
+                    strategy = family if family in ['gmm', 'kmeans', 'mean'] else 'mean'
+                n_comp = 1
+                if str(config).split('_')[-1].isdigit():
+                    n_comp = int(str(config).split('_')[-1])
+                elif strategy == 'gmm':
+                    n_comp = 2
+                
+                if strategy not in cache_entry['prototypes']:
+                    cache_entry['prototypes'][strategy] = {}
+                proto_config = f"protot_{strategy}_{n_comp}"
+                metrics = {
+                    'best_mcc': valid_mcc,
+                    'valid_mcc': valid_mcc,
+                    'best_n_components': n_comp,
+                    'train_mcc': head.get('train_mcc'),
+                    'test_mcc': head.get('test_mcc'),
+                    'valid_auc': head.get('valid_auc'),
+                    'test_auc': head.get('test_auc'),
+                }
+                cache_entry['prototypes'][strategy].update(metrics)
+                _remember_best(proto_config, metrics)
+            elif 'baseline' in config or family in ['logreg', 'ridge', 'naive_bayes', 'svc', 'random_forest', 'gradient_boosting', 'decision_tree', 'lda', 'qda']:
+                baseline_name = family if 'baseline' not in config else config.replace('baseline_', '')
+                metrics = {
+                    'mcc': valid_mcc,
+                    'valid_mcc': valid_mcc,
+                    'train_mcc': head.get('train_mcc'),
+                    'test_mcc': head.get('test_mcc'),
+                    'valid_auc': head.get('valid_auc'),
+                    'test_auc': head.get('test_auc'),
+                }
+                cache_entry['baselines'][baseline_name] = metrics
+                _remember_best(f"baseline_{baseline_name}", metrics)
+        
+        # Set best overall
+        if best_head is not None:
+            best_config, best_metrics = best_head
+            cache_entry['best_mcc'] = best_score
+            cache_entry['best_config'] = best_config
+            cache_entry['best_head_metrics'] = best_metrics
+            cache_entry['best_k'] = best_config
+        
+        cache[n_aug] = cache_entry
+    
+    return cache
 
 
 def load_best_classifier_from_cache(_args):
@@ -2031,11 +2233,19 @@ def load_best_classifier_from_cache(_args):
                 best_overall = result
                 best_n_aug = int(n_aug)
 
-        if best_overall and best_overall.get('best_k') is not None:
+        if best_overall:
+            best_config = best_overall.get('best_config')
+            if best_config is None:
+                best_config = best_overall.get('best_k')
+        else:
+            best_config = None
+
+        if best_config is not None:
             return {
-                'best_config': best_overall.get('best_k'),
+                'best_config': best_config,
                 'best_mcc': best_mcc,
                 'n_aug': best_n_aug,
+                'best_head_metrics': best_overall.get('best_head_metrics'),
                 'all_results': best_overall,
             }
     except Exception as e:

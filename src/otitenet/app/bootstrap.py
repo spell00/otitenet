@@ -14,12 +14,15 @@ Those functions live in the existing `otitenet/app/database.py` and
 that `from otitenet.bootstrap import …` works correctly.
 """
 
+import streamlit as st
+
 # Database‑related bootstrapping
 from .database import (
     create_db,
     get_db_connection,
     ensure_results_model_id,
     ensure_results_class_scores,
+    ensure_results_head_config,
     ensure_best_models_registry_nsize,
     check_ds_exists,
     list_image_results,
@@ -28,12 +31,14 @@ from .database import (
     insert_score,
 )
 
+@st.cache_resource
 def initialize_database():
     from .database import (
         create_db,
         get_db_connection,
         ensure_results_model_id,
         ensure_results_class_scores,
+        ensure_results_head_config,
         ensure_best_models_registry_nsize,
         ensure_registry_metrics_columns,
         cleanup_duplicate_best_models_registry,
@@ -69,6 +74,7 @@ def initialize_database():
 
     conn, cursor = _run_db_step("ensure_results_model_id", ensure_results_model_id, conn, cursor)
     conn, cursor = _run_db_step("ensure_results_class_scores", ensure_results_class_scores, conn, cursor)
+    conn, cursor = _run_db_step("ensure_results_head_config", ensure_results_head_config, conn, cursor)
     conn, cursor = _run_db_step("ensure_best_models_registry_nsize", ensure_best_models_registry_nsize, conn, cursor)
     conn, cursor = _run_db_step("ensure_registry_metrics_columns", ensure_registry_metrics_columns, conn, cursor)
     conn, cursor = _run_db_step("cleanup_incompatible_best_models_registry", cleanup_incompatible_best_models_registry, conn, cursor)
@@ -90,6 +96,12 @@ def initialize_database():
         conn, cursor = _run_db_step("ensure_people_user_email", ensure_people_user_email, conn, cursor)
     except ImportError:
         print("[bootstrap] Warning: ensure_people_user_email not found")
+
+    try:
+        from .database import ensure_learned_embedding_heads_table
+        conn, cursor = _run_db_step("ensure_learned_embedding_heads_table", ensure_learned_embedding_heads_table, conn, cursor)
+    except ImportError:
+        print("[bootstrap] Warning: ensure_learned_embedding_heads_table not found")
 
     try:
         conn.ping(reconnect=True, attempts=2, delay=1)
@@ -135,7 +147,7 @@ def is_current_user_admin():
     return bool(st.session_state.get("is_admin", False))
 
 # Production model loader (delegates to the service layer)
-def load_production_model(cursor):
+def load_production_model(_cursor):
     """Load the current production model into session_state."""
     from .services.production_model_service import get_production_model, set_production_model
     import time
@@ -143,12 +155,7 @@ def load_production_model(cursor):
 
     task = st.session_state.get("production_task", "notNormal")
     now = time.monotonic()
-    cache_task = st.session_state.get("production_model_cache_task")
-    cache_ts = float(st.session_state.get("production_model_cache_ts", 0.0) or 0.0)
-    if cache_task == task and st.session_state.get("production_model") and now - cache_ts < 60:
-        return st.session_state["production_model"]
-
-    model_info = get_production_model(cursor, task=task)
+    model_info = get_production_model(_cursor, task=task)
     if model_info:
         st.session_state["production_model"] = model_info
         st.session_state["production_model_cache_task"] = task

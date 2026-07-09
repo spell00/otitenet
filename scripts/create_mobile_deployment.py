@@ -1,6 +1,7 @@
 # /home/simon/otitenet/scripts/create_mobile_deployment.py
 
 import argparse
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -16,9 +17,12 @@ from otitenet.api.mobile_deployment import (
     CURRENT_DIR,
     create_simple_torch_classifier_manifest,
     create_knn_embedding_manifest,
+    create_sklearn_embedding_manifest,
     create_torch_prototype_manifest,
+    normalized_distance_metadata,
 )
-from otitenet.app.utils import extract_params_from_log_path, parse_classifier_config
+from otitenet.app.utils import extract_params_from_log_path, parse_classifier_config, split_combo_key_to_values
+from otitenet.data.dataset_paths import infer_output_subdir_from_split_datasets
 from otitenet.data.labels import DEFAULT_LABEL_TASK, label_scheme_for_task, labels_for_task
 DEFAULT_LABELS = None
 
@@ -39,8 +43,10 @@ def parse_input_size(text: str) -> tuple[int, int]:
 
 def _normalize_yes_no(value) -> str:
     text = str(value or "no").strip().lower()
-    if text in {"yes", "true", "1", "per_image"}:
+    if text in {"yes", "true", "1", "imagenet", "torchvision", "channel", "channel_mean_std"}:
         return "yes"
+    if text in {"per_image", "per-image", "legacy", "sklearn"}:
+        return "per_image"
     return "no"
 
 
@@ -85,12 +91,19 @@ def build_production_params(production_model: dict | None) -> dict:
         "n_positives": ("NPos", "npos", "n_positives"),
         "n_negatives": ("NNeg", "nneg", "n_negatives"),
         "n_calibration": ("N_Calibration", "n_calibration"),
-        "head": ("Head", "head_name", "learned_classifier_label"),
-        "head_config": ("Head Config", "head_config", "classification_head_config", "best_classifier_config"),
-        "head_family": ("head_family",),
-        "head_n_aug": ("head_n_aug", "n_aug", "N Aug"),
+        "head": ("Best Classification Head", "Head", "head_name", "learned_classifier_label"),
+        "head_config": ("Best Head Config", "Head Config", "head_config", "classification_head_config", "best_classifier_config"),
+        "head_family": ("head_family", "Head Family"),
+        "head_n_aug": ("Head N Aug", "Best Head N Aug", "best_head_n_aug", "head_n_aug", "n_aug", "N Aug"),
         "prototype_strategy": ("prototype_strategy", "Proto_Strat"),
         "prototype_components": ("prototype_components", "Proto_Comp"),
+        "Dataset": ("Dataset", "dataset", "path"),
+        "Artifact Dataset": ("Artifact Dataset",),
+        "Combo Dataset": ("Combo Dataset",),
+        "train_datasets": ("train_datasets", "Train Datasets"),
+        "valid_dataset": ("valid_dataset", "Valid Dataset"),
+        "test_dataset": ("test_dataset", "Test Dataset"),
+        "split_config_key": ("split_config_key",),
     }
     return {
         out_key: _production_value(production_model, *keys)
@@ -99,11 +112,30 @@ def build_production_params(production_model: dict | None) -> dict:
     }
 
 
+def resolve_deployment_distance(
+    production_model: dict | None,
+    production_params: dict,
+    explicit_dist_fct: str | None = None,
+    fallback: str = "euclidean",
+) -> tuple[str, dict]:
+    distance = explicit_dist_fct or _production_value(
+        production_model,
+        "Dist_Fct",
+        "dist_fct",
+        "dist_metric",
+        "Distance",
+        "distance",
+        default=None,
+    )
+    return normalized_distance_metadata(production_params, distance=distance, default=fallback)
+
+
 def resolve_head_config(production_model: dict | None, explicit_head_config: str | None = None) -> str | None:
     return (
         explicit_head_config
         or _production_value(
             production_model,
+            "Best Head Config",
             "best_classifier_config",
             "classification_head_config",
             "head_config",
@@ -122,7 +154,41 @@ def resolve_deployment_type(requested_type: str, production_model: dict | None, 
         return "torch_prototype"
     if head_meta.get("family") == "knn":
         return "knn_embedding"
+    if head_meta.get("family") == "baseline":
+        return "sklearn_embedding"
     return "torch_classifier"
+
+
+def resolve_dataset_path_from_production(production_model: dict | None, parsed: dict | None = None) -> str:
+    parsed = parsed or {}
+    candidates = [
+        _production_value(production_model, "Dataset", "dataset", default=None),
+        _production_value(production_model, "Artifact Dataset", default=None),
+        _production_value(production_model, "Combo Dataset", default=None),
+        parsed.get("Dataset"),
+    ]
+    for candidate in candidates:
+        text = str(candidate or "").strip().replace("\\", "/")
+        if not text or text.lower() in {"none", "nan", "null"}:
+            continue
+        return text if text.startswith("data/") else f"data/{text}"
+
+    train = _production_value(production_model, "train_datasets", "Train Datasets", default="")
+    valid = _production_value(production_model, "valid_dataset", "Valid Dataset", default="")
+    test = _production_value(production_model, "test_dataset", "Test Dataset", default="")
+    split_key = _production_value(production_model, "split_config_key", default="")
+    if split_key and not (train or valid or test):
+        train, valid, test = split_combo_key_to_values(str(split_key))
+
+    subdir = infer_output_subdir_from_split_datasets(train, valid, test)
+    nsize = _production_value(production_model, "NSize", "nsize", "new_size", default=parsed.get("new_size") or 64)
+    try:
+        size = int(float(str(nsize).replace("nsize", "")))
+    except Exception:
+        size = 64
+    if subdir:
+        return f"data/otite_ds_{size}/{subdir}"
+    return f"data/otite_ds_{size}"
 
 
 # def ensure_supported_direct_classifier(production_model: dict | None, allow_head_mismatch: bool) -> None:
@@ -241,8 +307,7 @@ def write_learned_prototypes_npz(production_model: dict, labels: list[str], head
 
     log_path = _production_value(production_model, "log_path", "Log Path", "logPath", default="")
     parsed = extract_params_from_log_path(str(log_path))
-    dataset = parsed.get("Dataset") or production_model.get("Dataset") or "otite_ds_64"
-    dataset_path = str(dataset) if str(dataset).startswith("data/") else f"data/{dataset}"
+    dataset_path = resolve_dataset_path_from_production(production_model, parsed)
 
     base_args = _argparse.Namespace(
         task=task,
@@ -256,7 +321,7 @@ def write_learned_prototypes_npz(production_model: dict, labels: list[str], head
         prototypes_to_use=str(_production_value(production_model, "Prototypes", "prototypes_to_use", default=parsed.get("Prototypes") or "class")),
         n_positives=int(_production_value(production_model, "NPos", "n_positives", default=parsed.get("NPos") or 1)),
         n_negatives=int(_production_value(production_model, "NNeg", "n_negatives", default=parsed.get("NNeg") or 1)),
-        normalize=str(_production_value(production_model, "Normalize", "normalize", default=parsed.get("Normalize") or "no")),
+        normalize=str(_production_value(production_model, "Normalize", "normalize", default=parsed.get("Normalize") or "yes")),
         dist_fct=str(_production_value(production_model, "Dist_Fct", "dist_fct", default=parsed.get("Dist_Fct") or "cosine")),
         n_neighbors=int(_production_value(production_model, "N_Neighbors", "n_neighbors", default=parsed.get("N_Neighbors") or 1)),
         prototype_strategy=str(head_meta.get("strategy") or "mean"),
@@ -313,6 +378,112 @@ def write_learned_prototypes_npz(production_model: dict, labels: list[str], head
     return target.name
 
 
+def _prototype_npz_metadata(prototypes_file: str | Path) -> dict:
+    import numpy as np
+
+    path = CURRENT_DIR / Path(prototypes_file).name
+    payload = np.load(path, allow_pickle=True)
+    labels = [str(label.item() if hasattr(label, "item") else label) for label in payload["labels"]]
+    metadata = {"labels": labels}
+    if "components" in payload.files:
+        try:
+            metadata["components"] = int(np.asarray(payload["components"]).item())
+        except Exception:
+            pass
+    if "strategy" in payload.files:
+        try:
+            metadata["strategy"] = str(np.asarray(payload["strategy"]).item())
+        except Exception:
+            pass
+    return metadata
+
+
+def _checkpoint_num_classes(model_file: str | Path) -> int | None:
+    try:
+        import torch
+
+        path = CURRENT_DIR / Path(model_file).name
+        state_dict = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        return None
+
+    if not isinstance(state_dict, dict):
+        return None
+    for key in ("linear.weight", "classifier.weight", "fc.weight", "subcenters"):
+        value = state_dict.get(key)
+        if hasattr(value, "shape") and len(value.shape) >= 1:
+            return int(value.shape[0])
+    return None
+
+
+def _task_for_labels(labels: list[str]) -> tuple[str | None, str | None]:
+    label_tuple = tuple(str(label) for label in labels)
+    for task in ("otite_four_class", "otitis_four_class", "notNormal"):
+        if tuple(labels_for_task(task)) == label_tuple:
+            return task, label_scheme_for_task(task)
+    return None, None
+
+
+def align_prototype_deployment_metadata(
+    *,
+    labels: list[str],
+    model_file: str,
+    prototypes_file: str,
+    head_config: str,
+    production_params: dict,
+    explicit_labels: bool,
+    explicit_head_config: bool,
+) -> tuple[list[str], str, dict]:
+    """Make prototype deployment manifest metadata match its packaged artifacts."""
+    proto_meta = _prototype_npz_metadata(prototypes_file)
+    artifact_labels = proto_meta.get("labels") or []
+
+    if artifact_labels and artifact_labels != [str(label) for label in labels]:
+        if explicit_labels:
+            raise ValueError(
+                "Explicit --labels do not match the packaged prototype labels: "
+                f"labels={labels}, prototype_labels={artifact_labels}"
+            )
+        print(
+            "[mobile-deploy] Aligning manifest labels with prototype artifact: "
+            f"{artifact_labels}"
+        )
+        labels = list(artifact_labels)
+
+    checkpoint_classes = _checkpoint_num_classes(model_file)
+    if checkpoint_classes is not None and checkpoint_classes != len(labels):
+        raise ValueError(
+            "Model checkpoint class count does not match deployment labels: "
+            f"checkpoint_classes={checkpoint_classes}, labels={labels}"
+        )
+
+    head_meta = parse_classifier_config(head_config)
+    artifact_strategy = proto_meta.get("strategy")
+    artifact_components = proto_meta.get("components")
+    if head_meta.get("family") == "prototype" and artifact_components:
+        strategy = str(artifact_strategy or head_meta.get("strategy") or "mean")
+        expected_head = f"protot_{strategy}_{int(artifact_components)}"
+        if expected_head != str(head_config):
+            if explicit_head_config:
+                raise ValueError(
+                    "Explicit --head-config does not match the packaged prototype metadata: "
+                    f"head_config={head_config}, artifact={expected_head}"
+                )
+            print(f"[mobile-deploy] Aligning manifest head_config with prototype artifact: {expected_head}")
+            head_config = expected_head
+            production_params["head"] = expected_head
+            production_params["head_config"] = expected_head
+            production_params["prototype_strategy"] = strategy
+            production_params["prototype_components"] = int(artifact_components)
+
+    task, scheme = _task_for_labels(labels)
+    if task and scheme:
+        production_params["label_task"] = task
+        production_params["label_scheme"] = scheme
+
+    return labels, str(head_config), production_params
+
+
 def _row_get(row, key, index=None):
     """
     Works with tuple cursors and dict cursors.
@@ -329,30 +500,60 @@ def _row_get(row, key, index=None):
     return None
 
 
+def _load_production_model_json(label_scheme: str) -> dict | None:
+    candidate_paths = [ROOT / f"data/production_model_{label_scheme}.json"]
+    if label_scheme == "four_class":
+        candidate_paths.append(ROOT / "data/production_model.json")
+
+    for path in candidate_paths:
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r") as f:
+                loaded = json.load(f)
+        except Exception as e:
+            print(f"[mobile-deploy] Could not load production model JSON {path}: {e}")
+            continue
+        if isinstance(loaded, dict):
+            return loaded
+    return None
+
+
 def get_current_production_model_from_db(task: str = DEFAULT_LABEL_TASK):
     """
     Read the model selected by the web admin.
 
     Expected logic:
     - Admin clicks "Set as Production Model" in the web/sidebar/admin UI.
-    - DB stores current production model.
-    - This script reads that active production model.
+    - The online app saves the active production model to JSON/session first,
+      then best-effort mirrors it to the DB.
+    - This script must read that same JSON-first source, otherwise stale DB rows
+      can leak into the offline deployment.
 
-    This function tries the clean database helper first. If unavailable,
-    it falls back to querying common production_model table shapes.
+    This function tries the app JSON files first. If unavailable, it falls back
+    to querying common production_model table shapes.
     """
     from otitenet.app.database import create_db, ensure_production_model_table
+
+    label_scheme = label_scheme_for_task(task)
+    model = _load_production_model_json(label_scheme)
+    if model:
+        model.setdefault("label_scheme", label_scheme)
+        model.setdefault("label_task", task)
+        print("[mobile-deploy] Loaded production model from app JSON source.")
+        return model
 
     conn, cursor = create_db()
     ensure_production_model_table(conn, cursor)
 
-    # Preferred path if your database.py already has get_production_model()
+    # DB fallback only. The JSON/session service above is the canonical app path.
     try:
         from otitenet.app.database import get_production_model
 
-        model = get_production_model(cursor, label_scheme=label_scheme_for_task(task))
+        model = get_production_model(cursor, label_scheme=label_scheme)
 
         if model:
+            print("[mobile-deploy] Loaded production model from DB fallback.")
             return model
 
     except Exception as e:
@@ -508,6 +709,97 @@ def resolve_model_file_from_production_model(production_model: dict) -> Path:
     )
 
 
+def resolve_train_encodings_from_production_model(production_model: dict) -> Path:
+    for key in ("train_encodings_file", "train_embeddings_file"):
+        value = production_model.get(key)
+        if value:
+            path = Path(value)
+            if path.exists() and path.is_file():
+                return path
+
+    log_path = (
+        production_model.get("log_path")
+        or production_model.get("Log Path")
+        or production_model.get("logPath")
+    )
+    if log_path:
+        path = Path(log_path)
+        if path.is_dir():
+            candidate = path / "train_encodings.npz"
+            if candidate.exists() and candidate.is_file():
+                return candidate
+
+    raise FileNotFoundError(
+        "Could not resolve train_encodings.npz from the production model. "
+        "Baseline embedding-head deployment requires the training encodings used by the web app."
+    )
+
+
+def _baseline_classifier_kind(head_config: str | None) -> str:
+    head_meta = parse_classifier_config(head_config)
+    name = str(head_meta.get("name") or head_config or "").strip().lower()
+    if name.startswith("baseline_"):
+        name = name[len("baseline_"):]
+    return name or "linear_svc"
+
+
+def write_sklearn_baseline_head(source_encodings: str | Path, head_config: str | None) -> str:
+    import joblib
+    import numpy as np
+    from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
+    from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+    from sklearn.linear_model import LogisticRegression, RidgeClassifier
+    from sklearn.naive_bayes import GaussianNB
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.svm import LinearSVC, SVC
+    from sklearn.tree import DecisionTreeClassifier
+
+    payload = np.load(source_encodings, allow_pickle=True)
+    X = np.asarray(payload["embeddings"], dtype=np.float32)
+    y = np.asarray(payload["cats"])
+    labels = np.asarray(payload["labels"]).astype(str) if "labels" in payload.files else np.asarray([])
+
+    kind = _baseline_classifier_kind(head_config)
+    if kind in {"logreg", "logisticregression", "logistic_regression"}:
+        clf = LogisticRegression(max_iter=1000, C=1.0, random_state=1)
+    elif kind in {"ridge", "ridge_classifier"}:
+        clf = RidgeClassifier(alpha=1.0)
+    elif kind in {"naive_bayes", "nb"}:
+        clf = GaussianNB()
+    elif kind in {"linear_svc", "linearsvc"}:
+        clf = LinearSVC(max_iter=5000, random_state=1)
+    elif kind in {"rbf_svc", "svc", "svm"}:
+        clf = SVC(kernel="rbf", C=1.0, gamma="scale", probability=True, random_state=1)
+    elif kind == "random_forest":
+        clf = RandomForestClassifier(n_estimators=200, max_depth=None, random_state=1, n_jobs=-1)
+    elif kind == "gradient_boosting":
+        clf = GradientBoostingClassifier(random_state=1)
+    elif kind == "decision_tree":
+        clf = DecisionTreeClassifier(random_state=1)
+    elif kind == "lda":
+        clf = LinearDiscriminantAnalysis()
+    elif kind == "qda":
+        clf = QuadraticDiscriminantAnalysis()
+    elif kind == "mlp_head":
+        clf = MLPClassifier(hidden_layer_sizes=(128,), max_iter=500, random_state=1)
+    else:
+        raise ValueError(f"Unsupported baseline head for offline deployment: {head_config}")
+
+    clf.fit(X, y)
+    target = CURRENT_DIR / "classifier_head.joblib"
+    CURRENT_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(
+        {
+            "classifier": clf,
+            "labels": labels,
+            "head_config": str(head_config or ""),
+            "kind": kind,
+        },
+        target,
+    )
+    return target.name
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Create the current mobile deployment manifest for OtiteNet."
@@ -515,7 +807,7 @@ def main():
 
     parser.add_argument(
         "--deployment-type",
-        choices=["auto", "torch_classifier", "knn_embedding", "torch_prototype"],
+        choices=["auto", "torch_classifier", "knn_embedding", "sklearn_embedding", "torch_prototype"],
         default="auto",
     )
 
@@ -530,9 +822,8 @@ def main():
 
     parser.add_argument(
         "--model-id",
-        type=int,
         default=None,
-        help="Optional model id. Defaults to production model id.",
+        help="Optional model id. Defaults to production model id. Can be numeric or a production string id.",
     )
 
     parser.add_argument(
@@ -563,7 +854,7 @@ def main():
         help="Allow exporting a direct classifier even when the web production model uses a prototype/KNN head.",
     )
     parser.add_argument("--head-config", default=None)
-    parser.add_argument("--normalize", choices=["yes", "no"], default=None)
+    parser.add_argument("--normalize", choices=["yes", "no", "per_image", "imagenet"], default=None)
     parser.add_argument("--dist-fct", default=None)
 
     # KNN embedding deployment
@@ -571,6 +862,15 @@ def main():
     parser.add_argument("--reference-embeddings-file", default=None)
     parser.add_argument("--reference-labels-file", default=None)
     parser.add_argument("--prototypes-file", default=None)
+    parser.add_argument(
+        "--regenerate-learned-prototypes",
+        action="store_true",
+        help=(
+            "Regenerate prototype vectors from train encodings for learned prototype heads. "
+            "By default the deployment packages prototypes.pkl so desktop scores match "
+            "the online New Analysis path."
+        ),
+    )
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--distance", default="cosine")
 
@@ -587,12 +887,16 @@ def main():
         print(production_model)
 
     input_size = infer_input_size_from_production(production_model, input_size)
-    normalize = _normalize_yes_no(_production_value(production_model, "Normalize", "normalize", default="no"))
+    normalize = _normalize_yes_no(_production_value(production_model, "Normalize", "normalize", default="yes"))
     if args.normalize is not None:
         normalize = args.normalize
     production_params = build_production_params(production_model)
     production_params["label_task"] = args.task
     production_params["label_scheme"] = label_scheme_for_task(args.task)
+    production_params["Dataset"] = resolve_dataset_path_from_production(
+        production_model,
+        extract_params_from_log_path(str(_production_value(production_model, "log_path", "Log Path", "logPath", default=""))),
+    )
     head_config = resolve_head_config(production_model, args.head_config)
     head_meta = parse_classifier_config(head_config)
     deployment_type = resolve_deployment_type(args.deployment_type, production_model, head_config)
@@ -607,8 +911,12 @@ def main():
             production_params["prototype_components"] = head_meta.get("components")
         elif head_meta.get("family") == "knn":
             production_params["n_neighbors"] = head_meta.get("k")
-    if args.dist_fct:
-        production_params["dist_fct"] = args.dist_fct
+    deployment_distance, production_params = resolve_deployment_distance(
+        production_model,
+        production_params,
+        explicit_dist_fct=args.dist_fct,
+        fallback=args.distance,
+    )
 
     model_id = args.model_id
     if model_id is None:
@@ -644,7 +952,7 @@ def main():
         copied_model_name = copy_to_current(source_model)
 
         manifest = create_simple_torch_classifier_manifest(
-            model_id=int(model_id),
+            model_id=str(model_id),
             model_name=str(model_name),
             model_file=copied_model_name,
             labels=labels,
@@ -676,15 +984,42 @@ def main():
         copied_reference_labels_name = copy_to_current(args.reference_labels_file)
 
         manifest = create_knn_embedding_manifest(
-            model_id=int(model_id),
+            model_id=str(model_id),
             model_name=str(model_name),
             embedding_model_file=copied_embedding_model_name,
             reference_embeddings_file=copied_reference_embeddings_name,
             reference_labels_file=copied_reference_labels_name,
             labels=labels,
             k=int(head_meta.get("k") or args.k),
-            distance=args.distance,
+            distance=deployment_distance,
             input_size=input_size,
+            normalize=normalize,
+            production_params=production_params,
+        )
+
+    elif deployment_type == "sklearn_embedding":
+        if args.embedding_model_file is None:
+            if production_model is None:
+                production_model = get_current_production_model_from_db(task=args.task)
+            source_embedding = resolve_model_file_from_production_model(production_model)
+        else:
+            source_embedding = Path(args.embedding_model_file)
+
+        if production_model is None:
+            production_model = get_current_production_model_from_db(task=args.task)
+        source_encodings = resolve_train_encodings_from_production_model(production_model)
+        copied_embedding_model_name = copy_to_current(source_embedding)
+        copied_classifier_name = write_sklearn_baseline_head(source_encodings, head_config)
+
+        manifest = create_sklearn_embedding_manifest(
+            model_id=str(model_id),
+            model_name=str(model_name),
+            embedding_model_file=copied_embedding_model_name,
+            classifier_file=copied_classifier_name,
+            labels=labels,
+            input_size=input_size,
+            normalize=normalize,
+            production_params=production_params,
         )
 
     elif deployment_type == "torch_prototype":
@@ -696,7 +1031,7 @@ def main():
         head_config = head_config or "protot_mean_1"
         if args.prototypes_file:
             copied_prototypes_name = write_prototypes_npz(args.prototypes_file, production_model or {}, labels)
-        else:
+        elif args.regenerate_learned_prototypes:
             try:
                 copied_prototypes_name = write_learned_prototypes_npz(production_model or {}, labels, str(head_config), args.task)
             except Exception as e:
@@ -705,16 +1040,31 @@ def main():
                     production_model = get_current_production_model_from_db(task=args.task)
                 source_prototypes = resolve_prototype_file_from_production_model(production_model)
                 copied_prototypes_name = write_prototypes_npz(source_prototypes, production_model or {}, labels)
+        else:
+            if production_model is None:
+                production_model = get_current_production_model_from_db(task=args.task)
+            source_prototypes = resolve_prototype_file_from_production_model(production_model)
+            copied_prototypes_name = write_prototypes_npz(source_prototypes, production_model or {}, labels)
+
+        labels, head_config, production_params = align_prototype_deployment_metadata(
+            labels=labels,
+            model_file=copied_model_name,
+            prototypes_file=copied_prototypes_name,
+            head_config=str(head_config),
+            production_params=production_params,
+            explicit_labels=args.labels is not None,
+            explicit_head_config=args.head_config is not None,
+        )
 
         manifest = create_torch_prototype_manifest(
-            model_id=int(model_id),
+            model_id=str(model_id),
             model_name=str(model_name),
             model_file=copied_model_name,
             prototypes_file=copied_prototypes_name,
             labels=labels,
             input_size=input_size,
             normalize=normalize,
-            distance=str(args.dist_fct or _production_value(production_model, "Dist_Fct", "dist_fct", default=args.distance)),
+            distance=deployment_distance,
             head_config=str(head_config),
             production_params=production_params,
         )

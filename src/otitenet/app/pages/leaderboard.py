@@ -30,6 +30,7 @@ from otitenet.app.utils import (
     _make_model_selection_key,
     _unique_preserve_order,
     apply_selection_keys_to_models_df,
+    assign_stable_model_ids,
     attach_task_column,
     best_cached_head_metrics_for_model_row,
     ensure_int,
@@ -331,7 +332,7 @@ def _query_best_models(cursor) -> Tuple[List[tuple], bool]:
 def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.DataFrame:
     if use_db_rank:
         columns = [
-            "Model ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos",
+            "Registry ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos",
             "NNeg", "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration",
             "Accuracy", "MCC",
             "Train MCC", "Valid MCC", "Test MCC", "All MCC",
@@ -345,7 +346,7 @@ def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.Data
         ]
     else:
         columns = [
-            "Model ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos",
+            "Registry ID", "Model Name", "NSize", "FGSM", "Prototypes", "NPos",
             "NNeg", "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration",
             "Accuracy", "MCC", "Normalize", "N_Neighbors", "Log Path",
             "Proto_Strat", "Proto_Comp",
@@ -357,6 +358,8 @@ def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.Data
         return pd.DataFrame(columns=columns)
 
     df = pd.DataFrame(rows, columns=columns)
+    if "exp ID" not in df.columns:
+        df["exp ID"] = ""
 
     if df.empty:
         return df
@@ -406,7 +409,8 @@ def _models_dataframe_from_log_tree() -> pd.DataFrame:
 
     df = pd.DataFrame(
         {
-            "Model ID": "",
+            "Registry ID": pd.NA,
+            "exp ID": "",
             "Model Name": artifacts.get("model_name", ""),
             "NSize": artifacts.get("nsize", ""),
             "FGSM": artifacts.get("fgsm", ""),
@@ -502,7 +506,7 @@ def _progress_manifest_models_dataframe(task: Optional[str] = None) -> pd.DataFr
                     split_key = split_config_key(row.get("train_datasets"), row.get("valid_dataset"), row.get("test_dataset"))
                     rows.append(
                         {
-                            "Model ID": str(row.get("exp_id") or row.get("job_id") or uuid or "").strip(),
+                            "exp ID": str(row.get("exp_id") or row.get("job_id") or uuid or "").strip(),
                             "Model Name": str(row.get("model") or "").strip(),
                             "NSize": str(row.get("new_size") or "").strip(),
                             "FGSM": str(row.get("fgsm") or "").strip(),
@@ -616,6 +620,9 @@ def _active_calibration_split(page_key: str | None = None) -> str:
 
 def _attach_metrics(df: pd.DataFrame, calibration_split: str = "valid") -> pd.DataFrame:
     df = df.copy()
+    if "#" in df.columns:
+        if "Registry Rank" not in df.columns:
+            df["Registry Rank"] = df["#"].copy()
 
     metric_cols = [
         "Train MCC", "Valid MCC", "Test MCC",
@@ -746,7 +753,17 @@ def _attach_metrics(df: pd.DataFrame, calibration_split: str = "valid") -> pd.Da
     ).reset_index(drop=True)
 
     df = df.drop(columns=["_valid_sort", "_mcc_sort"], errors="ignore")
-    df["#"] = range(1, len(df) + 1)
+    if "Registry Rank" in df.columns and pd.to_numeric(df["Registry Rank"], errors="coerce").notna().any():
+        df["#"] = df["Registry Rank"]
+        missing_rank = pd.to_numeric(df["#"], errors="coerce").isna()
+        if missing_rank.any():
+            used_ranks = pd.to_numeric(df.loc[~missing_rank, "#"], errors="coerce").dropna()
+            next_rank = int(used_ranks.max()) + 1 if not used_ranks.empty else 1
+            fill_values = range(next_rank, next_rank + int(missing_rank.sum()))
+            df.loc[missing_rank, "#"] = list(fill_values)
+    else:
+        df["#"] = range(1, len(df) + 1)
+    df = assign_stable_model_ids(df)
 
     return df
 
@@ -768,7 +785,7 @@ def _order_model_columns(df: pd.DataFrame) -> pd.DataFrame:
         ordered_cols.append("#")
 
     preferred_non_metric = [
-        "Model ID", "Task", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
+        "Model ID", "Registry ID", "exp ID", "Task", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
         "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration", "Normalize",
         "N_Neighbors", "Proto_Strat", "Proto_Comp",
         "train_datasets", "valid_dataset", "test_dataset",
@@ -787,21 +804,47 @@ def _split_combo_key_from_row(row) -> str:
     return split_combo_key_from_row(row)
 
 
-def _filter_models_df_by_sidebar_split(models_df: pd.DataFrame) -> pd.DataFrame:
+def _canonical_dataset_path(dataset_path: str) -> str:
+    return str(dataset_path or "").strip().replace("\\", "/")
+
+
+def _filter_models_df_by_sidebar_split(models_df: pd.DataFrame, *, include_split: bool = True) -> pd.DataFrame:
     if models_df is None or models_df.empty:
         return models_df
 
-    selected_split_key = st.session_state.get("sidebar_split_combo_key")
-    if not selected_split_key:
-        return models_df
-
     df = models_df.copy()
-    df["_split_combo_key"] = df.apply(_split_combo_key_from_row, axis=1)
-    filtered_df = df[df["_split_combo_key"] == str(selected_split_key)].drop(columns=["_split_combo_key"])
-    return filtered_df.reset_index(drop=True)
+    
+    # Filter by dataset path if selected in sidebar
+    selected_dataset_segment = st.session_state.get("sidebar_dataset_last_key")
+    if selected_dataset_segment and "Dataset" in df.columns:
+        selected_dataset_key = _canonical_dataset_path(selected_dataset_segment)
+        df = df[df["Dataset"].astype(str).map(_canonical_dataset_path) == selected_dataset_key]
+    
+    # Filter by data source if selected in sidebar
+    use_log_tree = "Log Tree" in st.session_state.get("sidebar_data_source_toggle", "")
+    if use_log_tree:
+        # Include all sources (database, log tree, manifest)
+        pass
+    else:
+        # Only include database and manifest (done jobs only)
+        df = df[df["Source"].astype(str) != "logs/best_models"]
+    
+    # Filter by split combo if selected in sidebar. Quick Model Selection can
+    # disable this while rebuilding the list of available split choices.
+    selected_split_key = st.session_state.get("sidebar_split_combo_key") if include_split else None
+    if selected_split_key:
+        df["_split_combo_key"] = df.apply(_split_combo_key_from_row, axis=1)
+        df = df[df["_split_combo_key"] == str(selected_split_key)].drop(columns=["_split_combo_key"])
+    
+    return df.reset_index(drop=True)
 
 
-def load_best_models_table(cursor, task: Optional[str] = None, calibration_split: str = "valid") -> pd.DataFrame:
+def load_best_models_table(
+    cursor,
+    task: Optional[str] = None,
+    calibration_split: str = "valid",
+    include_sidebar_split: bool = True,
+) -> pd.DataFrame:
     rows, use_db_rank = _query_best_models(cursor)
     df = _models_dataframe_from_rows(rows, use_db_rank)
     df = _merge_db_and_log_tree_models(df)
@@ -813,7 +856,7 @@ def load_best_models_table(cursor, task: Optional[str] = None, calibration_split
     if df.empty:
         return df
 
-    df = _filter_models_df_by_sidebar_split(df)
+    df = _filter_models_df_by_sidebar_split(df, include_split=include_sidebar_split)
     if df.empty:
         return df
 
@@ -1506,7 +1549,7 @@ def _build_validation_threshold_frame(model_rows: pd.DataFrame, selected_idx: in
         votes = [
             str(row.get(col) or "").strip()
             for col in prediction_cols
-            if str(row.get(col) or "").strip()
+            if str(row.get(col) or "").strip() and str(row.get(col) or "").strip().lower() != "error"
         ]
         if not votes:
             ensemble_predictions.append("Unknown")
@@ -1918,6 +1961,36 @@ def apply_active_top_models_selection(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _include_selected_model_row(display_df: pd.DataFrame, all_models_df: pd.DataFrame) -> pd.DataFrame:
+    selected_key = st.session_state.get("selected_model_selection_key")
+    if not selected_key or all_models_df is None or all_models_df.empty:
+        return display_df
+
+    display_df = display_df.copy() if display_df is not None else pd.DataFrame()
+    display_keys = set()
+    if not display_df.empty:
+        display_keys = {
+            _make_model_selection_key(row.to_dict())
+            for _, row in display_df.iterrows()
+        }
+    if selected_key in display_keys:
+        return display_df
+
+    matches = [
+        row
+        for _, row in all_models_df.iterrows()
+        if _make_model_selection_key(row.to_dict()) == selected_key
+    ]
+    if not matches:
+        return display_df
+
+    selected_df = pd.DataFrame([matches[0].to_dict()])
+    if display_df.empty:
+        return selected_df.reset_index(drop=True)
+
+    return pd.concat([display_df, selected_df], ignore_index=True, sort=False)
+
+
 def _render_calibration_vs_performance(models_df: pd.DataFrame, split: str = "valid") -> None:
     st.markdown("---")
     st.subheader("📈 Calibration vs Performance")
@@ -2107,7 +2180,7 @@ def _set_selected_model(row_dict: Dict[str, Any], selected_key: str) -> None:
     row_dict = dict(row_dict)
     row_dict.update(extract_params_from_log_path(row_dict.get("Best Model Dir") or row_dict.get("Log Path")))
 
-    row_dict["model_id"] = row_dict.get("Model ID")
+    row_dict["model_id"] = row_dict.get("Registry ID")
 
     if "N_Neighbors" in row_dict:
         row_dict["n_neighbors"] = row_dict["N_Neighbors"]
@@ -2490,6 +2563,7 @@ def render(
                 _update_model_number_map(models_df)
 
                 display_models_df = apply_active_top_models_selection(models_df).reset_index(drop=True)
+                display_models_df = _include_selected_model_row(display_models_df, models_df).reset_index(drop=True)
                 if display_models_df.empty:
                     st.info("No models match the selected Top Models filters.")
                     _render_top_models_filter_controls(models_df, page_key)

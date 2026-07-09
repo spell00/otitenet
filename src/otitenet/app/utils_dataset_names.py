@@ -6,7 +6,7 @@ DATASET_SHORT_NAME_MAP = {
     "Banque_Viscaino_Chili_2020": "Chili",
     "Banque_Comert_Turquie_2020_jpg": "Turquie",
     "Banque_Calaman_USA_2020_trie_CM": "USA",
-    "GMFUNL_jan2023": "Quebec",
+    "GMFUNL_jan2023": "GMFUNL",
 }
 
 def get_short_dataset_name(name: str) -> str:

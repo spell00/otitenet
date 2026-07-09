@@ -28,6 +28,16 @@ def _safe_positive_int(value, default: int = 1) -> int:
     return parsed if parsed > 0 else int(default)
 
 
+def _sanitize_path_param(value: str, default: str) -> str:
+    """Sanitize a path parameter, returning default if value is NaN/empty/invalid."""
+    if value is None:
+        return default
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "nan", "null"}:
+        return default
+    return text
+
+
 @st.cache_resource
 def resolve_model_paths(base_dir: str, normalize_val: str, dist_fct_val: str, requested_k: int):
     """Find model/prototype paths, falling back across dist_fct and knn folders if needed.
@@ -41,6 +51,10 @@ def resolve_model_paths(base_dir: str, normalize_val: str, dist_fct_val: str, re
     Returns:
         Tuple of (model_path, prototype_path, resolved_k)
     """
+    # Sanitize normalize and dist_fct values to prevent NaN/empty in paths
+    normalize_val = _sanitize_path_param(normalize_val, "no")
+    dist_fct_val = _sanitize_path_param(dist_fct_val, "euclidean")
+    
     norm_base_dir = os.path.join(base_dir, f'norm{normalize_val}')
     
     # Try exact dist_fct first

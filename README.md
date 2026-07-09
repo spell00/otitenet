@@ -114,7 +114,12 @@ The online app stores users, model selections, and analysis results in MySQL.
 
 ```sql
 CREATE DATABASE results_db;
-GRANT ALL PRIVILEGES ON results_db.* TO 'y_user'@'%' IDENTIFIED BY 'password';
+CREATE USER IF NOT EXISTS 'y_user'@'localhost' IDENTIFIED BY 'password';
+CREATE USER IF NOT EXISTS 'y_user'@'%' IDENTIFIED BY 'password';
+ALTER USER 'y_user'@'localhost' IDENTIFIED BY 'password';
+ALTER USER 'y_user'@'%' IDENTIFIED BY 'password';
+GRANT ALL PRIVILEGES ON results_db.* TO 'y_user'@'localhost';
+GRANT ALL PRIVILEGES ON results_db.* TO 'y_user'@'%';
 FLUSH PRIVILEGES;
 ```
 
@@ -211,6 +216,9 @@ Compact build, recommended:
 PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:prepare:compact
 PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:sidecar:compact
 PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:tauri:compact
+#cd /home/simon/otitenet/desktop
+#PYTHON=/home/simon/otitenet/.conda/bin/python npm run sidecar:build:compact
+#PYTHON=/home/simon/otitenet/.conda/bin/python npm run tauri:build:compact
 ```
 
 Exact/full PyTorch build:
@@ -224,8 +232,8 @@ PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:tauri:exact
 Installer outputs:
 
 ```text
-desktop/src-tauri/target/release/bundle/deb/Otitenet_0.3.0_amd64_compact.deb
-desktop/src-tauri/target/release/bundle/deb/Otitenet_0.3.0_amd64_exact.deb
+desktop/src-tauri/target/release/bundle/deb/Otitenet_0.7.1_amd64_compact.deb
+desktop/src-tauri/target/release/bundle/deb/Otitenet_0.7.1_amd64_exact.deb
 ```
 
 Detailed desktop packaging notes are in [docs/OFFLINE_DESKTOP.md](docs/OFFLINE_DESKTOP.md).

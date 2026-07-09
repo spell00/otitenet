@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import importlib
+import re
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image
 
-from otitenet.app.image_processing import preprocess_image_array as app_preprocess_image_array
+from otitenet.app.image_processing import (
+    image_to_chw_array,
+    preprocess_image_array as app_preprocess_image_array,
+)
 from otitenet.offline.deployment import OfflineDeployment
 
 
@@ -49,8 +53,41 @@ class PrototypeHeadModel:
         return self.embedding_model.predict_embedding(array)
 
 
+class SklearnHeadModel:
+    def __init__(self, embedding_model: Any, classifier: Any, head_labels: list[str]):
+        self.embedding_model = embedding_model
+        self.classifier = classifier
+        self.head_labels = [str(label) for label in head_labels]
+
+    def predict_embedding(self, array: np.ndarray) -> np.ndarray:
+        return self.embedding_model.predict_embedding(array)
+
+
 def load_model(deployment: OfflineDeployment, device: str = "cpu"):
     path = deployment.model_file
+    if deployment.model_type in {"onnx_embedding_baseline", "onnx_baseline"}:
+        classifier, head_labels = _load_classifier_head(deployment)
+        return SklearnHeadModel(OnnxEmbeddingModel(path), classifier, head_labels)
+
+    if deployment.model_type in {"torch_embedding_baseline", "torch_baseline"}:
+        try:
+            import torch
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "This baseline-head deployment requires PyTorch unless it is exported "
+                "to an ONNX embedding deployment."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                "PyTorch could not be imported from this exact desktop runtime. "
+                "Rebuild and reinstall the exact Tauri package."
+            ) from exc
+
+        torch_runtime = importlib.import_module("otitenet.offline.torch_runtime")
+        torch_model = torch_runtime.load_state_dict_model(path, deployment, device)
+        classifier, head_labels = _load_classifier_head(deployment)
+        return SklearnHeadModel(TorchEmbeddingModel(torch_model, device), classifier, head_labels)
+
     if deployment.model_type in {"onnx_prototype", "onnx_embedding_prototype"}:
         return PrototypeHeadModel(OnnxEmbeddingModel(path), _load_prototypes(deployment))
 
@@ -61,6 +98,13 @@ def load_model(deployment: OfflineDeployment, device: str = "cpu"):
             raise RuntimeError(
                 "This exact production deployment requires PyTorch because the web app "
                 "uses a PyTorch embedding model plus a prototype/KNN head."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                "PyTorch could not be imported from this exact desktop runtime. "
+                "The bundled torch shared libraries are likely stale or mismatched. "
+                "Rebuild and reinstall the exact Tauri package so libtorch_python.so, "
+                "libtorch_cpu.so, and the torch Python package come from the same build."
             ) from exc
 
         torch_runtime = importlib.import_module("otitenet.offline.torch_runtime")
@@ -80,6 +124,12 @@ def load_model(deployment: OfflineDeployment, device: str = "cpu"):
                 "desktop app so the packaged runtime can use ONNX Runtime."
             ) from exc
         raise
+    except Exception as exc:
+        raise RuntimeError(
+            "PyTorch could not be imported from this exact desktop runtime. "
+            "The bundled torch shared libraries are likely stale or mismatched. "
+            "Rebuild and reinstall the exact Tauri package."
+        ) from exc
 
     try:
         model = torch.jit.load(str(path), map_location=device)
@@ -131,15 +181,49 @@ def _load_prototypes(deployment: OfflineDeployment) -> dict[str, np.ndarray]:
     return prototypes
 
 
+def _load_classifier_head(deployment: OfflineDeployment) -> tuple[Any, list[str]]:
+    files = deployment.manifest.get("files", {})
+    classifier_name = files.get("classifier_head") or files.get("head") or files.get("classifier")
+    if not classifier_name:
+        raise ValueError("Baseline deployment manifest does not define a classifier head file.")
+
+    classifier_path = deployment.root / Path(classifier_name).name
+    if not classifier_path.exists():
+        raise FileNotFoundError(f"Classifier head file not found: {classifier_path}")
+
+    try:
+        import joblib
+
+        payload = joblib.load(classifier_path)
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Loading a baseline classifier head requires joblib.") from exc
+
+    if isinstance(payload, dict) and "classifier" in payload:
+        classifier = payload["classifier"]
+        labels = payload.get("labels")
+    else:
+        classifier = payload
+        labels = deployment.labels
+
+    if labels is None or len(labels) == 0:
+        labels = deployment.labels
+    return classifier, [str(label) for label in labels]
+
+
 def preprocess_image_array(image: Image.Image, deployment: OfflineDeployment) -> np.ndarray:
     preprocessing = deployment.manifest.get("preprocessing", {})
     normalization = str(preprocessing.get("normalization", "")).lower()
     normalize = preprocessing.get("normalize")
-    if normalization == "per_image" or str(normalize).lower() in {"yes", "true", "1", "per_image"}:
+    resize_mode = str(preprocessing.get("resize_mode", "app_64_then_size")).lower()
+    base_match = re.match(r"app_(\d+)_then_size", resize_mode)
+    base_resize_size = int(preprocessing.get("base_resize_size") or (base_match.group(1) if base_match else 64))
+    if normalization == "per_image" or (
+        not normalization and str(normalize).lower() in {"yes", "true", "1", "per_image"}
+    ):
         height, width = deployment.input_size
         if height != width:
             raise ValueError(f"App-compatible preprocessing expects square input, got {height}x{width}.")
-        return app_preprocess_image_array(image, height, normalize="yes")
+        return app_preprocess_image_array(image, height, normalize="per_image", base_size=base_resize_size)
 
     mean = preprocessing.get("normalize_mean")
     std = preprocessing.get("normalize_std")
@@ -147,14 +231,18 @@ def preprocess_image_array(image: Image.Image, deployment: OfflineDeployment) ->
         height, width = deployment.input_size
         if height != width:
             raise ValueError(f"App-compatible preprocessing expects square input, got {height}x{width}.")
-        return app_preprocess_image_array(image, height, normalize="no")
+        return app_preprocess_image_array(image, height, normalize="no", base_size=base_resize_size)
 
-    image = image.convert("RGB")
     height, width = deployment.input_size
-    image = image.resize((width, height))
+    if resize_mode.startswith("app_") and resize_mode.endswith("_then_size"):
+        if height != width:
+            raise ValueError(f"App-compatible preprocessing expects square input, got {height}x{width}.")
+        array = image_to_chw_array(image, height, normalize="no", base_size=base_resize_size)
+    else:
+        image = image.convert("RGB").resize((width, height))
+        array = np.asarray(image, dtype=np.float32) / 255.0
+        array = array.transpose(2, 0, 1)
 
-    array = np.asarray(image, dtype=np.float32) / 255.0
-    array = array.transpose(2, 0, 1)
 
     if mean and std:
         mean_array = np.asarray(mean, dtype=np.float32).reshape(3, 1, 1)
@@ -183,59 +271,95 @@ def _prototype_probabilities(
     labels: list[str],
     dist_fct_name: str,
 ) -> np.ndarray:
-    try:
-        import torch
-    except Exception:
-        torch = None
+    emb = np.asarray(embedding, dtype=np.float32)
+    if emb.ndim == 1:
+        emb = emb[None, :]
+    distances = []
+    for label in labels:
+        proto = prototypes.get(str(label))
+        if proto is None:
+            distances.append(np.inf)
+            continue
+        proto = np.asarray(proto, dtype=np.float32)
+        if proto.ndim == 1:
+            proto = proto[None, :]
+        if str(dist_fct_name).lower() == "cosine":
+            emb_norm = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
+            proto_norm = proto / (np.linalg.norm(proto, axis=1, keepdims=True) + 1e-12)
+            distances.append(float(np.min(1.0 - np.matmul(emb_norm, proto_norm.T))))
+        else:
+            diff = emb[:, None, :] - proto[None, :, :]
+            distances.append(float(np.min(np.sqrt(np.sum(diff * diff, axis=2)))))
+    distances_array = np.asarray(distances, dtype=np.float64)
 
-    if torch is not None:
-        emb = torch.as_tensor(embedding, dtype=torch.float32)
-        if emb.ndim == 1:
-            emb = emb.unsqueeze(0)
-        distances = []
-        for label in labels:
-            proto = prototypes.get(str(label))
-            if proto is None:
-                distances.append(float("inf"))
-                continue
-            proto_t = torch.as_tensor(proto, dtype=emb.dtype)
-            if proto_t.ndim == 1:
-                proto_t = proto_t.unsqueeze(0)
-            if str(dist_fct_name).lower() == "cosine":
-                emb_norm = torch.nn.functional.normalize(emb, p=2, dim=1)
-                proto_norm = torch.nn.functional.normalize(proto_t, p=2, dim=1)
-                distances.append(1.0 - torch.mm(emb_norm, proto_norm.T).mean().item())
-            else:
-                distances.append(torch.cdist(emb, proto_t, p=2).mean().item())
-        distances_array = np.asarray(distances, dtype=np.float64)
-    else:
-        emb = np.asarray(embedding, dtype=np.float32)
-        if emb.ndim == 1:
-            emb = emb[None, :]
-        distances = []
-        for label in labels:
-            proto = prototypes.get(str(label))
-            if proto is None:
-                distances.append(np.inf)
-                continue
-            proto = np.asarray(proto, dtype=np.float32)
-            if proto.ndim == 1:
-                proto = proto[None, :]
-            if str(dist_fct_name).lower() == "cosine":
-                emb_norm = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
-                proto_norm = proto / (np.linalg.norm(proto, axis=1, keepdims=True) + 1e-12)
-                distances.append(1.0 - float(np.matmul(emb_norm, proto_norm.T).mean()))
-            else:
-                diff = emb[:, None, :] - proto[None, :, :]
-                distances.append(float(np.sqrt(np.sum(diff * diff, axis=2)).mean()))
-        distances_array = np.asarray(distances, dtype=np.float64)
+    finite_mask = np.isfinite(distances_array)
+    if not np.any(finite_mask):
+        return np.zeros(len(labels), dtype=np.float64)
 
-    inv = 1.0 / (distances_array + 1e-8)
-    inv[~np.isfinite(inv)] = 0.0
-    total = inv.sum()
+    finite_distances = distances_array[finite_mask]
+    temperature = float(np.std(finite_distances))
+    if temperature <= 1e-8:
+        temperature = 1.0
+
+    logits = np.full(len(labels), -np.inf, dtype=np.float64)
+    logits[finite_mask] = -distances_array[finite_mask] / temperature
+    logits = logits - np.max(logits[finite_mask])
+    exp = np.zeros(len(labels), dtype=np.float64)
+    exp[finite_mask] = np.exp(logits[finite_mask])
+    total = float(exp.sum())
     if total <= 0:
         return np.zeros(len(labels), dtype=np.float64)
-    return inv / total
+    return exp / total
+
+
+def _classifier_probabilities(classifier: Any, embedding: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if hasattr(classifier, "predict_proba"):
+        probs = np.asarray(classifier.predict_proba(embedding), dtype=np.float64)
+        classes = np.asarray(getattr(classifier, "classes_", np.arange(probs.shape[1])))
+        return probs[0], classes
+
+    if hasattr(classifier, "decision_function"):
+        scores = np.asarray(classifier.decision_function(embedding), dtype=np.float64)
+        classes = np.asarray(getattr(classifier, "classes_", np.arange(scores.shape[-1] if scores.ndim > 1 else 2)))
+        if scores.ndim == 1:
+            pos = 1.0 / (1.0 + np.exp(-scores))
+            return np.asarray([1.0 - pos[0], pos[0]], dtype=np.float64), classes
+        scores = scores - np.max(scores, axis=1, keepdims=True)
+        exp = np.exp(scores)
+        return (exp / np.sum(exp, axis=1, keepdims=True))[0], classes
+
+    pred = classifier.predict(embedding)[0]
+    classes = np.asarray(getattr(classifier, "classes_", [pred]))
+    probs = np.zeros(len(classes), dtype=np.float64)
+    matches = np.where(classes == pred)[0]
+    probs[int(matches[0]) if len(matches) else 0] = 1.0
+    return probs, classes
+
+
+def _align_classifier_probabilities(
+    probs: np.ndarray,
+    classes: np.ndarray,
+    head_labels: list[str],
+    manifest_labels: list[str],
+) -> np.ndarray:
+    class_to_label: dict[str, str] = {}
+    for cls in classes:
+        class_key = str(cls.item() if hasattr(cls, "item") else cls)
+        label = class_key
+        try:
+            idx = int(float(class_key))
+            if 0 <= idx < len(head_labels):
+                label = head_labels[idx]
+        except (TypeError, ValueError):
+            pass
+        class_to_label[class_key] = str(label)
+
+    by_label = {}
+    for cls, prob in zip(classes, probs):
+        class_key = str(cls.item() if hasattr(cls, "item") else cls)
+        by_label[class_to_label.get(class_key, class_key)] = float(prob)
+
+    return np.asarray([by_label.get(str(label), 0.0) for label in manifest_labels], dtype=np.float64)
 
 
 def predict(image: Image.Image, model: Any, deployment: OfflineDeployment, device: str = "cpu") -> dict[str, Any]:
@@ -246,6 +370,10 @@ def predict(image: Image.Image, model: Any, deployment: OfflineDeployment, devic
         params = deployment.manifest.get("production_params", {}) or {}
         dist_fct = params.get("dist_fct") or deployment.manifest.get("distance") or "euclidean"
         probs = _prototype_probabilities(embedding, model.prototypes, labels, str(dist_fct))
+    elif isinstance(model, SklearnHeadModel):
+        embedding = model.predict_embedding(preprocess_image_array(image, deployment))
+        head_probs, classes = _classifier_probabilities(model.classifier, embedding)
+        probs = _align_classifier_probabilities(head_probs, classes, model.head_labels, labels)
     elif isinstance(model, OnnxClassifier):
         logits = model.predict_logits(preprocess_image_array(image, deployment))
         probs = _softmax(logits)[0]

@@ -14,7 +14,7 @@ if __name__ == '__main__':
     parser.add_argument('--fgsm', type=int, default=0)
     parser.add_argument('--n_calibration', type=int, default=0)
     parser.add_argument('--loss', type=str, default='triplet')
-    parser.add_argument('--normalize', type=str, default='no')
+    parser.add_argument('--normalize', type=str, default='yes', choices=['yes', 'no', 'per_image', 'imagenet'])
     parser.add_argument('--dloss', type=str, default='no')
     parser.add_argument('--prototypes_to_use', type=str, default='class')
     parser.add_argument('--n_positives', type=int, default=1)

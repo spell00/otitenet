@@ -79,6 +79,17 @@ def _numeric_model_ids(model_ids):
     return out
 
 
+def _row_registry_model_id(row_dict):
+    row_dict = row_dict or {}
+    for key in ("Registry ID", "DB Model ID", "model_id", "id"):
+        value = _model_id_as_int(row_dict.get(key))
+        if value is not None:
+            return value
+    if "Registry ID" not in row_dict:
+        return _model_id_as_int(row_dict.get("Model ID"))
+    return None
+
+
 def _append_unique_path(paths, value):
     text = str(value or "").strip()
     if not text or text.lower() in {"none", "nan", "null"}:
@@ -224,7 +235,7 @@ def _result_matches_model_row_df(results_df, row_dict, base_args=None):
     """Return a boolean mask selecting stored result rows for a model row."""
     if results_df is None or results_df.empty:
         return pd.Series([], dtype=bool)
-    model_id_int = _model_id_as_int((row_dict or {}).get("Model ID"))
+    model_id_int = _row_registry_model_id(row_dict or {})
     mask = pd.Series(False, index=results_df.index)
     if model_id_int is not None and "Model ID" in results_df.columns:
         mask = mask | (pd.to_numeric(results_df["Model ID"], errors="coerce") == model_id_int)
@@ -259,7 +270,7 @@ def _delete_existing_results_for_model_row(cursor, conn, person_id, filenames, r
     filter_parts = []
     filter_values = []
 
-    model_id_int = _model_id_as_int(row_dict.get("Model ID"))
+    model_id_int = _row_registry_model_id(row_dict)
     if model_id_int is not None:
         filter_parts.append("model_id=%s")
         filter_values.append(model_id_int)
@@ -283,19 +294,28 @@ def _delete_existing_results_for_model_row(cursor, conn, person_id, filenames, r
 
     file_placeholders = ",".join(["%s"] * len(filenames))
     query_values = tuple([person_id] + filenames + filter_values)
-    cursor.execute(
-        f"""
-        DELETE FROM results
-        WHERE person_id=%s
-          AND filename IN ({file_placeholders})
-          AND ({" OR ".join(f"({part})" for part in filter_parts)})
-        """,
-        query_values,
-    )
-    deleted = int(getattr(cursor, "rowcount", 0) or 0)
-    if conn:
-        conn.commit()
-    return deleted
+    try:
+        cursor.execute(
+            f"""
+            DELETE FROM results
+            WHERE person_id=%s
+              AND filename IN ({file_placeholders})
+              AND ({" OR ".join(f"({part})" for part in filter_parts)})
+            """,
+            query_values,
+        )
+        deleted = int(getattr(cursor, "rowcount", 0) or 0)
+        if conn:
+            conn.commit()
+        return deleted
+    except Exception as exc:
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        print(f"[Inference] Skipped incomplete-result cleanup after database error: {exc}")
+        return 0
 
 
 def _delete_incomplete_top_n_results(cursor, conn, person_id, filenames, top_n_model_df, incomplete_rows, base_args=None):
@@ -964,6 +984,15 @@ def render(ctx):
 
             # Keep this tab synced to the model selected in Quick Model Selection when possible.
             canonical_key = st.session_state.get("selected_model_selection_key")
+            canonical_version = st.session_state.get("selected_model_version")
+            last_synced_version = st.session_state.get("inference_model_select_last_sync_version")
+            if (
+                canonical_key in model_options
+                and canonical_version is not None
+                and canonical_version != last_synced_version
+            ):
+                st.session_state["inference_model_select_key"] = canonical_key
+                st.session_state["inference_model_select_last_sync_version"] = canonical_version
             default_index = model_options.index(canonical_key) if canonical_key in model_options else 0
 
             st.divider()
@@ -977,7 +1006,14 @@ def render(ctx):
                 key="inference_top_n_models",
             )
             top_n_model_df = inference_model_df.head(int(top_n_models)).copy()
-            top_n_model_ids = _numeric_model_ids(top_n_model_df["Model ID"].dropna().tolist())
+            top_n_model_ids = [
+                model_id
+                for model_id in (
+                    _row_registry_model_id(row.to_dict())
+                    for _, row in top_n_model_df.iterrows()
+                )
+                if model_id is not None
+            ]
 
             def _model_row_log_paths(row_dict):
                 return _model_row_result_log_paths(row_dict, base_args=args)
@@ -1184,6 +1220,7 @@ def render(ctx):
                         missing_model_id, "Log Path"
                     ].fillna("").astype(str)
                 vote_source["Prediction"] = vote_source["Prediction"].fillna("Unknown").astype(str)
+                vote_source = vote_source[vote_source["Prediction"].str.lower() != "error"]
                 selected_model_id_int = _model_id_as_int(selected_model_id)
 
                 vote_counts = (
@@ -1572,18 +1609,28 @@ def render(ctx):
                             )
                             with open(img_path, "rb") as f:
                                 image_bytes = f.read()
-                            run_analysis_on_file(
-                                img_name,
-                                image_bytes,
-                                batch_model_args,
-                                cursor,
-                                conn,
-                                force_reanalyze=force_all_models_inference,
-                                show_validation_metrics=False,
-                                fast_infer=False,
-                                quiet=True,
-                                generate_gradcam=False,
-                            )
+                            try:
+                                run_analysis_on_file(
+                                    img_name,
+                                    image_bytes,
+                                    batch_model_args,
+                                    cursor,
+                                    conn,
+                                    force_reanalyze=force_all_models_inference,
+                                    show_validation_metrics=False,
+                                    fast_infer=False,
+                                    quiet=True,
+                                    generate_gradcam=False,
+                                )
+                            except Exception as e:
+                                # Check if this is a skip error (missing embeddings)
+                                if "SkipModelError" in type(e).__name__ or "embeddings" in str(e).lower() or "train encodings" in str(e).lower():
+                                    st.caption(f"⚠️ Skipped {model_label} for {img_name} (embeddings not available)")
+                                    done_jobs += 1
+                                    continue
+                                else:
+                                    # Re-raise other exceptions
+                                    raise
                             done_jobs += 1
                             progress.progress(min(1.0, done_jobs / max(total_jobs, 1)))
                     refreshed_df = _fetch_latest_inference_results_for_models(top_n_model_ids, top_n_model_df)
@@ -1622,7 +1669,7 @@ def render(ctx):
 
             selected_model_dict = key_to_row[selected_model_key]
             model_id = selected_model_dict.get("Model ID")
-            model_id_int = _model_id_as_int(model_id)
+            model_id_int = _row_registry_model_id(selected_model_dict)
             model_name = selected_model_dict.get("Model Name")
             log_path = selected_model_dict.get("Log Path")
             model_args = args_from_inference_row(args, selected_model_dict)
@@ -1671,7 +1718,7 @@ def render(ctx):
                     "Selected model confidence threshold",
                     min_value=0.0,
                     max_value=1.0,
-                    value=float(st.session_state.get("production_selected_confidence_threshold", 0.50)),
+                    value=float(st.session_state.get("production_selected_confidence_threshold", 0.0)),
                     step=0.01,
                     key="inference_selected_confidence_threshold",
                     help="If the selected model confidence is below this value, the decision falls back to the Top-N ensemble vote.",
@@ -1681,7 +1728,7 @@ def render(ctx):
                     "Top-N ensemble vote threshold (%)",
                     min_value=0.0,
                     max_value=100.0,
-                    value=float(st.session_state.get("production_ensemble_vote_threshold_pct", 80.0)),
+                    value=float(st.session_state.get("production_ensemble_vote_threshold_pct", 0.0)),
                     step=1.0,
                     key="inference_ensemble_vote_threshold_pct",
                     help="If the winning Top-N class has less than this percent of votes, the ensemble decision is Unknown.",
@@ -1750,7 +1797,7 @@ def render(ctx):
 
             top_n_votes_df = _render_top_n_vote_table(
                 top_n_existing_df,
-                model_id,
+                model_id_int,
                 model_name,
                 ensemble_vote_threshold_pct,
                 selected_confidence_threshold,
@@ -2133,15 +2180,21 @@ def render(ctx):
                     st.markdown(f"**Top-N ensemble:** {observe_row.get('Ensemble Prediction', 'Unknown')}")
                     st.markdown(f"**Confidence:** {observe_row['Confidence']}")
                     st.markdown(f"**Ground Truth:** {observe_row['Ground Truth']}")
+                    
+                    st.markdown("**Per-Class Confidence Scores:**")
                     observe_score_cols = [c for c in observe_row.index if str(c).startswith('Score ')]
                     if observe_score_cols:
                         observe_score_df = pd.DataFrame(
                             [{
                                 'Class': str(c)[len('Score '):],
-                                'Score': observe_row[c],
+                                'Confidence': observe_row[c],
                             } for c in observe_score_cols]
                         )
+                        observe_score_df = observe_score_df.sort_values('Confidence', ascending=False)
                         st.dataframe(_arrow_safe_dataframe(observe_score_df), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No per-class confidence scores available. Recompute inference to generate class scores.")
+                    
                     correct_value = str(observe_row.get('Decision Correct', '')).strip()
                     if correct_value == "✓":
                         st.success("Decision correct")

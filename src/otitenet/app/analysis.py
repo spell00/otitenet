@@ -28,8 +28,13 @@ from otitenet.app.model_loading import (
     load_model_and_prototypes,
     load_model_for_log_path
 )
+
+
+class SkipModelError(Exception):
+    """Raised when a model should be skipped during bulk inference (e.g., missing embeddings)."""
+    pass
 from otitenet.app.database import check_ds_exists, insert_score
-from otitenet.app.image_processing import get_image, preprocess_image
+from otitenet.app.image_processing import get_image, infer_base_resize_size, preprocess_image
 from otitenet.app.utils import (
     get_model_params_path,
     dataset_path_segment,
@@ -251,7 +256,7 @@ def _fit_batch_encoder(unique_batches):
 def _embedding_classifier_cache_key(_args, head_config=None):
     """Return the session-state cache key for a model/head embedding classifier."""
     resolved_head_config = head_config if head_config is not None else _head_config_from_args(_args)
-    return f"{get_model_cache_key(_args)}|head={resolved_head_config}"
+    return f"{get_model_cache_key(_args)}|head={resolved_head_config}|n_aug={getattr(_args, 'n_aug', '')}"
 
 
 def clear_embedding_classifier_cache_for_args(_args, head_config=None) -> bool:
@@ -408,11 +413,9 @@ def get_or_build_embedding_classifier(_args, data, unique_labels, unique_batches
 
     if train_encs is None:
         if not allow_reencode:
-            raise RuntimeError(
-                "Saved train encodings are required for bulk inference, but none were found. "
-                "Rebuild/sync the best-model artifacts so train_encodings.npz is present; "
-                "the app will not re-encode the training split during bulk inference."
-            )
+            print(f"[Encodings] Skipping model: saved train encodings required but not found (allow_reencode=False)")
+            st.warning(f"⚠️ Skipping model: train encodings not found and re-encoding disabled. Model will be skipped in bulk inference.")
+            raise SkipModelError("Train encodings not found and re-encoding disabled")
         if use_trained_encoder:
             st.info("ℹ️ Encoding with trained model weights from the selected checkpoint")
         # ---- Slow path: encode training data with model ----
@@ -657,7 +660,13 @@ def _run_analysis_on_file_impl(
             unique_labels_knn = unique_labels
             nets = {'cnn': shap_model, 'embedding_classifier': None}
         
-        original, image = get_image(f'data/queries/{filename}', size=image_size, normalize=_args.normalize)
+        base_resize_size = infer_base_resize_size(getattr(_args, "path", None))
+        original, image = get_image(
+            f'data/queries/{filename}',
+            size=image_size,
+            normalize=_args.normalize,
+            base_size=base_resize_size,
+        )
         
         # Optionally fetch cached validation metrics; bulk analysis can skip this entirely
         valid_acc = None
@@ -782,10 +791,9 @@ def _run_analysis_on_file_impl(
                     # Use the selected embedding classifier head.
                     embedding_classifier = nets['embedding_classifier']
                     if embedding_classifier is None:
-                        raise RuntimeError(
-                            "No embedding classifier was available for the selected learned-embedding head "
-                            f"({format_classifier_config(_head_config_from_args(_args))})."
-                        )
+                        print(f"[Inference] Skipping: no embedding classifier available for head {format_classifier_config(_head_config_from_args(_args))}")
+                        st.warning(f"⚠️ Skipping: embedding classifier not available (train encodings missing). Model skipped in bulk inference.")
+                        raise SkipModelError("Embedding classifier not available (train encodings missing)")
                     if hasattr(embedding_classifier, "predict_proba"):
                         pred_probs = embedding_classifier.predict_proba(embedding)
                     elif hasattr(embedding_classifier, "decision_function"):

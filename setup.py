@@ -11,7 +11,7 @@ from setuptools import find_namespace_packages, setup
 
 setup(
     name='otitenet',
-    version='0.3.0',
+    version='0.7.1',
     package_dir={"": "src"},
     packages=find_namespace_packages(where="src", include=["otitenet", "otitenet.*"]),
     url='https://github.com/spell0/otitenet',

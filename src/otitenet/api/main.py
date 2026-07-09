@@ -87,7 +87,7 @@ async def analyze_image(
         task="otite",
         path="data/otite_ds_64",
         new_size=64,
-        normalize="no",
+        normalize="yes",
         n_neighbors=1,
         dist_fct="euclidean",
         classif_loss="triplet",

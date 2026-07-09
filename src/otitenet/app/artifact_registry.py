@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 import pandas as pd
+import streamlit as st
 
 
 DATASET_REGISTRY_PATH = Path("configs/datasets.csv")
@@ -22,6 +23,7 @@ def _bool_text(value: bool) -> str:
     return "yes" if value else "no"
 
 
+@st.cache_data(ttl=300)
 def scan_dataset_registry(data_dir: str | Path = "data") -> pd.DataFrame:
     """Scan raw and processed datasets into a stable tabular registry."""
     data_root = Path(data_dir)
@@ -82,6 +84,7 @@ def scan_dataset_registry(data_dir: str | Path = "data") -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values(["kind", "path"]).reset_index(drop=True)
 
 
+@st.cache_data(ttl=300)
 def load_dataset_registry(data_dir: str | Path = "data") -> pd.DataFrame:
     if DATASET_REGISTRY_PATH.exists():
         return pd.read_csv(DATASET_REGISTRY_PATH, dtype=str).fillna("")
@@ -235,6 +238,7 @@ def _attach_source_run_paths(df: pd.DataFrame, root: Path) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=300)
 def load_best_models_registry(log_root: str | Path = "logs/best_models") -> pd.DataFrame:
     scanned = scan_best_models_registry(log_root)
     if not BEST_MODELS_REGISTRY_PATH.exists():

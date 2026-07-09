@@ -1,14 +1,23 @@
+import os
+
 import mysql.connector
 from mysql.connector import Error
 
+
+def db_config() -> dict:
+    return {
+        "host": os.environ.get("OTITENET_DB_HOST", "localhost"),
+        "user": os.environ.get("OTITENET_DB_USER", "y_user"),
+        "password": os.environ.get("OTITENET_DB_PASSWORD", "password"),
+        "database": os.environ.get("OTITENET_DB_NAME", "results_db"),
+    }
+
+
 # Connect to MySQL
+conn = None
+cursor = None
 try:
-    conn = mysql.connector.connect(
-        host="localhost",  # Update with your host
-        user="y_user",  # Update with your MySQL username
-        password="password",  # Update with your MySQL password
-        database="results_db"  # Update with your MySQL database name
-    )
+    conn = mysql.connector.connect(**db_config())
     cursor = conn.cursor()
 
     # Create users table
@@ -120,6 +129,6 @@ except Error as e:
     print(f"❌ Error: {e}")
 
 finally:
-    if conn.is_connected():
+    if conn and conn.is_connected():
         cursor.close()
         conn.close()

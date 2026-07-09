@@ -156,6 +156,13 @@ def _set_classifier_head_on_args_global(args, config):
         setattr(args, "best_classifier_config", config)
         setattr(args, "classification_head_config", config)
         setattr(args, "learned_classifier_label", _head_config_label_global(config))
+        try:
+            heads = _classification_head_options_for_args_global(args)
+            matching_head = next((h for h in heads if str(h.get("config")) == config), None)
+            if matching_head is not None and matching_head.get("n_aug") is not None:
+                setattr(args, "n_aug", int(float(str(matching_head.get("n_aug")))))
+        except Exception:
+            pass
 
         from otitenet.app.utils import parse_classifier_config
 

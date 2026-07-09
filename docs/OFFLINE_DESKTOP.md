@@ -178,8 +178,8 @@ npm run desktop:tauri:exact
 Those commands write:
 
 ```text
-desktop/src-tauri/target/release/bundle/deb/Otitenet_0.3.0_amd64_compact.deb
-desktop/src-tauri/target/release/bundle/deb/Otitenet_0.3.0_amd64_exact.deb
+desktop/src-tauri/target/release/bundle/deb/Otitenet_0.7.1_amd64_compact.deb
+desktop/src-tauri/target/release/bundle/deb/Otitenet_0.7.1_amd64_exact.deb
 ```
 
 From `desktop/`, the equivalent commands are:
@@ -189,6 +189,6 @@ npm run tauri:build:compact
 npm run tauri:build:exact
 ```
 
-Each variant build also refreshes Tauri's normal `.deb` output, such as `Otitenet_0.3.0_amd64.deb`. The suffixed files are copied from that output and preserved so both installers can coexist.
+Each variant build also refreshes Tauri's normal `.deb` output, such as `Otitenet_0.7.1_amd64.deb`. The suffixed files are copied from that output and preserved so both installers can coexist.
 
 The platform installer/app bundle will be under `desktop/src-tauri/target/release/bundle/`.

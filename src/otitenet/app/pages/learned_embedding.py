@@ -148,6 +148,9 @@ def _normalize_head_entry(entry, model_row, model_args=None):
         or model_row.get("id")
         or model_row.get("model_id")
     )
+    # If model_id is still None, try to get it from the entry itself (e.g., from database-loaded heads)
+    if model_id is None and isinstance(entry, dict):
+        model_id = entry.get("model_id") or entry.get("Model ID") or entry.get("id")
     model_name = (
         model_row.get("Model Name")
         or model_row.get("model_name")
@@ -318,7 +321,35 @@ def _get_heads_for_model_args(model_args, model_row):
     try:
         heads = list(enumerate_classification_heads(model_args, include_all_n_aug=True) or [])
     except Exception as e:
-        return [], str(e)
+        # Try loading from database as fallback
+        try:
+            model_id = model_row.get("Model ID") or model_row.get("id") or model_row.get("model_id")
+            log_path = model_row.get("Log Path") or model_row.get("log_path")
+            
+            # Import here to avoid circular dependency
+            from otitenet.app.database import load_learned_embedding_heads
+            
+            # Try to get cursor from global context if available
+            cursor = None
+            try:
+                import streamlit as st
+                if 'db_cursor' in st.session_state:
+                    cursor = st.session_state.db_cursor
+            except Exception:
+                pass
+            
+            if cursor:
+                db_heads = load_learned_embedding_heads(cursor, model_id=model_id, log_path=log_path)
+                if db_heads:
+                    heads = db_heads
+                    print(f"[learned_embedding] Loaded {len(heads)} heads from database for model {model_id}")
+                else:
+                    return [], str(e)
+            else:
+                return [], str(e)
+        except Exception as db_e:
+            print(f"[learned_embedding] Database fallback failed: {db_e}")
+            return [], str(e)
 
     rows = [_normalize_head_entry(h, model_row, model_args=model_args) for h in heads]
     rows = _best_display_heads(rows)
@@ -687,13 +718,13 @@ def _render_head_tables(heads_df):
 
 
 def _render_training_dataset_filter(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty or "train_datasets" not in df.columns:
-        return df
-
+    # Always show the filter using sidebar split combo key, even if df is empty
     combo_keys = list(st.session_state.get("sidebar_split_combo_options") or [])
     labels = {}
     sidebar_labels = st.session_state.get("sidebar_split_combo_labels") or {}
-    if not combo_keys:
+    
+    # If no combo keys in session state, try to build from dataframe
+    if not combo_keys and df is not None and not df.empty and "train_datasets" in df.columns:
         for _, row in df.iterrows():
             combo_key = split_combo_key_from_row(row)
             if not combo_key.replace("|", "").strip():
@@ -1561,6 +1592,27 @@ def train_heads_for_args(
 
     with open(cache_path, "wb") as f:
         pickle.dump(cache, f)
+
+    # Save to database for persistence across app restarts
+    try:
+        model_id = None
+        log_path = getattr(_args, "log_path", None)
+        
+        # Try to resolve model_id from database
+        if ctx and hasattr(ctx, 'cursor'):
+            from otitenet.app.database import resolve_model_id
+            model_id = resolve_model_id(ctx.cursor, _args, log_path)
+        
+        # Convert cache result to heads format and save
+        if ctx and hasattr(ctx, 'cursor') and hasattr(ctx, 'conn'):
+            from otitenet.app.utils import enumerate_classification_heads
+            from otitenet.app.database import save_learned_embedding_heads
+            
+            heads = enumerate_classification_heads(_args, include_all_n_aug=True)
+            if heads:
+                save_learned_embedding_heads(ctx.cursor, ctx.conn, model_id, log_path, heads)
+    except Exception as e:
+        print(f"[learned_embedding] Warning: could not save heads to database: {e}")
 
     return result, cache_path
 

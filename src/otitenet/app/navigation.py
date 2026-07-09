@@ -16,7 +16,6 @@ ADMIN_PAGES = [
 CLIENT_PAGES = [
     ("past_results", "🖼️ Grad-CAM Gallery"),
     ("new_analysis", "🧪 New Analysis"),
-    ("inference_results", "🧾 Inference Results"),
 ]
 
 
@@ -26,6 +25,10 @@ def select_page(is_admin: bool) -> str:
     pages = ADMIN_PAGES if is_admin else CLIENT_PAGES
     page_ids = [page_id for page_id, _label in pages]
     page_labels = {page_id: label for page_id, label in pages}
+
+    restore_page = st.session_state.pop("_restore_active_page_id", None)
+    if restore_page in page_ids:
+        st.session_state["active_page_id"] = restore_page
 
     current_page = st.session_state.get("active_page_id")
     if current_page not in page_ids:
@@ -80,6 +83,5 @@ def create_tabs(is_admin: bool):
         [
             "🖼️ Grad-CAM Gallery",
             "🧪 New Analysis",
-            "🧾 Inference Results",
         ]
     )

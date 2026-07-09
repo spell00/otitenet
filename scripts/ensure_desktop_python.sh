@@ -67,6 +67,8 @@ required = {
     "PIL": "Pillow",
     "streamlit": "streamlit",
     "onnxruntime": "onnxruntime",
+    "joblib": "joblib",
+    "sklearn": "scikit-learn",
 }
 
 if mode in {"sidecar", "tauri"}:

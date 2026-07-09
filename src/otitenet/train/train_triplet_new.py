@@ -2426,8 +2426,8 @@ class TrainAE:
         # Get n_aug from params; defaults to 0 (originals only)
         n_aug = max(0, int(self.params.get('n_aug', 0))) if hasattr(self, 'params') else 0
         
-        base_transform = get_base_transform()
-        knn_aug_transform = get_knn_augmentation_transform(self.args.new_size)
+        base_transform = get_base_transform(normalize=self.args.normalize)
+        knn_aug_transform = get_knn_augmentation_transform(self.args.new_size, normalize=self.args.normalize)
 
         for group in groups:
             # Collect encoded samples and mirrored metadata (labels/names/etc.)
@@ -4404,7 +4404,7 @@ if __name__ == "__main__":
     parser.add_argument('--train_datasets', type=str, default='Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM,GMFUNL_jan2023', help='Optional comma-separated training datasets. If empty, all datasets except valid/test are used.')
     parser.add_argument('--test_dataset', type=str, default='inference', help='Optional dedicated test dataset. If omitted or unavailable, half of the validation set is used as test.')
     parser.add_argument('--new_size', type=int, default=64, help='New size for images')
-    parser.add_argument('--normalize', type=str, default=None, help='Normalize images - if None, will optimize')
+    parser.add_argument('--normalize', type=str, default='yes', choices=['yes', 'no', 'per_image', 'imagenet', 'None'], help='Image normalization: yes/imagenet uses torchvision Normalize, per_image uses legacy per-image normalization, no disables normalization, None optimizes')
     parser.add_argument('--n_aug', type=int, default=1, help='Number of augmentations per image (1=original only)')
     parser.add_argument('--auto_select_k', type=int, default=1, help='Automatically select best k (1-10) each epoch based on validation MCC')
     parser.add_argument('--save_repro_artifacts', type=int, default=1, help='Save manifests + sanity samples for reproducibility')
@@ -4489,7 +4489,7 @@ if __name__ == "__main__":
         args.fgsm = 1
     if args.normalize is None:
         optimize_params['normalize'] = True
-        args.normalize = "no"
+        args.normalize = "yes"
     args = validate_n_calibration(args)
     args = disable_stn_when_unsupported(args)
     if int(getattr(args, 'auto_select_k', 0) or 0) and str(getattr(args, 'siamese_inference', 'linearsvc')).strip().lower() != 'knn':
@@ -4648,7 +4648,7 @@ if __name__ == "__main__":
         if optimize_params.get('fgsm'):
             params['fgsm'] = trial.suggest_categorical("fgsm", [0, 1])
         if optimize_params.get('normalize'):
-            params['normalize'] = trial.suggest_categorical("normalize", ['yes', 'no'])
+            params['normalize'] = trial.suggest_categorical("normalize", ['yes', 'no', 'per_image'])
             
         proto_to_use = params.get('prototypes_to_use', getattr(args, 'prototypes_to_use', ''))
         if proto_to_use != 'no':

@@ -14,6 +14,11 @@ from otitenet.app.display_metrics import (
     _arrow_safe_dataframe,
     _head_config_label_global,
 )
+from otitenet.app.services.gradcam_service import (
+    compute_and_save_grad_cam_online,
+    create_temp_grad_cam_dir,
+    pil_image_to_tensor,
+)
 from otitenet.app.services.inference_results_service import (
     find_inference_gradcam_images,
     fmt_confidence,
@@ -356,7 +361,89 @@ def _display_table(df: pd.DataFrame) -> None:
     )
 
 
-def _render_selected_observation(row: pd.Series, inference_dir: str, n_layers: int) -> None:
+def _compute_grad_cam_on_demand(row: pd.Series, ctx: Any, n_layers: int) -> Tuple[bool, str]:
+    """Compute Grad-CAM on demand for a selected result row.
+
+    Args:
+        row: Selected result row with model and image information
+        ctx: App context with args and device
+        n_layers: Number of layers to compute Grad-CAM for
+
+    Returns:
+        Tuple of (success, message)
+    """
+    try:
+        from otitenet.app.model_loading import load_model_and_prototypes
+        from PIL import Image
+
+        from otitenet.app.image_processing import infer_base_resize_size, preprocess_image
+        from otitenet.app.services.inference_results_service import args_from_inference_row
+
+        filename = row.get("Filename")
+        log_path = row.get("Log Path")
+
+        if not log_path or not filename:
+            return False, "Missing log_path or filename"
+
+        # Build args from the result row
+        model_args = args_from_inference_row(ctx.args, row.to_dict())
+
+        # Load model and prototypes
+        with st.spinner("Loading model and prototypes..."):
+            model, _, prototypes, image_size, device_str, _, unique_labels, _, _ = load_model_and_prototypes(model_args)
+
+        # Load and preprocess image
+        img_path = _existing_image_path(filename, inference_dir="data/datasets/inference")
+        if not img_path or not os.path.exists(img_path):
+            return False, f"Image file not found: {filename}"
+
+        image = Image.open(img_path).convert("RGB")
+        image_tensor = preprocess_image(
+            image,
+            image_size,
+            model_args.normalize,
+            base_size=infer_base_resize_size(getattr(model_args, "path", None)),
+        )
+
+        # Prepare prototypes dict
+        class_prototypes = {}
+        if hasattr(prototypes, 'class_prototypes'):
+            proto_dict = prototypes.class_prototypes.get('train', {})
+            for label, proto_array in proto_dict.items():
+                if proto_array is not None:
+                    class_prototypes[label] = proto_array
+
+        if not class_prototypes:
+            return False, "No prototypes available for Grad-CAM computation"
+
+        # Compute Grad-CAM for each layer
+        output_dir = log_path
+        base_filename = strip_extension(filename)
+
+        with st.spinner("Computing Grad-CAM heatmaps..."):
+            for layer in range(max(1, n_layers - 3), n_layers + 1):
+                try:
+                    saved_paths = compute_and_save_grad_cam_online(
+                        model=model,
+                        image_tensor=image_tensor,
+                        class_prototypes=class_prototypes,
+                        output_dir=output_dir,
+                        filename=base_filename,
+                        layer=layer,
+                        device=device_str,
+                        alpha=0.55,
+                    )
+                except Exception as e:
+                    st.warning(f"Failed to compute Grad-CAM for layer {layer}: {e}")
+                    continue
+
+        return True, f"Grad-CAM computed successfully for {filename}"
+
+    except Exception as e:
+        return False, f"Grad-CAM computation failed: {str(e)}"
+
+
+def _render_selected_observation(row: pd.Series, inference_dir: str, n_layers: int, ctx: Any) -> None:
     filename = row.get("Filename")
     log_path = row.get("Log Path")
 
@@ -400,6 +487,15 @@ def _render_selected_observation(row: pd.Series, inference_dir: str, n_layers: i
             "No Grad-CAM image found for this row. Fresh predictions generate Grad-CAM automatically. "
             "To regenerate, rerun inference/new analysis for this image with force re-analyze enabled."
         )
+        
+        # Add on-demand computation button
+        if st.button("🔄 Compute Grad-CAM on demand", key=f"compute_gradcam_{filename}_{log_path}"):
+            success, message = _compute_grad_cam_on_demand(row, ctx, n_layers)
+            if success:
+                st.success(message)
+                st.rerun()
+            else:
+                st.error(message)
         return
 
     for gc_path in gradcam_images:
@@ -547,7 +643,7 @@ def render(ctx: Any) -> None:
         )
 
         selected_row = filtered_df.loc[selected_idx]
-        _render_selected_observation(selected_row, inference_dir=inference_dir, n_layers=int(n_layers))
+        _render_selected_observation(selected_row, inference_dir=inference_dir, n_layers=int(n_layers), ctx=ctx)
 
     else:
         max_items = st.number_input(

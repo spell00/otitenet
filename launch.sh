@@ -23,6 +23,7 @@ dataset_name="otite_ds_64"
 valid_dataset="Banque_Viscaino_Chili_2020"
 test_dataset="Banque_Viscaino_Chili_2020"
 train_datasets="Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM,GMFUNL_jan2023"
+normalize_values="yes no per_image imagenet"
 user_set_num_jobs=0
 user_set_bs=0
 min_free_mb=2048
@@ -30,7 +31,7 @@ mem_per_job_mb=6000
 max_oom_retries=3
 poll_interval=5
 show_progress_bar=1
-siamese_inference="linearsvc" # knn, linearsvc, logisticregression
+siamese_inference="logisticregression" # knn, linearsvc, logisticregression
 
 # DANN/FGSM params shared with CNN/MLP.
 gamma=1.0
@@ -71,6 +72,10 @@ for arg in "$@"; do
             ;;
         --train-datasets=*)
             train_datasets="${arg#*=}"
+            ;;
+        --normalize-values=*)
+            normalize_values="${arg#*=}"
+            normalize_values="${normalize_values//,/ }"
             ;;
         --min-free-mb=*)
             min_free_mb="${arg#*=}"
@@ -1781,7 +1786,7 @@ poll_running_jobs() {
 generate_jobs() {
     local n_calibration normalize model fgsm dloss loss prototype classif_loss n_negatives exp_id
     for n_calibration in 4 0; do
-        for normalize in yes no; do
+        for normalize in $normalize_values; do
             for model in resnet18 resnet50 vit_b_16 vit_b_16_384 densenet161 vgg16 efficientnet_b0 densenet121; do
                 for fgsm in 0 1; do
                     for dloss in no inverseTriplet; do
@@ -1903,7 +1908,7 @@ scheduler_loop() {
 count_jobs() {
     local count=0
     for n_calibration in 0 4; do
-        for normalize in yes no; do
+        for normalize in $normalize_values; do
             for model in resnet18 vgg16 efficientnet_b0 vit; do
                 for fgsm in 0 1; do
                     for dloss in no inverseTriplet; do

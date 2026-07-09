@@ -1301,7 +1301,7 @@ def parse_args():
 
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--new_size", type=int, default=64)
-    parser.add_argument("--normalize", type=str, default="no")
+    parser.add_argument("--normalize", type=str, default="yes", choices=["yes", "no", "per_image", "imagenet"])
     parser.add_argument("--bs", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers (-1 uses all CPU cores)")
     parser.add_argument("--n_epochs", type=int, default=80)
