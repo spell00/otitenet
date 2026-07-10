@@ -1,0 +1,63 @@
+args:
+  exp_id: paper_otite_four_class_PAPER_E03_N0_S42
+  uuid: ee3604df-6e72-42f9-8b27-c5ad19f38cea
+  task: otite_four_class
+  model_name: resnet18
+  path: data/otite_ds_64/USA_Turquie_Chili_GMFUNL
+  path_original: ./data/otite_ds_-1
+  train_datasets: Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM
+  valid_dataset: Banque_Viscaino_Chili_2020
+  test_dataset: GMFUNL_jan2023
+  effective_train_datasets: Banque_Calaman_USA_2020_trie_CM,Banque_Comert_Turquie_2020_jpg,GMFUNL_jan2023
+  effective_valid_dataset: Banque_Viscaino_Chili_2020
+  effective_test_dataset: Banque_Viscaino_Chili_2020
+  new_size: 224
+  normalize: true
+  n_epochs: 100
+  n_trials: 1
+  trial_index: 1
+  bs: 32
+  dloss: inverseTriplet
+  classif_loss: arcface
+  prototypes_to_use: false
+  prototype_strategy: mean
+  prototype_components: 1
+  siamese_inference: linearsvc
+  n_neighbors: 1
+  fgsm: 1
+  n_calibration: 0
+  n_positives: 1
+  n_negatives: 1
+  dist_fct: cosine
+  n_aug: 1
+  seed: 42
+  groupkfold: 1
+  weighted_sampler: 1
+  device: cuda:0
+optimized_params:
+  dist_fct: cosine
+  dmargin: 0.15599452033620265
+  dropout: 0.0
+  epsilon: 0.1599409170128045
+  gamma: 0.017073967431528128
+  is_transform: 1
+  lr: 1.329291894316217e-05
+  margin: 0
+  n_aug: 4
+  n_neighbors: 3
+  normalize: false
+  optimizer_type: adam
+  smoothing: 0.146398788362281
+  wd: 0.005061576888752304
+run:
+  foldername: 259f009b-47aa-41ab-98ba-90f198cd0614
+  complete_log_path: logs/otite_four_class/259f009b-47aa-41ab-98ba-90f198cd0614
+code:
+  git_commit: 96e95fbf5ad4f6454080a88846827e3271ca2446
+  git_branch: paper-reproduction-experiments
+  git_dirty: true
+  requirements_sha256: 72acfb144a71f6b33fbe54cd10cfb0ef1387bfed8a470727c472ad78c0c038ea
+dvc:
+  selected_paths: data/otite_ds_64/USA_Turquie_Chili_GMFUNL;data;logs/best_models
+  selected_dvc_files: data.dvc;logs/best_models.dvc
+  selected_md5s: 4164aea77091cc10e2a40a6c1662bea3.dir;4164aea77091cc10e2a40a6c1662bea3.dir;96beebccebc8db68da9f1905353963c6.dir

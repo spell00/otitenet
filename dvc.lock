@@ -12,45 +12,44 @@ stages:
     params:
       logs/dvc_exp/latest_params.yaml:
         args:
-          exp_id: 
-            PROD_otitis_four_class_otite_ds_64_USA_Turquie_Chili_GMFUNL_siamese_resnet18_triplet_inverseTriplet_nneg5_proto_no_ncal4_normyes_fgsm0_inferlinearsvc_otitis_four_class_PROD
-          uuid: c0c93b09-199b-47b7-bf96-622566aa93e5
-          task: otitis_four_class
+          exp_id: paper_otite_four_class_PAPER_E03_N0_S42
+          uuid: ee3604df-6e72-42f9-8b27-c5ad19f38cea
+          task: otite_four_class
           model_name: resnet18
           path: data/otite_ds_64/USA_Turquie_Chili_GMFUNL
           path_original: ./data/otite_ds_-1
-          train_datasets: Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM,GMFUNL_jan2023
+          train_datasets: Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM
           valid_dataset: Banque_Viscaino_Chili_2020
-          test_dataset: Banque_Viscaino_Chili_2020
+          test_dataset: GMFUNL_jan2023
           effective_train_datasets: Banque_Calaman_USA_2020_trie_CM,Banque_Comert_Turquie_2020_jpg,GMFUNL_jan2023
           effective_valid_dataset: Banque_Viscaino_Chili_2020
           effective_test_dataset: Banque_Viscaino_Chili_2020
           new_size: 224
           normalize: true
-          n_epochs: 1000
-          n_trials: 3
-          trial_index: 3
+          n_epochs: 100
+          n_trials: 1
+          trial_index: 1
           bs: 32
           dloss: inverseTriplet
-          classif_loss: triplet
+          classif_loss: arcface
           prototypes_to_use: false
           prototype_strategy: mean
           prototype_components: 1
           siamese_inference: linearsvc
           n_neighbors: 1
-          fgsm: 0
-          n_calibration: 4
+          fgsm: 1
+          n_calibration: 0
           n_positives: 1
-          n_negatives: 5
-          dist_fct: euclidean
+          n_negatives: 1
+          dist_fct: cosine
           n_aug: 1
           seed: 42
           groupkfold: 1
-          weighted_sampler: 0
+          weighted_sampler: 1
           device: cuda:0
         code:
-          git_commit: 572c46e7cd43f9d791dbc5ceacd815745e5b44e8
-          git_branch: master
+          git_commit: 96e95fbf5ad4f6454080a88846827e3271ca2446
+          git_branch: paper-reproduction-experiments
           git_dirty: true
           requirements_sha256: 72acfb144a71f6b33fbe54cd10cfb0ef1387bfed8a470727c472ad78c0c038ea
         dvc:
@@ -59,25 +58,25 @@ stages:
           selected_md5s: 
             4164aea77091cc10e2a40a6c1662bea3.dir;4164aea77091cc10e2a40a6c1662bea3.dir;96beebccebc8db68da9f1905353963c6.dir
         optimized_params:
-          dist_fct: euclidean
-          dmargin: 0.7851759613930136
+          dist_fct: cosine
+          dmargin: 0.15599452033620265
           dropout: 0.0
-          epsilon: 0
-          gamma: 0.0629064429458615
+          epsilon: 0.1599409170128045
+          gamma: 0.017073967431528128
           is_transform: 1
-          lr: 6.847920095574779e-05
-          margin: 5.142344384136116
-          n_aug: 1
+          lr: 1.329291894316217e-05
+          margin: 0
+          n_aug: 4
           n_neighbors: 3
           normalize: false
           optimizer_type: adam
-          smoothing: 0.058428929707043636
-          wd: 6.870101665590006e-08
+          smoothing: 0.146398788362281
+          wd: 0.005061576888752304
         run:
-          foldername: e22b8487-eaf3-4af8-aadf-06516cfde144
-          complete_log_path: logs/otitis_four_class/e22b8487-eaf3-4af8-aadf-06516cfde144
+          foldername: 259f009b-47aa-41ab-98ba-90f198cd0614
+          complete_log_path: logs/otite_four_class/259f009b-47aa-41ab-98ba-90f198cd0614
     outs:
     - path: logs/dvc_exp/latest_metrics.json
       hash: md5
-      md5: 4bb11211c0d77b799a070e2097fd4575
-      size: 1270
+      md5: 539b9384e7a411851753614bde6c579f
+      size: 1287
