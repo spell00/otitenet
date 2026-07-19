@@ -19,12 +19,14 @@ def update_model_ranks():
         )
         cursor = conn.cursor()
         
-        # Get all models ordered by MCC descending
+        # Get all models ordered by valid_mcc descending (same criterion as Optuna sweep, cv=3).
+        # Fall back to mcc when valid_mcc is NULL so legacy rows still get ranked.
         cursor.execute("""
             SELECT id, model_name, nsize, fgsm, prototypes, npos, nneg, dloss, dist_fct, 
-                   classif_loss, n_calibration, normalize, n_neighbors, mcc
+                   classif_loss, n_calibration, normalize, n_neighbors,
+                   COALESCE(valid_mcc, mcc) AS sort_mcc
             FROM best_models_registry
-            ORDER BY mcc DESC
+            ORDER BY COALESCE(valid_mcc, mcc) DESC
         """)
         
         all_models = cursor.fetchall()
@@ -53,6 +55,7 @@ def update_model_ranks():
         for row in all_models:
             key = make_dedupe_key(row)
             if key not in seen_keys:
+                # keep the row with the highest COALESCE(valid_mcc, mcc) — already sorted desc
                 seen_keys[key] = True
                 unique_models.append(row)
         

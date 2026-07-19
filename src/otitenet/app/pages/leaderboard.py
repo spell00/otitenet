@@ -280,7 +280,8 @@ def _query_best_models(cursor) -> Tuple[List[tuple], bool]:
                    train_datasets, valid_dataset, test_dataset, split_config_key,
                    artifact_id, best_model_dir, source_run_log_path
             FROM best_models_registry
-            ORDER BY (model_rank IS NULL) ASC, model_rank ASC, mcc DESC
+            ORDER BY (model_rank IS NULL) ASC, model_rank ASC,
+                     COALESCE(valid_mcc, mcc) DESC
             """
         )
         return cursor.fetchall() or [], True
@@ -296,7 +297,7 @@ def _query_best_models(cursor) -> Tuple[List[tuple], bool]:
                            train_datasets, valid_dataset, test_dataset, split_config_key,
                            artifact_id, best_model_dir, source_run_log_path
                     FROM best_models_registry
-                    ORDER BY mcc DESC
+                    ORDER BY COALESCE(valid_mcc, mcc) DESC
                     """
                 )
                 return cursor.fetchall() or [], False
@@ -309,7 +310,7 @@ def _query_best_models(cursor) -> Tuple[List[tuple], bool]:
                            prototype_strategy, prototype_components,
                            train_datasets, valid_dataset, test_dataset, split_config_key
                     FROM best_models_registry
-                    ORDER BY mcc DESC
+                    ORDER BY mcc DESC  -- legacy fallback, no valid_mcc column
                     """
                 )
                 rows = cursor.fetchall() or []
@@ -378,9 +379,13 @@ def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.Data
             df.at[idx, "Artifact Log Path"] = preferred
             df.at[idx, "Log Path"] = preferred
 
-    if "MCC" in df.columns:
-        df["_mcc_numeric"] = pd.to_numeric(df["MCC"], errors="coerce").fillna(float("-inf"))
-        df = df.sort_values("_mcc_numeric", ascending=False).drop(columns=["_mcc_numeric"])
+    if "MCC" in df.columns or "Valid MCC" in df.columns:
+        # Rank by valid_mcc (cv=3, same as Optuna sweep); fall back to mcc for legacy rows.
+        df["_valid_mcc_sort"] = pd.to_numeric(df.get("Valid MCC"), errors="coerce").fillna(float("-inf"))
+        df["_mcc_sort"] = pd.to_numeric(df.get("MCC"), errors="coerce").fillna(float("-inf"))
+        df = df.sort_values(
+            ["_valid_mcc_sort", "_mcc_sort"], ascending=[False, False]
+        ).drop(columns=["_valid_mcc_sort", "_mcc_sort"])
 
     if "Log Path" in df.columns:
         df = df.dropna(subset=["Log Path"])
@@ -769,6 +774,8 @@ def _attach_metrics(df: pd.DataFrame, calibration_split: str = "valid") -> pd.Da
 
 
 def _order_model_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Valid MCC is the ranking criterion (cv=3, same as Optuna sweep).
+    # Test MCC is displayed but never used for ranking.
     metric_cols = [
         "Accuracy", "MCC",
         "Train MCC", "Valid MCC", "Test MCC",
@@ -2569,9 +2576,6 @@ def render(
                     _render_top_models_filter_controls(models_df, page_key)
                 else:
                     _update_model_number_map(display_models_df)
-
-                    if include_model_table:
-                        _render_top_models_table(display_models_df, args)
 
                     _render_top_models_filter_controls(models_df, page_key)
 
