@@ -64,6 +64,10 @@ jobs:
       - name: Build Windows NSIS installer
         shell: pwsh
         run: |
+          $tauriConfigPath = "desktop/src-tauri/tauri.conf.json"
+          $tauriConfig = Get-Content $tauriConfigPath -Raw | ConvertFrom-Json
+          $tauriConfig.bundle.PSObject.Properties.Remove("resources")
+          $tauriConfig | ConvertTo-Json -Depth 100 | Set-Content $tauriConfigPath -Encoding UTF8
           Push-Location desktop
           npm run tauri:build -- --bundles nsis
           Pop-Location
