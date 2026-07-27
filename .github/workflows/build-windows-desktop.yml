@@ -1,0 +1,88 @@
+name: Build Windows Desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: Desktop build variant
+        required: true
+        default: compact
+        type: choice
+        options:
+          - compact
+          - exact
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      OTITENET_DESKTOP_VARIANT: ${{ inputs.variant }}
+      OTITENET_PYINSTALLER_ONEFILE: "1"
+      PYTHONUTF8: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements-desktop.txt
+            requirements-export.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-desktop.txt
+          python -m pip install -r requirements-export.txt
+
+      - name: Build Windows Streamlit sidecar
+        shell: pwsh
+        run: |
+          python -m PyInstaller packaging/pyinstaller/otitenet_streamlit.spec --clean -y
+          if (!(Test-Path "dist/otitenet-streamlit.exe")) {
+            throw "Missing PyInstaller output: dist/otitenet-streamlit.exe"
+          }
+          New-Item -ItemType Directory -Force -Path "desktop/src-tauri/binaries" | Out-Null
+          Copy-Item "dist/otitenet-streamlit.exe" "desktop/src-tauri/binaries/otitenet-streamlit-x86_64-pc-windows-msvc.exe" -Force
+
+      - name: Install frontend dependencies
+        shell: pwsh
+        run: |
+          npm ci
+          Push-Location desktop
+          npm ci
+          Pop-Location
+
+      - name: Build Windows NSIS installer
+        shell: pwsh
+        run: |
+          Push-Location desktop
+          npm run tauri:build -- --bundles nsis
+          Pop-Location
+
+      - name: Upload Windows sidecar
+        uses: actions/upload-artifact@v4
+        with:
+          name: otitenet-windows-sidecar-${{ inputs.variant }}
+          path: dist/otitenet-streamlit.exe
+          if-no-files-found: error
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: otitenet-windows-installer-${{ inputs.variant }}
+          path: desktop/src-tauri/target/release/bundle/nsis/*
+          if-no-files-found: error
