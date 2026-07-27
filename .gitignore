@@ -152,3 +152,13 @@ desktop/dist/
 desktop/src-tauri/binaries/
 desktop/src-tauri/gen/
 desktop/src-tauri/target/
+
+# Minimal offline desktop deployment payload used by PyInstaller.
+!data/
+!data/mobile_deployments/
+!data/mobile_deployments/current/
+data/mobile_deployments/current/*
+!data/mobile_deployments/current/manifest.json
+!data/mobile_deployments/current/embedding_model.onnx
+!data/mobile_deployments/current/classifier_head.joblib
+!data/mobile_deployments/current/transforms.json

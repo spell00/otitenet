@@ -24,7 +24,11 @@ from otitenet.app.services.inference_results_service import (
     fmt_confidence,
     normalize_analysis_result,
 )
-from otitenet.app.utils import _ensure_model_number_map, _make_model_selection_key
+from otitenet.app.utils import (
+    _ensure_model_number_map,
+    _make_model_selection_key,
+    ensure_calibration_alias_columns,
+)
 
 
 IMAGE_TYPES = ["jpg", "jpeg", "png", "bmp", "tif", "tiff"]
@@ -56,6 +60,7 @@ def _load_ranked_models(cursor) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = best_models_table.copy().reset_index(drop=True)
+    df = ensure_calibration_alias_columns(df)
     df["_selection_key"] = df.apply(lambda r: _make_model_selection_key(r.to_dict()), axis=1)
 
     if "#" not in df.columns:
@@ -273,6 +278,7 @@ def render(ctx: Any) -> None:
         "Valid AUC",
         "Test AUC",
         "MCC",
+        "N_Calibration",
         "Normalize",
         "N_Neighbors",
     ]

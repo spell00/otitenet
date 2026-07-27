@@ -25,6 +25,7 @@ from otitenet.app.utils import (
     _ensure_model_number_map,
     _make_model_selection_key,
     enumerate_classification_heads,
+    ensure_calibration_alias_columns,
     format_classifier_config,
     parse_classifier_config,
     resolve_best_classifier_config,
@@ -313,6 +314,7 @@ def _load_ranked_models(cursor, top_n: int) -> pd.DataFrame:
     if best_models_table is None or best_models_table.empty:
         return pd.DataFrame()
     df = best_models_table.copy().reset_index(drop=True)
+    df = ensure_calibration_alias_columns(df)
     if "#" not in df.columns:
         df["#"] = range(1, len(df) + 1)
     df["_selection_key"] = df.apply(lambda r: _make_model_selection_key(r.to_dict()), axis=1)
@@ -1009,7 +1011,7 @@ def render(ctx):
             use_topn_ensemble = False
         else:
             st.markdown("**Top-N models that will run**")
-            topn_cols = [c for c in ["#", "Model ID", "Model Name", "Valid MCC", "Test MCC", "Valid AUC", "Test AUC", "Head", "Head Config"] if c in topn_models_df.columns]
+            topn_cols = [c for c in ["#", "Model ID", "Model Name", "N_Calibration", "Valid MCC", "Test MCC", "Valid AUC", "Test AUC", "Head", "Head Config"] if c in topn_models_df.columns]
             st.dataframe(_arrow_safe_dataframe(topn_models_df[topn_cols]), use_container_width=True)
 
     images_for_run, run_batch = _select_images_for_current_run(uploaded_images, is_admin=is_admin)

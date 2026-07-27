@@ -63,6 +63,7 @@ def test_best_models_registry_has_one_row_per_model_and_source_run(tmp_path):
     assert row["dataset_path"] == "otite_ds_64/USA_Turquie_Chili_GMFUNL_inference"
     assert row["nsize"] == "224"
     assert row["fgsm"] == "0"
+    assert row["n_calibration"] == "0"
     assert row["classif_loss"] == "arcface"
     assert row["dloss"] == "inverseTriplet"
     assert row["prototypes"] == "class"

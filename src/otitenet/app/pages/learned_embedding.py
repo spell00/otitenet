@@ -162,6 +162,12 @@ def _normalize_head_entry(entry, model_row, model_args=None):
     model_valid_mcc = model_row.get("Valid MCC") or model_row.get("valid_mcc") or model_row.get("MCC") or model_row.get("mcc")
     model_test_mcc = model_row.get("Test MCC") or model_row.get("test_mcc")
     log_path = model_row.get("Log Path") or model_row.get("log_path") or getattr(model_args, "log_path", None)
+    n_calibration = _first_nonblank(
+        model_row.get("n_calibration"),
+        model_row.get("N_Calibration"),
+        model_row.get("N Calibration"),
+        getattr(model_args, "n_calibration", None),
+    )
     train_datasets = _first_nonblank(
         model_row.get("train_datasets"),
         model_row.get("Train Datasets"),
@@ -194,6 +200,8 @@ def _normalize_head_entry(entry, model_row, model_args=None):
             "Train Datasets": train_datasets,
             "Valid Dataset": valid_dataset,
             "Test Dataset": test_dataset,
+            "n_calibration": n_calibration,
+            "N_Calibration": n_calibration,
             "N Aug": n_aug,
             "Family": family,
             "Classifier": _family_display_name(family),
@@ -255,6 +263,8 @@ def _normalize_head_entry(entry, model_row, model_args=None):
         "Train Datasets": train_datasets,
         "Valid Dataset": valid_dataset,
         "Test Dataset": test_dataset,
+        "n_calibration": n_calibration,
+        "N_Calibration": n_calibration,
         "N Aug": n_aug,
         "Family": family,
         "Classifier": _family_display_name(family),
@@ -661,6 +671,7 @@ def _render_head_tables(heads_df):
         "Train Datasets",
         "Valid Dataset",
         "Test Dataset",
+        "n_calibration",
         "Log Path",
         "N Aug",
         "Classifier",
@@ -708,6 +719,7 @@ def _render_head_tables(heads_df):
             "Train Datasets",
             "Valid Dataset",
             "Test Dataset",
+            "n_calibration",
             "Log Path",
             "N Aug",
             "Classifier",
@@ -2018,6 +2030,11 @@ def _result_summary_row(model_row, result, cache_path):
         "Status": "trained",
         "Model ID": model_id,
         "Model": model_name,
+        "n_calibration": _first_nonblank(
+            result.get("n_calibration"),
+            model_row.get("n_calibration") if isinstance(model_row, dict) else None,
+            model_row.get("N_Calibration") if isinstance(model_row, dict) else None,
+        ),
         "N Aug": model_row.get("N_Aug", model_row.get("n_aug")) if isinstance(model_row, dict) else None,
         "Best Config": result.get("best_config"),
         "Best Head": format_classifier_config(result.get("best_config")),
@@ -2315,6 +2332,11 @@ def _training_status_row(
         "Status": status,
         "Model ID": model_id,
         "Model": model_name,
+        "n_calibration": _first_nonblank(
+            model_row.get("n_calibration") if isinstance(model_row, dict) else None,
+            model_row.get("N_Calibration") if isinstance(model_row, dict) else None,
+            getattr(model_args, "n_calibration", None),
+        ),
         "N Aug": int(n_aug),
         "Best Config": None,
         "Best Head": None,
@@ -2380,6 +2402,16 @@ def _current_sidebar_model_row(ctx, n_aug: int) -> Dict[str, Any]:
         "train_datasets": selected.get("train_datasets") or getattr(ctx.args, "train_datasets", None),
         "valid_dataset": selected.get("valid_dataset") or getattr(ctx.args, "valid_dataset", None),
         "test_dataset": selected.get("test_dataset") or getattr(ctx.args, "test_dataset", None),
+        "n_calibration": _first_nonblank(
+            selected.get("n_calibration"),
+            selected.get("N_Calibration"),
+            getattr(ctx.args, "n_calibration", None),
+        ),
+        "N_Calibration": _first_nonblank(
+            selected.get("n_calibration"),
+            selected.get("N_Calibration"),
+            getattr(ctx.args, "n_calibration", None),
+        ),
         "N_Aug": int(n_aug),
     }
 
@@ -2452,6 +2484,7 @@ def _display_training_results(payload: Dict[str, Any], replay: bool = False):
         trained_cols = [
             "Model ID",
             "Model",
+            "n_calibration",
             "N Aug",
             "Classifier",
             "Head",

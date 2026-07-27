@@ -33,6 +33,7 @@ from otitenet.app.utils import (
     _optimization_cache_file_paths,
     sort_dataframe_by_model_metric,
     ensure_int,
+    ensure_calibration_alias_columns,
     normalize_train_datasets,
     split_config_key,
     split_combo_key_from_row,
@@ -325,9 +326,9 @@ def _progress_manifest_model_rows(task: str = "", model_name: str = "") -> pd.Da
 def _append_manifest_model_rows(base_df: pd.DataFrame, manifest_df: pd.DataFrame) -> pd.DataFrame:
     """Append manifest rows after aligning columns, tolerating an empty manifest."""
     if manifest_df is None or manifest_df.empty:
-        return base_df.copy()
+        return ensure_calibration_alias_columns(base_df.copy())
     if base_df is None or base_df.empty:
-        return manifest_df.copy()
+        return ensure_calibration_alias_columns(manifest_df.copy())
 
     out = base_df.copy()
     manifest_aligned = manifest_df.copy()
@@ -337,7 +338,7 @@ def _append_manifest_model_rows(base_df: pd.DataFrame, manifest_df: pd.DataFrame
     for col in manifest_aligned.columns:
         if col not in out.columns:
             out[col] = pd.NA
-    return pd.concat([out, manifest_aligned[out.columns]], ignore_index=True)
+    return ensure_calibration_alias_columns(pd.concat([out, manifest_aligned[out.columns]], ignore_index=True))
 
 
 def _has_value(value) -> bool:

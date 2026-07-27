@@ -24,6 +24,7 @@ if __name__ == "__main__":
         sys.path.insert(0, str(src_path))
     port = choose_port()
     os.environ["OTITENET_STREAMLIT_PORT"] = str(port)
+    os.environ.setdefault("OTITENET_DEPLOYMENT_DIR", resolve_path("data/mobile_deployments/current"))
     app_file = os.environ.get("OTITENET_STREAMLIT_APP", "app_offline.py")
 
     sys.argv = [

@@ -34,6 +34,7 @@ from otitenet.app.utils import (
     attach_task_column,
     best_cached_head_metrics_for_model_row,
     ensure_int,
+    ensure_calibration_alias_columns,
     extract_params_from_log_path,
     filter_models_df_by_task,
     format_classifier_config,
@@ -423,6 +424,7 @@ def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.Data
 
     if df.empty:
         return df
+    df = ensure_calibration_alias_columns(df)
 
     # Preserve task information from the original registry path before Log Path is
     # swapped to a source-run artifact path that no longer encodes best_models/<task>/.
@@ -973,6 +975,8 @@ def _order_model_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "#" in df.columns:
         ordered_cols.append("#")
 
+    df = ensure_calibration_alias_columns(df)
+
     preferred_non_metric = [
         "Model ID", "Registry ID", "exp ID", "Task", "N Classes", "Labels", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
         "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration", "Normalize",
@@ -1439,9 +1443,10 @@ def _render_top_models_table(models_df: pd.DataFrame, args) -> None:
     st.write("**Top Models (all registry rows):**")
     st.markdown("**Table:** Top Models")
 
+    models_df = ensure_calibration_alias_columns(models_df)
     display_columns = [
         col for col in models_df.columns
-        if col not in {"Log Path", "N_Neighbors"}
+        if col not in {"Log Path", "N_Neighbors", "n_cal", "n_calibration"}
     ]
 
     display_df = models_df[display_columns].copy()

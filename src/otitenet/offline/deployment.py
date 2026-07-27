@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,8 +50,39 @@ class OfflineDeployment:
         return self.root / Path(model_name).name
 
 
+def _default_deployment_candidates() -> list[Path]:
+    candidates: list[Path] = []
+
+    env_dir = os.environ.get("OTITENET_DEPLOYMENT_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir))
+
+    bundled_root = getattr(sys, "_MEIPASS", None)
+    if bundled_root:
+        candidates.append(Path(bundled_root) / DEFAULT_DEPLOYMENT_DIR)
+
+    candidates.append(DEFAULT_DEPLOYMENT_DIR)
+
+    source_root = Path(__file__).resolve().parents[3]
+    candidates.append(source_root / DEFAULT_DEPLOYMENT_DIR)
+
+    return candidates
+
+
+def _resolve_deployment_root(root: str | Path) -> Path:
+    root_path = Path(root)
+    if root_path != DEFAULT_DEPLOYMENT_DIR or root_path.is_absolute():
+        return root_path
+
+    for candidate in _default_deployment_candidates():
+        if (candidate / "manifest.json").exists():
+            return candidate
+
+    return root_path
+
+
 def load_deployment(root: str | Path = DEFAULT_DEPLOYMENT_DIR) -> OfflineDeployment:
-    root = Path(root)
+    root = _resolve_deployment_root(root)
     manifest_path = root / "manifest.json"
     if not manifest_path.exists():
         raise FileNotFoundError(f"Offline deployment manifest not found: {manifest_path}")

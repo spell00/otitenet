@@ -75,6 +75,41 @@ def metric_value_from_mapping(mapping, metric=None, default=np.nan):
     return default
 
 
+def ensure_calibration_alias_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure model tables expose all calibration-count aliases used by the UI."""
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    aliases = ["N_Calibration", "n_cal", "n_calibration"]
+    present = [col for col in aliases if col in out.columns]
+    if not present:
+        return out
+
+    def _has_value(value) -> bool:
+        try:
+            if pd.isna(value):
+                return False
+        except Exception:
+            pass
+        return str(value).strip() not in {"", "None", "nan", "NaN", "<NA>", "—"}
+
+    base = out[present[0]].copy()
+    for col in present[1:]:
+        missing = ~base.map(_has_value)
+        if missing.any():
+            base.loc[missing] = out.loc[missing, col]
+
+    for col in aliases:
+        if col not in out.columns:
+            out[col] = base
+        else:
+            missing = ~out[col].map(_has_value)
+            if missing.any():
+                out.loc[missing, col] = base.loc[missing]
+    return out
+
+
 def sort_dataframe_by_model_metric(df, metric=None) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -1608,6 +1643,7 @@ def _ensure_model_number_map(cursor):
     if model_number_map and best_models_table is not None and cached_metric == active_metric:
         try:
             cached_df = sort_dataframe_by_model_metric(pd.DataFrame(best_models_table)).reset_index(drop=True)
+            cached_df = ensure_calibration_alias_columns(cached_df)
             cached_df["#"] = np.arange(1, len(cached_df) + 1)
             refreshed_map = {}
             for _, row in cached_df.iterrows():
@@ -1735,6 +1771,7 @@ def _ensure_model_number_map(cursor):
             "Artifact ID", "Best Model Dir", "Source Run Path",
         ]
     df = pd.DataFrame(model_rows, columns=cols)
+    df = ensure_calibration_alias_columns(df)
     if "Best Model Dir" not in df.columns:
         df["Best Model Dir"] = df.get("Log Path", "")
     if "Source Run Path" not in df.columns:

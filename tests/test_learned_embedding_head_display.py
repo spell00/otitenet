@@ -204,6 +204,19 @@ def test_training_label_omits_missing_model_number():
     assert "n_aug=0" in label
 
 
+def test_normalized_embedding_head_rows_include_n_calibration():
+    from otitenet.app.pages.learned_embedding import _normalize_head_entry
+
+    row = _normalize_head_entry(
+        {"config": "baseline_ridge", "valid_mcc": 0.42, "n_aug": 0},
+        {"Model ID": 1, "Model Name": "resnet18"},
+        model_args=Namespace(task="otitis_four_class", n_calibration=4),
+    )
+
+    assert row["n_calibration"] == 4
+    assert row["N_Calibration"] == 4
+
+
 def test_knn_head_progress_reports_each_head():
     from otitenet.app.pages.learned_embedding import _compute_knn_heads
 
