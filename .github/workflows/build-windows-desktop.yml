@@ -35,9 +35,7 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: |
-            package-lock.json
-            desktop/package-lock.json
+          cache-dependency-path: desktop/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -61,7 +59,6 @@ jobs:
       - name: Install frontend dependencies
         shell: pwsh
         run: |
-          npm ci
           Push-Location desktop
           npm ci
           Pop-Location
