@@ -117,6 +117,7 @@ sitecustomize.py
 # Windows desktop workflow inputs
 !package.json
 !package-lock.json
+
 !packaging/
 !packaging/pyinstaller/
 !packaging/pyinstaller/hooks/
@@ -124,16 +125,18 @@ sitecustomize.py
 packaging/pyinstaller/hooks/__pycache__/
 !packaging/pyinstaller/otitenet_streamlit.spec
 !packaging/pyinstaller/streamlit_entrypoint.py
+
 !desktop/
 !desktop/index.html
 !desktop/package.json
 !desktop/package-lock.json
 !desktop/tsconfig.json
 !desktop/vite.config.ts
+
 !desktop/src/
 !desktop/src/**
+
 !desktop/src-tauri/
-desktop/src-tauri/gen/
 !desktop/src-tauri/Cargo.lock
 !desktop/src-tauri/Cargo.toml
 !desktop/src-tauri/build.rs
@@ -143,3 +146,9 @@ desktop/src-tauri/gen/
 !desktop/src-tauri/src/**
 !desktop/src-tauri/icons/
 !desktop/src-tauri/icons/**
+
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/binaries/
+desktop/src-tauri/gen/
+desktop/src-tauri/target/

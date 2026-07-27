@@ -1,6 +1,6 @@
 args:
   exp_id: paper_prevbest_four_classes_220726_PAPER_E03_PREVBEST_R01_N16_S42
-  uuid: 5db8404f-64e2-4688-a1c4-74836a0b7128
+  uuid: e0eb8509-1291-4492-8a21-ac6d1b696ce7
   task: four_classes_220726
   model_name: resnet18
   path: data/otite_ds_64/USA_Turquie_Chili_GMFUNL_inference
@@ -15,7 +15,7 @@ args:
   normalize: true
   n_epochs: 1000
   n_trials: 20
-  trial_index: 4
+  trial_index: 5
   bs: 32
   dloss: inverseTriplet
   classif_loss: ce
@@ -36,28 +36,28 @@ args:
   device: cuda:0
 optimized_params:
   dist_fct: cosine
-  dmargin: 0.06505159298527952
+  dmargin: 0.4951769101112702
   dropout: 0.0
   epsilon: 0
-  gamma: 62.451395747430766
+  gamma: 0.013726318898045875
   is_transform: 1
-  lr: 3.489018845491386e-05
+  lr: 8.200518402245835e-06
   margin: 0
-  n_aug: 5
-  n_neighbors: 9
+  n_aug: 2
+  n_neighbors: 8
   normalize: false
   optimizer_type: adam
-  smoothing: 0.009290082543999545
-  wd: 3.5849855803404713e-05
+  smoothing: 0.1368466053024314
+  wd: 3.855073690026179e-08
 run:
-  foldername: 5db8404f-64e2-4688-a1c4-74836a0b7128
-  complete_log_path: logs/four_classes_220726/5db8404f-64e2-4688-a1c4-74836a0b7128
+  foldername: e0eb8509-1291-4492-8a21-ac6d1b696ce7
+  complete_log_path: logs/four_classes_220726/e0eb8509-1291-4492-8a21-ac6d1b696ce7
 code:
-  git_commit: 8d1d8f55114dbda28a7bba9434a50bdef7fd8ada
+  git_commit: 08dcca7aa719073f8aa498dbe9f834e4d36d5a75
   git_branch: main
   git_dirty: true
   requirements_sha256: 72acfb144a71f6b33fbe54cd10cfb0ef1387bfed8a470727c472ad78c0c038ea
 dvc:
   selected_paths: data/otite_ds_64/USA_Turquie_Chili_GMFUNL_inference;data;logs/best_models
   selected_dvc_files: data.dvc;logs/best_models.dvc
-  selected_md5s: 4164aea77091cc10e2a40a6c1662bea3.dir;4164aea77091cc10e2a40a6c1662bea3.dir;96beebccebc8db68da9f1905353963c6.dir
+  selected_md5s: 377fdeffba15e7a2a8cccc22d1717a25.dir;377fdeffba15e7a2a8cccc22d1717a25.dir;96beebccebc8db68da9f1905353963c6.dir
