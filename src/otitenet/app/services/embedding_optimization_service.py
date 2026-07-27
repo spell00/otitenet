@@ -158,6 +158,7 @@ def args_from_model_row(base_args, row_dict: dict):
         "NNeg": "n_negatives",
         "nneg": "n_negatives",
         "N_Calibration": "n_calibration",
+        "n_cal": "n_calibration",
         "n_calibration": "n_calibration",
         "N_Neighbors": "n_neighbors",
         "n_neighbors": "n_neighbors",

@@ -1,9 +1,20 @@
 from pathlib import Path
+import os
 import sys
 
 SRC = Path(__file__).resolve().parent / "src"
 if SRC.exists() and str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+if os.environ.get("OTITENET_DEBUGPY_WAIT", "").strip().lower() in {"1", "true", "yes"}:
+    import debugpy
+
+    debug_host = os.environ.get("OTITENET_DEBUGPY_HOST", "127.0.0.1")
+    debug_port = int(os.environ.get("OTITENET_DEBUGPY_PORT", "5679"))
+    debugpy.listen((debug_host, debug_port))
+    print(f"Waiting for debugger attach on {debug_host}:{debug_port}...", flush=True)
+    debugpy.wait_for_client()
+    debugpy.breakpoint()
 
 import streamlit as st
 
@@ -21,7 +32,6 @@ from otitenet.app.bootstrap import (
     load_production_model,
 )
 from otitenet.app.components.account_sidebar import (
-    render_labeling_task_sidebar,
     render_current_optimization_sidebar,
     render_person_sidebar,
     require_login,
@@ -53,8 +63,6 @@ initialize_user_state()
 require_login(conn, cursor)
 
 is_admin = is_current_user_admin()
-render_labeling_task_sidebar()
-load_production_model(cursor)
 
 st.title("Ear Health Classifier with SHAP 👂")
 
@@ -111,6 +119,8 @@ args = build_args_from_sidebar(
     is_admin=is_admin,
     data_dir=data_dir,
 )
+
+load_production_model(cursor)
 
 if not is_admin:
     args = apply_production_model_to_args(

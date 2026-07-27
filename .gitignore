@@ -102,7 +102,9 @@ best_models_old/
 completed_runs_metrics.csv
 
 .cometml-runs/
-.github/
+.github/*
+!.github/workflows/
+!.github/workflows/*.yml
 .streamlit/
 best_models_old/
 desktop/

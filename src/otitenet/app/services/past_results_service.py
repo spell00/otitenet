@@ -25,6 +25,7 @@ PAST_RESULTS_COLUMNS = [
     "FGSM",
     "Normalize",
     "N_Calibration",
+    "n_cal",
     "Classif_Loss",
     "DLoss",
     "Dist_Fct",

@@ -20,6 +20,7 @@ from otitenet.app.utils import (
     _unique_preserve_order,
     assign_stable_model_ids,
     attach_task_column,
+    dedupe_model_rows,
     filter_models_df_by_task,
     get_split_mcc_metrics,
     get_model_order_metric,
@@ -77,17 +78,25 @@ def _available_dataset_paths(data_dir: str) -> list[str]:
 
 
 def _infer_new_size_from_dataset_path(dataset_path: str, default: int = 224) -> int:
-    match = re.search(r"(?:^|/)otite_ds_(\d+)(?:/|$)", str(dataset_path or ""))
+    try:
+        dataset_text = "" if dataset_path is None or pd.isna(dataset_path) else str(dataset_path)
+    except Exception:
+        dataset_text = str(dataset_path or "")
+    match = re.search(r"(?:^|/)otite_ds_(\d+)(?:/|$)", dataset_text)
     if match:
         return int(match.group(1))
     try:
-        return int(str(dataset_path).split("_")[-1])
+        return int(dataset_text.split("_")[-1])
     except Exception:
         return default
 
 
 def _canonical_dataset_path(dataset_path: str) -> str:
-    text = str(dataset_path or "").strip().replace("\\", "/")
+    try:
+        text = "" if dataset_path is None or pd.isna(dataset_path) else str(dataset_path)
+    except Exception:
+        text = str(dataset_path or "")
+    text = text.strip().replace("\\", "/")
     return text
 
 
@@ -261,44 +270,45 @@ def _progress_manifest_model_rows(task: str = "", model_name: str = "") -> pd.Da
         if "job_state" in df.columns:
             df = df[df["job_state"].astype(str).str.lower() == "done"]
         for _, row in df.iterrows():
-            dataset = str(row.get("dataset_name") or row.get("dataset_key") or "").strip().replace("\\", "/")
+            dataset = str(_first_value(row.get("dataset_name"), row.get("dataset_key"), default="")).strip().replace("\\", "/")
             if dataset and "/" not in dataset and dataset.startswith("otite_ds_"):
                 parts = dataset.split("_", 3)
                 if len(parts) == 4:
                     dataset = f"{parts[0]}_{parts[1]}_{parts[2]}/{parts[3]}"
             dataset = _canonical_dataset_path(dataset)
 
-            task_value = str(row.get("task") or task_text).strip() or task_text
-            uuid = str(row.get("uuid") or "").strip()
+            task_value = str(_first_value(row.get("task"), task_text, default=task_text)).strip() or task_text
+            uuid = str(_first_value(row.get("uuid"), default="")).strip()
             source_run_path = os.path.join("logs", task_value, uuid) if uuid else ""
             if source_run_path and not os.path.isdir(source_run_path):
                 source_run_path = ""
-            log_path = source_run_path or str(row.get("stdout_file") or row.get("log_file") or "").strip()
-            classif_loss = str(row.get("classif_loss") or "").strip() or str(row.get("loss") or "").strip()
+            log_path = source_run_path or str(_first_value(row.get("stdout_file"), row.get("log_file"), default="")).strip()
+            classif_loss = str(_first_value(row.get("classif_loss"), row.get("loss"), default="")).strip()
             split_key = split_config_key(row.get("train_datasets"), row.get("valid_dataset"), row.get("test_dataset"))
             rows.append(
                 {
-                    "exp ID": str(row.get("exp_id") or row.get("job_id") or uuid or "").strip(),
-                    "Model Name": str(row.get("model") or model_name or "").strip(),
-                    "NSize": str(row.get("new_size") or "").strip(),
-                    "FGSM": str(row.get("fgsm") or "").strip(),
-                    "Prototypes": str(row.get("prototype") or row.get("prototypes") or "").strip(),
-                    "NPos": str(row.get("n_positives") or "").strip(),
-                    "NNeg": str(row.get("n_negatives") or "").strip(),
-                    "DLoss": str(row.get("dloss") or "").strip(),
-                    "Dist_Fct": str(row.get("dist_fct") or "").strip(),
+                    "exp ID": str(_first_value(row.get("exp_id"), row.get("job_id"), uuid, default="")).strip(),
+                    "Model Name": str(_first_value(row.get("model"), model_name, default="")).strip(),
+                    "NSize": str(_first_value(row.get("new_size"), default="")).strip(),
+                    "FGSM": str(_first_value(row.get("fgsm"), default="")).strip(),
+                    "Prototypes": str(_first_value(row.get("prototype"), row.get("prototypes"), default="")).strip(),
+                    "NPos": str(_first_value(row.get("n_positives"), default="")).strip(),
+                    "NNeg": str(_first_value(row.get("n_negatives"), default="")).strip(),
+                    "DLoss": str(_first_value(row.get("dloss"), default="")).strip(),
+                    "Dist_Fct": str(_first_value(row.get("dist_fct"), default="")).strip(),
                     "Classif_Loss": classif_loss,
-                    "N_Calibration": str(row.get("n_calibration") or "").strip(),
+                    "N_Calibration": str(_first_value(row.get("n_calibration"), default="")).strip(),
+                    "n_cal": str(_first_value(row.get("n_cal"), row.get("n_calibration"), default="")).strip(),
                     "Accuracy": pd.NA,
                     "MCC": pd.NA,
-                    "Normalize": str(row.get("normalize") or "").strip(),
-                    "N_Neighbors": str(row.get("knn") or row.get("n_neighbors") or "").strip(),
+                    "Normalize": str(_first_value(row.get("normalize"), default="")).strip(),
+                    "N_Neighbors": str(_first_value(row.get("knn"), row.get("n_neighbors"), default="")).strip(),
                     "Log Path": log_path,
-                    "Proto_Strat": str(row.get("prototype_strategy") or "").strip(),
-                    "Proto_Comp": str(row.get("prototype_components") or "").strip(),
-                    "train_datasets": str(row.get("train_datasets") or "").strip(),
-                    "valid_dataset": str(row.get("valid_dataset") or "").strip(),
-                    "test_dataset": str(row.get("test_dataset") or "").strip(),
+                    "Proto_Strat": str(_first_value(row.get("prototype_strategy"), default="")).strip(),
+                    "Proto_Comp": str(_first_value(row.get("prototype_components"), default="")).strip(),
+                    "train_datasets": str(_first_value(row.get("train_datasets"), default="")).strip(),
+                    "valid_dataset": str(_first_value(row.get("valid_dataset"), default="")).strip(),
+                    "test_dataset": str(_first_value(row.get("test_dataset"), default="")).strip(),
                     "split_config_key": split_key,
                     "Artifact ID": uuid,
                     "Best Model Dir": source_run_path or log_path,
@@ -310,6 +320,43 @@ def _progress_manifest_model_rows(task: str = "", model_name: str = "") -> pd.Da
                 }
             )
     return pd.DataFrame(rows)
+
+
+def _append_manifest_model_rows(base_df: pd.DataFrame, manifest_df: pd.DataFrame) -> pd.DataFrame:
+    """Append manifest rows after aligning columns, tolerating an empty manifest."""
+    if manifest_df is None or manifest_df.empty:
+        return base_df.copy()
+    if base_df is None or base_df.empty:
+        return manifest_df.copy()
+
+    out = base_df.copy()
+    manifest_aligned = manifest_df.copy()
+    for col in out.columns:
+        if col not in manifest_aligned.columns:
+            manifest_aligned[col] = pd.NA
+    for col in manifest_aligned.columns:
+        if col not in out.columns:
+            out[col] = pd.NA
+    return pd.concat([out, manifest_aligned[out.columns]], ignore_index=True)
+
+
+def _has_value(value) -> bool:
+    if value is None:
+        return False
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        missing = False
+    if isinstance(missing, bool) and missing:
+        return False
+    return str(value).strip() not in {"", "None", "nan", "NaN", "<NA>", "—"}
+
+
+def _first_value(*values, default=None):
+    for value in values:
+        if _has_value(value):
+            return value
+    return default
 
 
 def _prefer_source_artifact_paths(df: pd.DataFrame) -> pd.DataFrame:
@@ -333,8 +380,8 @@ def _prefer_source_artifact_paths(df: pd.DataFrame) -> pd.DataFrame:
 
 def _validate_and_resolve_dataset(params_dict: dict, data_dir: str = './data') -> dict:
     """Validate the Dataset key inside the params_dict, replacing with a valid folder if needed."""
-    task = params_dict.get("Task") or params_dict.get("task") or "otite"
-    model_name = params_dict.get("Model Name") or params_dict.get("model_name") or "default"
+    task = _first_value(params_dict.get("Task"), params_dict.get("task"), default="otite")
+    model_name = _first_value(params_dict.get("Model Name"), params_dict.get("model_name"), default="default")
     dataset = _canonical_dataset_path(params_dict.get("Dataset"))
     
     # Strip any data/ prefix
@@ -377,45 +424,52 @@ def _validate_and_resolve_dataset(params_dict: dict, data_dir: str = './data') -
 def _args_namespace_from_model_row(model_row: dict) -> argparse.Namespace:
     """Build an args-like namespace from a Quick Model Selection / registry row."""
     row = dict(model_row)
-    parse_path = (
-        row.get("Best Model Dir")
-        or row.get("best_model_dir")
-        or row.get("Log Path")
-        or row.get("log_path")
+    parse_path = _first_value(
+        row.get("Best Model Dir"),
+        row.get("best_model_dir"),
+        row.get("Log Path"),
+        row.get("log_path"),
     )
     row.update(extract_params_from_log_path(parse_path))
     row = _validate_and_resolve_dataset(row)
-    dataset = row.get("Dataset") or row.get("path") or "otite_ds_64"
+    dataset = _first_value(row.get("Dataset"), row.get("path"), default="otite_ds_64")
     if isinstance(dataset, str) and not dataset.startswith("data/"):
         dataset = f"data/{dataset}"
-    proto_comp = row.get("Proto_Comp") or row.get("prototype_components") or 1
+    proto_comp = _first_value(row.get("Proto_Comp"), row.get("prototype_components"), default=1)
     try:
         proto_comp = int(proto_comp)
     except (TypeError, ValueError):
         proto_comp = 1
     return argparse.Namespace(
-        task=row.get("Task") or row.get("task") or "otite",
-        model_name=row.get("Model Name") or row.get("model_name"),
+        task=_first_value(row.get("Task"), row.get("task"), default="otite"),
+        model_name=_first_value(row.get("Model Name"), row.get("model_name")),
         path=dataset,
-        new_size=ensure_int(row.get("NSize") or row.get("new_size") or 64),
-        fgsm=str(row.get("FGSM") or row.get("fgsm") or "0"),
-        n_calibration=str(row.get("N_Calibration") or row.get("n_calibration") or "0"),
-        classif_loss=str(row.get("Classif_Loss") or row.get("classif_loss") or "triplet"),
-        dloss=str(row.get("DLoss") or row.get("dloss") or "triplet"),
-        prototypes_to_use=str(row.get("Prototypes") or row.get("prototypes_to_use") or "class"),
-        n_positives=str(row.get("NPos") or row.get("n_positives") or "1"),
-        n_negatives=str(row.get("NNeg") or row.get("n_negatives") or "1"),
-        normalize=str(row.get("Normalize") or row.get("normalize") or "no"),
-        dist_fct=str(row.get("Dist_Fct") or row.get("dist_fct") or "euclidean"),
-        n_neighbors=int(row.get("N_Neighbors") or row.get("n_neighbors") or 1),
-        prototype_strategy=str(row.get("Proto_Strat") or row.get("prototype_strategy") or "mean"),
+        new_size=ensure_int(_first_value(row.get("NSize"), row.get("new_size"), default=64)),
+        fgsm=str(_first_value(row.get("FGSM"), row.get("fgsm"), default="0")),
+        n_calibration=str(_first_value(row.get("n_cal"), row.get("N_Calibration"), row.get("n_calibration"), default="0")),
+        classif_loss=str(_first_value(row.get("Classif_Loss"), row.get("classif_loss"), default="triplet")),
+        dloss=str(_first_value(row.get("DLoss"), row.get("dloss"), default="triplet")),
+        prototypes_to_use=str(_first_value(row.get("Prototypes"), row.get("prototypes_to_use"), default="class")),
+        n_positives=str(_first_value(row.get("NPos"), row.get("n_positives"), default="1")),
+        n_negatives=str(_first_value(row.get("NNeg"), row.get("n_negatives"), default="1")),
+        normalize=str(_first_value(row.get("Normalize"), row.get("normalize"), default="no")),
+        dist_fct=str(_first_value(row.get("Dist_Fct"), row.get("dist_fct"), default="euclidean")),
+        n_neighbors=int(_first_value(row.get("N_Neighbors"), row.get("n_neighbors"), default=1)),
+        prototype_strategy=str(_first_value(row.get("Proto_Strat"), row.get("prototype_strategy"), default="mean")),
         prototype_components=proto_comp,
-        train_datasets=str(row.get("train_datasets") or row.get("Train Datasets") or ""),
-        valid_dataset=str(row.get("valid_dataset") or row.get("Valid Dataset") or ""),
-        test_dataset=str(row.get("test_dataset") or row.get("Test Dataset") or ""),
-        split_config_in_path=bool(row.get("_split_config_in_path") or row.get("Split Segment") or row.get("split_config_key")),
-        _split_config_in_path=bool(row.get("_split_config_in_path") or row.get("Split Segment") or row.get("split_config_key")),
-        log_path=str(row.get("Artifact Log Path") or row.get("Log Path") or row.get("log_path") or ""),
+        train_datasets=str(_first_value(row.get("train_datasets"), row.get("Train Datasets"), default="")),
+        valid_dataset=str(_first_value(row.get("valid_dataset"), row.get("Valid Dataset"), default="")),
+        test_dataset=str(_first_value(row.get("test_dataset"), row.get("Test Dataset"), default="")),
+        split_config_in_path=_has_value(_first_value(row.get("_split_config_in_path"), row.get("Split Segment"), row.get("split_config_key"))),
+        _split_config_in_path=_has_value(_first_value(row.get("_split_config_in_path"), row.get("Split Segment"), row.get("split_config_key"))),
+        log_path=str(_first_value(
+            row.get("Artifact Log Path"),
+            row.get("Best Model Dir"),
+            row.get("Source Run Path"),
+            row.get("Log Path"),
+            row.get("log_path"),
+            default="",
+        )),
     )
 
 
@@ -525,13 +579,13 @@ def _resolve_production_head_config(row: dict, selected_head_config=None):
     if selected_head_config is not None and str(selected_head_config).strip() not in {"", "None", "nan", "—"}:
         return selected_head_config
     row = row or {}
-    return (
-        row.get('Best Head Config')
-        or row.get('Head Config')
-        or row.get('head_config')
-        or row.get('classification_head_config')
-        or row.get('best_classifier_config')
-        or "baseline_linear_svc"
+    return _first_value(
+        row.get('Best Head Config'),
+        row.get('Head Config'),
+        row.get('head_config'),
+        row.get('classification_head_config'),
+        row.get('best_classifier_config'),
+        default="baseline_linear_svc",
     )
 
 
@@ -539,12 +593,12 @@ def _resolve_production_head_n_aug(row: dict, selected_head_n_aug=None):
     if selected_head_n_aug is not None and str(selected_head_n_aug).strip() not in {"", "None", "nan", "—"}:
         return selected_head_n_aug
     row = row or {}
-    return (
-        row.get('Head N Aug')
-        or row.get('Best Head N Aug')
-        or row.get('best_head_n_aug')
-        or row.get('N Aug')
-        or row.get('n_aug')
+    return _first_value(
+        row.get('Head N Aug'),
+        row.get('Best Head N Aug'),
+        row.get('best_head_n_aug'),
+        row.get('N Aug'),
+        row.get('n_aug'),
     )
 
 
@@ -680,17 +734,17 @@ def _split_segment_from_params(params: dict) -> str:
     if not params:
         return ""
     explicit = params.get("Split Segment")
-    if explicit and str(explicit).strip() not in {"", "None", "nan"}:
+    if _has_value(explicit):
         return str(explicit).strip()
     split_key = params.get("split_config_key")
-    if split_key and str(split_key).strip() not in {"", "None", "nan"}:
+    if _has_value(split_key):
         train_datasets, valid_dataset, test_dataset = (str(split_key).replace(";", ",").split("|") + ["", "", ""])[:3]
         return split_config_segment(train_datasets, valid_dataset, test_dataset)
-    if params.get("_split_config_in_path") or params.get("split_config_in_path"):
+    if _has_value(params.get("_split_config_in_path")) or _has_value(params.get("split_config_in_path")):
         return split_config_segment(
-            params.get("train_datasets") or params.get("Train Datasets") or "",
-            params.get("valid_dataset") or params.get("Valid Dataset") or "",
-            params.get("test_dataset") or params.get("Test Dataset") or "",
+            _first_value(params.get("train_datasets"), params.get("Train Datasets"), default=""),
+            _first_value(params.get("valid_dataset"), params.get("Valid Dataset"), default=""),
+            _first_value(params.get("test_dataset"), params.get("Test Dataset"), default=""),
         )
     return ""
 
@@ -751,8 +805,8 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
     
     active_task = st.session_state.get("production_task")
     selected_params = st.session_state.get('selected_model_params') or {}
-    selected_task = selected_params.get("Task") or selected_params.get("task")
-    if active_task and selected_task and str(selected_task) != str(active_task):
+    selected_task = _first_value(selected_params.get("Task"), selected_params.get("task"))
+    if _has_value(active_task) and _has_value(selected_task) and str(selected_task) != str(active_task):
         selected_params = {}
         for key in [
             "selected_model_params",
@@ -790,7 +844,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         if not task_list:
             st.error("No tasks found in the best-model registry or logs/best_models.")
             st.stop()
-        task_default = selected_params.get("Task") or active_task
+        task_default = _first_value(selected_params.get("Task"), active_task)
         sync_value('task_selectbox', task_default)
         _safe_selectbox_sync('task_selectbox', task_list, task_default)
         task = st.selectbox("task", task_list, key="task_selectbox")
@@ -1047,23 +1101,27 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                     _df_from_leaderboard = True
                 except Exception as e:
                     st.warning(f"Could not load from leaderboard ({e}), falling back to database+manifest")
-                    _df = pd.concat([_df, _manifest_model_df[_df.columns]], ignore_index=True)
+                    _df = _append_manifest_model_rows(_df, _manifest_model_df)
                     _df_from_leaderboard = False
             else:
                 # Use database + manifest (local processing)
-                _df = pd.concat([_df, _manifest_model_df[_df.columns]], ignore_index=True)
+                _df = _append_manifest_model_rows(_df, _manifest_model_df)
                 _df["Artifact Dataset"] = _df.apply(
                     lambda row: _canonical_dataset_path(
                         extract_params_from_log_path(
-                            row.get("Best Model Dir")
-                            or row.get("Log Path")
-                            or row.get("Source Run Path")
-                            or ""
+                            _first_value(
+                                row.get("Best Model Dir"),
+                                row.get("Log Path"),
+                                row.get("Source Run Path"),
+                                default="",
+                            )
                         ).get("Dataset", "")
-                        or row.get("Artifact Dataset")
-                        or row.get("Dataset")
-                        or row.get("Combo Dataset")
-                        or ""
+                        or _first_value(
+                            row.get("Artifact Dataset"),
+                            row.get("Dataset"),
+                            row.get("Combo Dataset"),
+                            default="",
+                        )
                     ),
                     axis=1,
                 )
@@ -1161,11 +1219,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                 "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration", "Normalize", "N_Neighbors",
                 "train_datasets", "valid_dataset", "test_dataset",
             ]
-            _dedupe_frame = _df[_group_cols].copy().fillna("").astype(str)
-            # Use row-wise join to ensure a Series (avoids pandas agg returning a DataFrame)
-            _df["_dedupe_key"] = _dedupe_frame.apply(lambda r: "|".join(r.values.tolist()), axis=1)
-            _df = _df.sort_values("MCC", ascending=False)
-            _df = _df.drop_duplicates(subset=["_dedupe_key"], keep="first").drop(columns=["_dedupe_key"])
+            _df = dedupe_model_rows(_df, _group_cols, sort_col="MCC")
             _df = _df.dropna(subset=["Log Path"])
             _df = _df[_df["Log Path"].astype(str) != ""]
             _df = _df.reset_index(drop=True)
@@ -1234,13 +1288,13 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
             if not selected_params and len(_df) > 0:
                 try:
                     best_row = _df.iloc[0].to_dict()
-                    parse_path = best_row.get("Best Model Dir") or best_row.get("Log Path")
+                    parse_path = _first_value(best_row.get("Best Model Dir"), best_row.get("Log Path"))
                     compatible_dataset = best_row.get("Dataset")
                     best_row.update(extract_params_from_log_path(parse_path))
-                    if compatible_dataset:
+                    if _has_value(compatible_dataset):
                         best_row["Dataset"] = compatible_dataset
                     best_row = _validate_and_resolve_dataset(best_row, data_dir)
-                    best_row["Task"] = best_row.get("Task") or active_task
+                    best_row["Task"] = _first_value(best_row.get("Task"), active_task)
                     if "N_Neighbors" in best_row:
                         best_row["n_neighbors"] = best_row["N_Neighbors"]
                     if "NSize" in best_row:
@@ -1325,6 +1379,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                         'Dist_Fct': rd.get('Dist_Fct'),
                         'Classif_Loss': rd.get('Classif_Loss'),
                         'N_Calibration': rd.get('N_Calibration'),
+                        'n_cal': rd.get('n_cal', rd.get('N_Calibration')),
                         'Accuracy': rd.get('Accuracy'),
                         'MCC': rd.get('MCC'),
                         'Normalize': rd.get('Normalize'),
@@ -1344,13 +1399,13 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                         'Source Run Path': rd.get('Source Run Path'),
                         'Artifact ID': rd.get('Artifact ID'),
                     }
-                    parse_path = model_dict.get("Best Model Dir") or model_dict.get("Log Path")
+                    parse_path = _first_value(model_dict.get("Best Model Dir"), model_dict.get("Log Path"))
                     compatible_dataset = model_dict.get("Dataset")
                     model_dict.update(extract_params_from_log_path(parse_path))
-                    if compatible_dataset:
+                    if _has_value(compatible_dataset):
                         model_dict["Dataset"] = compatible_dataset
                     model_dict = _validate_and_resolve_dataset(model_dict, data_dir)
-                    model_dict["Task"] = model_dict.get("Task") or active_task
+                    model_dict["Task"] = _first_value(model_dict.get("Task"), active_task)
                     if "N_Neighbors" in model_dict:
                         model_dict["n_neighbors"] = model_dict["N_Neighbors"]
                     if "NSize" in model_dict:
@@ -1387,7 +1442,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                     except Exception:
                         pass
                     try:
-                        if model_dict.get('Task'):
+                        if _has_value(model_dict.get('Task')):
                             st.session_state['production_task'] = model_dict['Task']
                     except Exception:
                         pass
@@ -1402,7 +1457,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                     except Exception:
                         pass
                     try:
-                        if model_dict.get('Dist_Fct'):
+                        if _has_value(model_dict.get('Dist_Fct')):
                             st.session_state['dist_fct_selectbox'] = str(model_dict.get('Dist_Fct')).strip().lower()
                     except Exception:
                         pass
@@ -1424,8 +1479,9 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                         except Exception:
                             pass
                     try:
-                        if model_dict.get('Normalize') in ['yes', 'no', 'per_image', 'imagenet']:
-                            st.session_state['normalize_input'] = model_dict.get('Normalize')
+                        normalize_value = model_dict.get('Normalize')
+                        if _has_value(normalize_value) and str(normalize_value) in ['yes', 'no', 'per_image', 'imagenet']:
+                            st.session_state['normalize_input'] = normalize_value
                     except Exception:
                         pass
                     st.success(f"✅ Applied: {model_dict.get('Model Name')}")
@@ -1438,7 +1494,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                 rd = key_to_row.get(selected_key)
                 if rd:
                     if st.button("🚀 Set as Production Model", key="set_production_model"):
-                        production_task = active_task or rd.get("Task") or "notNormal"
+                        production_task = _first_value(active_task, rd.get("Task"), default="notNormal")
                         model_dict = {
                             'label_task': production_task,
                             'label_scheme': label_scheme_for_task(production_task),
@@ -1456,6 +1512,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                             'Dist_Fct': rd.get('Dist_Fct'),
                             'Classif_Loss': rd.get('Classif_Loss'),
                             'N_Calibration': rd.get('N_Calibration'),
+                        'n_cal': rd.get('n_cal', rd.get('N_Calibration')),
                             'Accuracy': rd.get('Accuracy'),
                             'MCC': rd.get('MCC'),
                             'Normalize': rd.get('Normalize'),
@@ -1469,11 +1526,11 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                             'Dataset': rd.get('Dataset'),
                             'Artifact Dataset': rd.get('Artifact Dataset'),
                             'Combo Dataset': rd.get('Combo Dataset'),
-                            'Log Path': (
-                                rd.get('Log Path')
-                                or rd.get('Artifact Log Path')
-                                or rd.get('Best Model Dir')
-                                or rd.get('Source Run Path')
+                            'Log Path': _first_value(
+                                rd.get('Log Path'),
+                                rd.get('Artifact Log Path'),
+                                rd.get('Best Model Dir'),
+                                rd.get('Source Run Path'),
                             ),
                             'Artifact Log Path': rd.get('Artifact Log Path'),
                             'Best Model Dir': rd.get('Best Model Dir'),
@@ -1488,11 +1545,11 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                         runtime_dist_fct = str(
                             st.session_state.get(
                                 'dist_fct_selectbox',
-                                model_dict.get('dist_fct') or model_dict.get('Dist_Fct') or 'euclidean',
+                                _first_value(model_dict.get('dist_fct'), model_dict.get('Dist_Fct'), default='euclidean'),
                             )
                         ).strip().lower()
                         if runtime_dist_fct not in {'euclidean', 'cosine'}:
-                            runtime_dist_fct = str(model_dict.get('dist_fct') or model_dict.get('Dist_Fct') or 'euclidean').strip().lower()
+                            runtime_dist_fct = str(_first_value(model_dict.get('dist_fct'), model_dict.get('Dist_Fct'), default='euclidean')).strip().lower()
                         model_dict = _set_distance_aliases(model_dict, runtime_dist_fct)
 
                         runtime_args = argparse.Namespace(
@@ -1520,17 +1577,21 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                     if 'production_model' in st.session_state:
                         prod = st.session_state['production_model']
                         prod_head = (
-                            prod.get('Head')
-                            or prod.get('head_name')
-                            or prod.get('learned_classifier_label')
+                            _first_value(
+                                prod.get('Head'),
+                                prod.get('head_name'),
+                                prod.get('learned_classifier_label'),
+                            )
                             or format_classifier_config(
-                                prod.get('Head Config')
-                                or prod.get('head_config')
-                                or prod.get('classification_head_config')
-                                or prod.get('best_classifier_config')
+                                _first_value(
+                                    prod.get('Head Config'),
+                                    prod.get('head_config'),
+                                    prod.get('classification_head_config'),
+                                    prod.get('best_classifier_config'),
+                                )
                             )
                         )
-                        if not prod_head or str(prod_head) in {'None', 'nan', '—'}:
+                        if not _has_value(prod_head):
                             prod_head = 'head not stored yet'
                         prod_n_aug = _resolve_production_head_n_aug(prod)
                         n_aug_suffix = ""
@@ -1584,7 +1645,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
 
         if available_sizes:
             # Default from DB / selected params; fallback to first available
-            nsize_default = selected_params.get('new_size') or selected_params.get('NSize')
+            nsize_default = _first_value(selected_params.get('new_size'), selected_params.get('NSize'))
             try:
                 nsize_default = int(nsize_default) if nsize_default is not None else None
             except (TypeError, ValueError):
@@ -1595,7 +1656,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
             _safe_selectbox_sync('nsize_selectbox', available_sizes, nsize_default)
             new_size = st.selectbox("new_size (nsize)", available_sizes, key="nsize_selectbox")
         else:
-            nsize_default = selected_params.get('new_size') or selected_params.get('NSize')
+            nsize_default = _first_value(selected_params.get('new_size'), selected_params.get('NSize'))
             try:
                 new_size = int(nsize_default) if nsize_default is not None else _infer_new_size_from_dataset_path(selected_path)
             except (TypeError, ValueError):
@@ -1616,7 +1677,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         if possible_fgsm:
             fgsm_list = possible_fgsm
         else:
-            fgsm_list = [str(selected_params.get("FGSM") or selected_params.get("fgsm") or "0")]
+            fgsm_list = [str(_first_value(selected_params.get("FGSM"), selected_params.get("fgsm"), default="0"))]
             st.caption("No FGSM mirror folders found; using registry value.")
 
         fgsm_default = selected_params.get("FGSM")
@@ -1627,9 +1688,9 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         n_cal_dir = os.path.join(model_dataset_dir, fgsm)
         n_calibration_list = sorted(os.listdir(n_cal_dir)) if os.path.isdir(n_cal_dir) else []
         if not n_calibration_list:
-            n_calibration_list = [str(selected_params.get("N_Calibration") or selected_params.get("n_calibration") or "0")]
+            n_calibration_list = [str(_first_value(selected_params.get("n_cal"), selected_params.get("N_Calibration"), selected_params.get("n_calibration"), default="0"))]
             st.caption("No calibration mirror folders found; using registry value.")
-        n_calibration_default = selected_params.get("N_Calibration")
+        n_calibration_default = _first_value(selected_params.get("n_cal"), selected_params.get("N_Calibration"))
         sync_value('n_calibration_selectbox', n_calibration_default)
         _safe_selectbox_sync('n_calibration_selectbox', n_calibration_list, n_calibration_default)
         n_calibration = st.selectbox("n_calibration", n_calibration_list, key="n_calibration_selectbox")
@@ -1637,9 +1698,9 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         classif_dir = os.path.join(n_cal_dir, n_calibration)
         classif_loss_list = sorted(os.listdir(classif_dir)) if os.path.isdir(classif_dir) else []
         if not classif_loss_list:
-            classif_loss_list = [str(selected_params.get("classif_loss") or selected_params.get("Classif_Loss") or "triplet")]
+            classif_loss_list = [str(_first_value(selected_params.get("classif_loss"), selected_params.get("Classif_Loss"), default="triplet"))]
             st.caption("No classif_loss mirror folders found; using registry value.")
-        classif_loss_default = selected_params.get("classif_loss") or selected_params.get("Classif_Loss")
+        classif_loss_default = _first_value(selected_params.get("classif_loss"), selected_params.get("Classif_Loss"))
         sync_value('classif_loss_selectbox', classif_loss_default)
         _safe_selectbox_sync('classif_loss_selectbox', classif_loss_list, classif_loss_default)
         classif_loss = st.selectbox("classif_loss", classif_loss_list, key="classif_loss_selectbox")
@@ -1647,7 +1708,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         dloss_dir = os.path.join(classif_dir, classif_loss)
         dloss_list = sorted(os.listdir(dloss_dir)) if os.path.isdir(dloss_dir) else []
         if not dloss_list:
-            dloss_list = [str(selected_params.get("DLoss") or selected_params.get("dloss") or "triplet")]
+            dloss_list = [str(_first_value(selected_params.get("DLoss"), selected_params.get("dloss"), default="triplet"))]
             st.caption("No dloss mirror folders found; using registry value.")
         dloss_default = selected_params.get("DLoss")
         sync_value('dloss_selectbox', dloss_default)
@@ -1657,7 +1718,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         proto_dir = os.path.join(dloss_dir, dloss)
         prototypes_list = sorted(os.listdir(proto_dir)) if os.path.isdir(proto_dir) else []
         if not prototypes_list:
-            prototypes_list = [str(selected_params.get("Prototypes") or selected_params.get("prototypes_to_use") or "class")]
+            prototypes_list = [str(_first_value(selected_params.get("Prototypes"), selected_params.get("prototypes_to_use"), default="class"))]
             st.caption("No prototype mirror folders found; using registry value.")
 
         prototypes_default = selected_params.get("Prototypes")
@@ -1686,7 +1747,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         npos_dir = os.path.join(proto_dir, prototypes_to_use)
         n_positives_list = sorted(os.listdir(npos_dir)) if os.path.isdir(npos_dir) else []
         if not n_positives_list:
-            n_positives_list = [str(selected_params.get("NPos") or selected_params.get("n_positives") or "1")]
+            n_positives_list = [str(_first_value(selected_params.get("NPos"), selected_params.get("n_positives"), default="1"))]
             st.caption("No npos mirror folders found; using registry value.")
         npos_default = str(selected_params.get("NPos")) if selected_params.get("NPos") is not None else None
         sync_value('npos_selectbox', npos_default)
@@ -1696,7 +1757,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
         nneg_dir = os.path.join(npos_dir, n_positives)
         n_negatives_list = sorted(os.listdir(nneg_dir)) if os.path.isdir(nneg_dir) else []
         if not n_negatives_list:
-            n_negatives_list = [str(selected_params.get("NNeg") or selected_params.get("n_negatives") or "1")]
+            n_negatives_list = [str(_first_value(selected_params.get("NNeg"), selected_params.get("n_negatives"), default="1"))]
             st.caption("No nneg mirror folders found; using registry value.")
         nneg_default = str(selected_params.get("NNeg")) if selected_params.get("NNeg") is not None else None
         sync_value('nneg_selectbox', nneg_default)
@@ -1745,7 +1806,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
             help="Chosen from existing saved train/valid/test combinations above.",
         )
         dist_fct_options = ['euclidean', 'cosine']
-        dist_fct_default = str(selected_params.get('dist_fct') or selected_params.get('Dist_Fct') or 'euclidean').strip().lower()
+        dist_fct_default = str(_first_value(selected_params.get('dist_fct'), selected_params.get('Dist_Fct'), default='euclidean')).strip().lower()
         if dist_fct_default not in dist_fct_options:
             dist_fct_default = 'euclidean'
 
@@ -1815,37 +1876,41 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
     args.random_recs = 0
     args.seed = 42
     args.normalize = normalize
-    args.train_datasets = str(train_datasets or selected_params.get('train_datasets', DEFAULT_APP_TRAIN_DATASETS) or DEFAULT_APP_TRAIN_DATASETS)
-    args.test_dataset = str(test_dataset or selected_params.get('test_dataset', valid_dataset) or valid_dataset)
-    args.split_config_in_path = bool(
-        selected_params.get('_split_config_in_path')
-        or selected_params.get('Split Segment')
-        or selected_params.get('split_config_key')
+    args.train_datasets = str(_first_value(train_datasets, selected_params.get('train_datasets', DEFAULT_APP_TRAIN_DATASETS), default=DEFAULT_APP_TRAIN_DATASETS))
+    args.test_dataset = str(_first_value(test_dataset, selected_params.get('test_dataset', valid_dataset), default=valid_dataset))
+    args.split_config_in_path = _has_value(
+        _first_value(
+            selected_params.get('_split_config_in_path'),
+            selected_params.get('Split Segment'),
+            selected_params.get('split_config_key'),
+        )
     )
     args._split_config_in_path = args.split_config_in_path
-    args.model_id = selected_params.get('model_id') or selected_params.get('Registry ID')
-    args.log_path = (
-        selected_params.get('Artifact Log Path')
-        or selected_params.get('Log Path')
-        or selected_params.get('log_path')
-        or st.session_state.get('selected_model_log_path')
-        or ''
+    args.model_id = _first_value(selected_params.get('model_id'), selected_params.get('Registry ID'))
+    args.log_path = _first_value(
+        selected_params.get('Artifact Log Path'),
+        selected_params.get('Best Model Dir'),
+        selected_params.get('Source Run Path'),
+        selected_params.get('Log Path'),
+        selected_params.get('log_path'),
+        st.session_state.get('selected_model_log_path'),
+        default='',
     )
     args.use_pretrained_encodings = bool(st.session_state.get('use_saved_encodings_tab1', True))
     args.use_trained_encoder = args.use_pretrained_encodings
-    args.siamese_inference = str(selected_params.get("siamese_inference") or "linearsvc")
+    args.siamese_inference = str(_first_value(selected_params.get("siamese_inference"), default="linearsvc"))
 
-    args.prototype_strategy = str(
-        selected_params.get('Proto_Strat')
-        or selected_params.get('prototype_strategy')
-        or 'mean'
-    )
+    args.prototype_strategy = str(_first_value(
+        selected_params.get('Proto_Strat'),
+        selected_params.get('prototype_strategy'),
+        default='mean',
+    ))
     try:
-        args.prototype_components = int(
-            selected_params.get('Proto_Comp')
-            or selected_params.get('prototype_components')
-            or 1
-        )
+        args.prototype_components = int(_first_value(
+            selected_params.get('Proto_Comp'),
+            selected_params.get('prototype_components'),
+            default=1,
+        ))
     except (TypeError, ValueError):
         args.prototype_components = 1
 
@@ -1860,17 +1925,17 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                 args.n_aug = int(float(str(selected_head_n_aug)))
             except Exception:
                 args.n_aug = selected_head_n_aug
-    if selected_head:
+    if _has_value(selected_head):
         args.best_classifier_config = str(selected_head)
     else:
-        selected_params_head = (
-            selected_params.get('best_classifier_config')
-            or selected_params.get('classification_head_config')
-            or selected_params.get('Head Config')
-            or selected_params.get('Best Head Config')
-            or selected_params.get('head_config')
+        selected_params_head = _first_value(
+            selected_params.get('best_classifier_config'),
+            selected_params.get('classification_head_config'),
+            selected_params.get('Head Config'),
+            selected_params.get('Best Head Config'),
+            selected_params.get('head_config'),
         )
-        if selected_params_head is not None and str(selected_params_head).strip() not in {"", "None", "nan", "—"}:
+        if _has_value(selected_params_head):
             args.best_classifier_config = str(selected_params_head)
             selected_head_n_aug = _resolve_production_head_n_aug(selected_params)
             if selected_head_n_aug is not None:

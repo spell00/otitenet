@@ -49,6 +49,7 @@ from otitenet.app.utils import (
 )
 from otitenet.app.utils_dataset_names import get_short_dataset_name, get_short_dataset_names
 from otitenet.data.data_getters import get_images_loaders
+from otitenet.data.labels import labels_for_task
 from otitenet.logging.metrics import MCC
 from otitenet.train.train_triplet_new import TrainAE
 from otitenet.utils.encoding_utils import (
@@ -85,6 +86,60 @@ def _safe_metric(value, digits: int = 4) -> str:
     return f"{value:.{digits}f}"
 
 
+def _has_value(value) -> bool:
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+    return str(value).strip() not in {"", "nan", "None", "<NA>"}
+
+
+def _first_value(*values, default=None):
+    for value in values:
+        if _has_value(value):
+            return value
+    return default
+
+
+def _clean_str(value, default: str = "") -> str:
+    value = _first_value(value, default=default)
+    return str(value).strip()
+
+
+def _checkpoint_class_count_for_run_dir(run_dir: str) -> Optional[int]:
+    run_dir = _clean_str(run_dir)
+    if not run_dir:
+        return None
+    model_path = run_dir if run_dir.endswith(".pth") else os.path.join(run_dir, "model.pth")
+    if not os.path.exists(model_path):
+        return None
+    try:
+        checkpoint = torch.load(model_path, map_location="cpu")
+        state = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        if not isinstance(state, dict):
+            return None
+        for key, value in state.items():
+            if str(key).endswith("subcenters") or str(key) == "subcenters":
+                if value is not None and hasattr(value, "shape") and len(value.shape) > 0:
+                    return int(value.shape[0])
+    except Exception:
+        return None
+    return None
+
+
+def _model_artifact_matches_task(run_dir: str, task: object) -> bool:
+    checkpoint_n_cats = _checkpoint_class_count_for_run_dir(run_dir)
+    if checkpoint_n_cats is None:
+        return True
+    try:
+        return checkpoint_n_cats == len(labels_for_task(task))
+    except Exception:
+        return True
+
+
 def _clone_args(args):
     """Copy argparse-like args safely."""
     try:
@@ -99,11 +154,13 @@ def _apply_model_row_to_args(args, row_dict: Dict[str, Any]):
     row = dict(row_dict or {})
 
     parsed = extract_params_from_log_path(
-        row.get("Best Model Dir")
-        or row.get("best_model_dir")
-        or row.get("Log Path")
-        or row.get("log_path")
-        or ""
+        _first_value(
+            row.get("Best Model Dir"),
+            row.get("best_model_dir"),
+            row.get("Log Path"),
+            row.get("log_path"),
+            default="",
+        )
     )
     row.update({k: v for k, v in parsed.items() if v is not None})
 
@@ -119,23 +176,23 @@ def _apply_model_row_to_args(args, row_dict: Dict[str, Any]):
     }
 
     for row_key, arg_key in mapping.items():
-        if row.get(row_key) is not None:
+        if _has_value(row.get(row_key)):
             setattr(local_args, arg_key, row.get(row_key))
 
-    if row.get("NSize") is not None:
+    if _has_value(row.get("NSize")):
         local_args.new_size = ensure_int(row.get("NSize"))
-    if row.get("NPos") is not None:
+    if _has_value(row.get("NPos")):
         local_args.n_positives = ensure_int(row.get("NPos"))
-    if row.get("NNeg") is not None:
+    if _has_value(row.get("NNeg")):
         local_args.n_negatives = ensure_int(row.get("NNeg"))
-    if row.get("N_Neighbors") is not None:
+    if _has_value(row.get("N_Neighbors")):
         local_args.n_neighbors = ensure_int(row.get("N_Neighbors"))
 
-    proto_strat = row.get("Proto_Strat") or row.get("prototype_strategy")
-    proto_comp = row.get("Proto_Comp") or row.get("prototype_components")
-    if proto_strat is not None:
+    proto_strat = _first_value(row.get("Proto_Strat"), row.get("prototype_strategy"))
+    proto_comp = _first_value(row.get("Proto_Comp"), row.get("prototype_components"))
+    if _has_value(proto_strat):
         local_args.prototype_strategy = proto_strat
-    if proto_comp is not None:
+    if _has_value(proto_comp):
         local_args.prototype_components = ensure_int(proto_comp)
 
     for row_key, arg_key in {
@@ -146,15 +203,15 @@ def _apply_model_row_to_args(args, row_dict: Dict[str, Any]):
         "test_dataset": "test_dataset",
         "Test Dataset": "test_dataset",
     }.items():
-        if row.get(row_key) is not None:
+        if _has_value(row.get(row_key)):
             setattr(local_args, arg_key, row.get(row_key))
 
-    if row.get("_split_config_in_path") or row.get("Split Segment") or row.get("split_config_key"):
+    if _first_value(row.get("_split_config_in_path"), row.get("Split Segment"), row.get("split_config_key")) is not None:
         local_args.split_config_in_path = True
         local_args._split_config_in_path = True
 
-    dataset = row.get("Dataset") or parsed.get("Dataset")
-    if dataset:
+    dataset = _first_value(row.get("Dataset"), parsed.get("Dataset"))
+    if _has_value(dataset):
         dataset = str(dataset)
         local_args.path = dataset if dataset.startswith("data/") else os.path.join("data", dataset)
 
@@ -168,20 +225,22 @@ def top_models_head_label(row_dict, args):
         row = dict(row_dict or {})
 
         head_config = row.get("Head Config")
-        if head_config is not None and str(head_config).strip() not in {"", "nan", "None"}:
+        if _has_value(head_config):
             stored_head = row.get("Head")
-            if stored_head is not None and str(stored_head).strip() not in {"", "nan", "None", "—"}:
+            if _has_value(stored_head) and str(stored_head).strip() != "—":
                 return str(stored_head)
-        if head_config is None or str(head_config).strip() in {"", "nan", "None"}:
+        if not _has_value(head_config):
             head_config = resolve_best_classifier_config(local_args, use_optimized=True)
 
         metadata = _load_model_row_metadata(row)
         metadata_args = metadata.get("args", {}) if isinstance(metadata, dict) else {}
-        kind = str(metadata_args.get("kind") or metadata.get("kind", "") if isinstance(metadata, dict) else "").strip().lower()
-        variant = str(metadata_args.get("variant") or metadata.get("variant", "") if isinstance(metadata, dict) else "").strip().lower()
-        exp_id = str(metadata_args.get("exp_id") or "").strip().lower()
+        kind = _clean_str(_first_value(metadata_args.get("kind"), metadata.get("kind", "") if isinstance(metadata, dict) else "")).lower()
+        variant = _clean_str(_first_value(metadata_args.get("variant"), metadata.get("variant", "") if isinstance(metadata, dict) else "")).lower()
+        exp_id = _clean_str(metadata_args.get("exp_id")).lower()
         complete_log_path = str(metadata.get("complete_log_path", "") if isinstance(metadata, dict) else "").strip().lower()
-        siamese_inference = str(metadata_args.get("siamese_inference") or getattr(local_args, "siamese_inference", "linearsvc")).strip().lower()
+        siamese_inference = _clean_str(
+            _first_value(metadata_args.get("siamese_inference"), getattr(local_args, "siamese_inference", "linearsvc"))
+        ).lower()
 
         classif_loss = str(getattr(local_args, "classif_loss", "")).lower()
         is_cnn_mlp = (
@@ -213,7 +272,7 @@ def top_models_head_label(row_dict, args):
                 return "Logistic Regression"
             return "Linear SVC"
 
-        if head_config is None or str(head_config).strip() in {"", "nan", "None"}:
+        if not _has_value(head_config):
             if siamese_inference == "knn":
                 return f"KNN (nn={ensure_int(row.get('N_Neighbors'))})"
             if siamese_inference == "logisticregression":
@@ -237,8 +296,8 @@ def top_models_head_label(row_dict, args):
 
 
 def _load_model_row_metadata(row: dict) -> dict:
-    log_path = row.get("Log Path") or row.get("log_path")
-    if not log_path:
+    log_path = _first_value(row.get("Log Path"), row.get("log_path"))
+    if not _has_value(log_path):
         return {}
 
     candidates = [
@@ -378,6 +437,15 @@ def _models_dataframe_from_rows(rows: List[tuple], use_db_rank: bool) -> pd.Data
         if preferred:
             df.at[idx, "Artifact Log Path"] = preferred
             df.at[idx, "Log Path"] = preferred
+        dataset = _first_value(row.get("Dataset"), row.get("Artifact Dataset"))
+        if not _has_value(dataset):
+            for path_key in ("Best Model Dir", "Artifact Log Path", "Log Path", "Source Run Path"):
+                parsed_dataset = extract_params_from_log_path(df.at[idx, path_key] if path_key in df.columns else "").get("Dataset")
+                if _has_value(parsed_dataset):
+                    dataset = parsed_dataset
+                    break
+        if _has_value(dataset):
+            df.at[idx, "Dataset"] = str(dataset).strip().replace("\\", "/")
 
     if "MCC" in df.columns or "Valid MCC" in df.columns:
         # Rank by valid_mcc (cv=3, same as Optuna sweep); fall back to mcc for legacy rows.
@@ -467,6 +535,25 @@ def _dataset_path_from_manifest_value(value: Any) -> str:
     return dataset
 
 
+def _dataset_path_from_run_metadata(run_path: str) -> str:
+    """Return the trained dataset path segment from a run_metadata.json file."""
+    if not run_path:
+        return ""
+    metadata_path = os.path.join(str(run_path), "run_metadata.json")
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return ""
+    args_payload = payload.get("args") if isinstance(payload, dict) else None
+    if not isinstance(args_payload, dict):
+        return ""
+    dataset = str(args_payload.get("path", "") or "").strip().replace("\\", "/")
+    if dataset.startswith("data/"):
+        dataset = dataset[len("data/") :]
+    return dataset
+
+
 def _progress_manifest_models_dataframe(task: Optional[str] = None) -> pd.DataFrame:
     task_text = str(task or "").strip()
     roots = []
@@ -484,8 +571,6 @@ def _progress_manifest_models_dataframe(task: Optional[str] = None) -> pd.DataFr
                 name for name in filenames
                 if name.startswith("PROD_") and name.endswith("_job_manifest.csv")
             ]
-            if not manifest_names:
-                continue
             for manifest_name in manifest_names:
                 manifest_path = os.path.join(dirpath, manifest_name)
                 try:
@@ -497,48 +582,138 @@ def _progress_manifest_models_dataframe(task: Optional[str] = None) -> pd.DataFr
                 if task_text and "task" in manifest_df.columns:
                     manifest_df = manifest_df[manifest_df["task"].astype(str) == task_text]
                 for _, row in manifest_df.iterrows():
-                    row_task = str(row.get("task") or task_text).strip()
+                    row_task = _clean_str(_first_value(row.get("task"), task_text))
                     if not row_task:
                         continue
-                    uuid = str(row.get("uuid") or "").strip()
+                    uuid = _clean_str(row.get("uuid"))
                     source_run_path = os.path.join("logs", row_task, uuid) if uuid else ""
                     if source_run_path and not os.path.isdir(source_run_path):
                         source_run_path = ""
-                    log_path = source_run_path or str(row.get("stdout_file") or row.get("log_file") or "").strip()
+                    log_path = _clean_str(_first_value(source_run_path, row.get("stdout_file"), row.get("log_file"), default=""))
                     if not log_path:
                         continue
-                    classif_loss = str(row.get("classif_loss") or "").strip() or str(row.get("loss") or "").strip()
+                    if source_run_path and not _model_artifact_matches_task(source_run_path, row_task):
+                        continue
+                    dataset = _dataset_path_from_manifest_value(_first_value(row.get("dataset_name"), row.get("dataset_key")))
+                    if not dataset and os.path.basename(dirpath).startswith("otite_ds_"):
+                        dataset = _dataset_path_from_manifest_value(os.path.basename(dirpath))
+                    if not dataset:
+                        dataset = _dataset_path_from_run_metadata(source_run_path)
+                    classif_loss = _clean_str(_first_value(row.get("classif_loss"), row.get("loss")))
                     split_key = split_config_key(row.get("train_datasets"), row.get("valid_dataset"), row.get("test_dataset"))
                     rows.append(
                         {
-                            "exp ID": str(row.get("exp_id") or row.get("job_id") or uuid or "").strip(),
-                            "Model Name": str(row.get("model") or "").strip(),
-                            "NSize": str(row.get("new_size") or "").strip(),
-                            "FGSM": str(row.get("fgsm") or "").strip(),
-                            "Prototypes": str(row.get("prototype") or row.get("prototypes") or "").strip(),
-                            "NPos": str(row.get("n_positives") or "").strip(),
-                            "NNeg": str(row.get("n_negatives") or "").strip(),
-                            "DLoss": str(row.get("dloss") or "").strip(),
-                            "Dist_Fct": str(row.get("dist_fct") or "").strip(),
+                            "exp ID": _clean_str(_first_value(row.get("exp_id"), row.get("job_id"), uuid)),
+                            "Model Name": _clean_str(row.get("model")),
+                            "NSize": _clean_str(row.get("new_size")),
+                            "FGSM": _clean_str(row.get("fgsm")),
+                            "Prototypes": _clean_str(_first_value(row.get("prototype"), row.get("prototypes"))),
+                            "NPos": _clean_str(row.get("n_positives")),
+                            "NNeg": _clean_str(row.get("n_negatives")),
+                            "DLoss": _clean_str(row.get("dloss")),
+                            "Dist_Fct": _clean_str(row.get("dist_fct")),
                             "Classif_Loss": classif_loss,
-                            "N_Calibration": str(row.get("n_calibration") or "").strip(),
+                            "N_Calibration": _clean_str(row.get("n_calibration")),
                             "Accuracy": np.nan,
                             "MCC": np.nan,
-                            "Normalize": str(row.get("normalize") or "").strip(),
-                            "N_Neighbors": str(row.get("knn") or row.get("n_neighbors") or "").strip(),
+                            "Normalize": _clean_str(row.get("normalize")),
+                            "N_Neighbors": _clean_str(_first_value(row.get("knn"), row.get("n_neighbors"))),
                             "Log Path": log_path,
-                            "Proto_Strat": str(row.get("prototype_strategy") or "").strip(),
-                            "Proto_Comp": str(row.get("prototype_components") or "").strip(),
-                            "train_datasets": str(row.get("train_datasets") or "").strip(),
-                            "valid_dataset": str(row.get("valid_dataset") or "").strip(),
-                            "test_dataset": str(row.get("test_dataset") or "").strip(),
+                            "Proto_Strat": _clean_str(row.get("prototype_strategy")),
+                            "Proto_Comp": _clean_str(row.get("prototype_components")),
+                            "train_datasets": _clean_str(row.get("train_datasets")),
+                            "valid_dataset": _clean_str(row.get("valid_dataset")),
+                            "test_dataset": _clean_str(row.get("test_dataset")),
                             "split_config_key": split_key,
                             "Artifact ID": uuid,
                             "Best Model Dir": source_run_path or log_path,
                             "Source Run Path": source_run_path,
-                            "Dataset": _dataset_path_from_manifest_value(row.get("dataset_name") or row.get("dataset_key")),
+                            "Dataset": dataset,
                             "Source": "progress manifest",
                             "Task": row_task,
+                        }
+                    )
+            metrics_names = [
+                name for name in filenames
+                if name.endswith("_completed_runs_metrics.csv")
+            ]
+            for metrics_name in metrics_names:
+                metrics_path = os.path.join(dirpath, metrics_name)
+                try:
+                    metrics_df = pd.read_csv(metrics_path, dtype=str).fillna("")
+                except Exception:
+                    continue
+                if "status" in metrics_df.columns:
+                    metrics_df = metrics_df[metrics_df["status"].astype(str).str.lower() == "completed"]
+                if task_text and "task" in metrics_df.columns:
+                    metrics_df = metrics_df[metrics_df["task"].astype(str) == task_text]
+                for _, row in metrics_df.iterrows():
+                    row_task = _clean_str(_first_value(row.get("task"), task_text))
+                    if not row_task:
+                        continue
+                    uuid = _clean_str(row.get("uuid"))
+                    source_run_path = os.path.join("logs", row_task, uuid) if uuid else ""
+                    if source_run_path and not os.path.isdir(source_run_path):
+                        source_run_path = ""
+                    log_path = _clean_str(_first_value(source_run_path, row.get("stdout_file"), row.get("log_file"), metrics_path, default=""))
+                    if not log_path:
+                        continue
+                    if source_run_path and not _model_artifact_matches_task(source_run_path, row_task):
+                        continue
+                    dataset = _dataset_path_from_manifest_value(_first_value(row.get("dataset_name"), row.get("dataset_key")))
+                    if not dataset and os.path.basename(dirpath).startswith("otite_ds_"):
+                        dataset = _dataset_path_from_manifest_value(os.path.basename(dirpath))
+                    if not dataset:
+                        dataset = _dataset_path_from_run_metadata(source_run_path)
+                    classif_loss = _clean_str(_first_value(row.get("classif_loss"), row.get("loss")))
+                    split_key = _clean_str(
+                        _first_value(
+                            row.get("split_config_key"),
+                            split_config_key(row.get("train_datasets"), row.get("valid_dataset"), row.get("test_dataset")),
+                        )
+                    )
+                    rows.append(
+                        {
+                            "exp ID": _clean_str(_first_value(row.get("run_tag"), row.get("exp_id"), uuid)),
+                            "Trial": _clean_str(row.get("trial_index")),
+                            "Model Name": _clean_str(_first_value(row.get("model_name"), row.get("model"))),
+                            "NSize": _clean_str(row.get("new_size")),
+                            "FGSM": _clean_str(row.get("fgsm")),
+                            "Prototypes": _clean_str(_first_value(row.get("prototype"), row.get("prototypes"))),
+                            "NPos": _clean_str(row.get("n_positives")),
+                            "NNeg": _clean_str(row.get("n_negatives")),
+                            "DLoss": _clean_str(row.get("dloss")),
+                            "Dist_Fct": _clean_str(row.get("dist_fct")),
+                            "Classif_Loss": classif_loss,
+                            "N_Calibration": _clean_str(row.get("n_calibration")),
+                            "Accuracy": pd.to_numeric(pd.Series([row.get("valid_accuracy")]), errors="coerce").iloc[0],
+                            "MCC": pd.to_numeric(pd.Series([row.get("valid_mcc")]), errors="coerce").iloc[0],
+                            "Train MCC": pd.to_numeric(pd.Series([row.get("train_mcc")]), errors="coerce").iloc[0],
+                            "Valid MCC": pd.to_numeric(pd.Series([row.get("valid_mcc")]), errors="coerce").iloc[0],
+                            "Test MCC": pd.to_numeric(pd.Series([row.get("test_mcc")]), errors="coerce").iloc[0],
+                            "Train AUC": pd.to_numeric(pd.Series([row.get("train_auc")]), errors="coerce").iloc[0],
+                            "Valid AUC": pd.to_numeric(pd.Series([row.get("valid_auc")]), errors="coerce").iloc[0],
+                            "Test AUC": pd.to_numeric(pd.Series([row.get("test_auc")]), errors="coerce").iloc[0],
+                            "Valid Accuracy": pd.to_numeric(pd.Series([row.get("valid_accuracy")]), errors="coerce").iloc[0],
+                            "Normalize": _clean_str(row.get("normalize")),
+                            "N_Neighbors": _clean_str(_first_value(row.get("knn"), row.get("n_neighbors"))),
+                            "Log Path": log_path,
+                            "Proto_Strat": _clean_str(row.get("prototype_strategy")),
+                            "Proto_Comp": _clean_str(row.get("prototype_components")),
+                            "train_datasets": _clean_str(row.get("train_datasets")),
+                            "valid_dataset": _clean_str(row.get("valid_dataset")),
+                            "test_dataset": _clean_str(row.get("test_dataset")),
+                            "split_config_key": split_key,
+                            "Artifact ID": uuid,
+                            "Best Model Dir": source_run_path or log_path,
+                            "Source Run Path": source_run_path,
+                            "Dataset": dataset,
+                            "Source": "progress metrics",
+                            "Task": row_task,
+                            "Timestamp": _clean_str(row.get("timestamp")),
+                            "Batch Entropy": pd.to_numeric(pd.Series([row.get("batch_entropy_norm")]), errors="coerce").iloc[0],
+                            "Batch NMI": pd.to_numeric(pd.Series([row.get("batch_nmi")]), errors="coerce").iloc[0],
+                            "Batch ARI": pd.to_numeric(pd.Series([row.get("batch_ari")]), errors="coerce").iloc[0],
                         }
                     )
     return pd.DataFrame(rows)
@@ -599,16 +774,16 @@ def _recent_trained_heads_for_model(row: pd.Series) -> List[Dict[str, Any]]:
     if not recent_rows:
         return []
 
-    model_id = row.get("Model ID") or row.get("id") or row.get("model_id")
-    log_path = str(row.get("Log Path") or row.get("log_path") or "").strip()
-    best_model_dir = str(row.get("Best Model Dir") or row.get("best_model_dir") or "").strip()
+    model_id = _first_value(row.get("Model ID"), row.get("id"), row.get("model_id"))
+    log_path = _clean_str(_first_value(row.get("Log Path"), row.get("log_path")))
+    best_model_dir = _clean_str(_first_value(row.get("Best Model Dir"), row.get("best_model_dir")))
     candidates = []
 
     for recent in recent_rows:
         if not isinstance(recent, dict):
             continue
-        recent_model_id = recent.get("Model ID") or recent.get("id") or recent.get("model_id")
-        recent_log_path = str(recent.get("Log Path") or recent.get("log_path") or "").strip()
+        recent_model_id = _first_value(recent.get("Model ID"), recent.get("id"), recent.get("model_id"))
+        recent_log_path = _clean_str(_first_value(recent.get("Log Path"), recent.get("log_path")))
         model_matches = model_id is not None and recent_model_id is not None and str(model_id) == str(recent_model_id)
         path_matches = bool(recent_log_path and recent_log_path in {log_path, best_model_dir})
         if model_matches or path_matches:
@@ -648,16 +823,18 @@ def _attach_metrics(df: pd.DataFrame, calibration_split: str = "valid") -> pd.Da
 
     for idx, row in df.iterrows():
         log_path = row.get("Log Path")
-        best_model_dir = row.get("Best Model Dir") or row.get("best_model_dir") or log_path
+        best_model_dir = _first_value(row.get("Best Model Dir"), row.get("best_model_dir"), log_path)
+        metrics_source = str(row.get("Source", "") or "").strip().lower()
+        preserve_row_metrics = metrics_source == "progress metrics"
         head_metrics = None
         registry_head_metrics = None
-        registry_head_config = row.get("Head Config") or row.get("best_head_config")
+        registry_head_config = _first_value(row.get("Head Config"), row.get("best_head_config"))
         registry_valid_mcc = pd.to_numeric(pd.Series([row.get("Valid MCC")]), errors="coerce").iloc[0]
         if registry_head_config is not None and str(registry_head_config).strip() not in {"", "nan", "None"} and pd.notna(registry_valid_mcc):
             registry_head_metrics = {
                 "Config": registry_head_config,
-                "Head": row.get("Head") or row.get("best_head_name") or format_classifier_config(registry_head_config),
-                "N Aug": row.get("Head N Aug") or row.get("best_head_n_aug"),
+                "Head": _first_value(row.get("Head"), row.get("best_head_name"), format_classifier_config(registry_head_config)),
+                "N Aug": _first_value(row.get("Head N Aug"), row.get("best_head_n_aug")),
                 "Train MCC": row.get("Train MCC"),
                 "Valid MCC": registry_valid_mcc,
                 "Test MCC": row.get("Test MCC"),
@@ -687,18 +864,18 @@ def _attach_metrics(df: pd.DataFrame, calibration_split: str = "valid") -> pd.Da
         head_candidates.extend(_recent_trained_heads_for_model(row))
         # The optimization cache and just-trained rows are the source of truth
         # after Tab 2 retraining. Persisted registry values are only a fallback.
-        if head_candidates:
+        if head_candidates and not preserve_row_metrics:
             head_metrics = max(
                 head_candidates,
                 key=lambda r: metric_value_from_mapping(r, default=float("-inf")),
             )
-        if head_metrics is None:
+        if head_metrics is None and not preserve_row_metrics:
             head_metrics = registry_head_metrics
         if head_metrics:
-            head_config = head_metrics.get("Config") or head_metrics.get("config")
+            head_config = _first_value(head_metrics.get("Config"), head_metrics.get("config"))
             if head_config is not None:
                 df.at[idx, "Head Config"] = str(head_config)
-                df.at[idx, "Head"] = head_metrics.get("Head") or format_classifier_config(head_config)
+                df.at[idx, "Head"] = _first_value(head_metrics.get("Head"), format_classifier_config(head_config))
             if head_metrics.get("N Aug") is not None:
                 df.at[idx, "Head N Aug"] = head_metrics.get("N Aug")
             df.at[idx, "Train MCC"] = head_metrics.get("Train MCC", head_metrics.get("train_mcc", np.nan))
@@ -718,7 +895,7 @@ def _attach_metrics(df: pd.DataFrame, calibration_split: str = "valid") -> pd.Da
                     if metric_name not in df.columns:
                         df[metric_name] = np.nan
                     df.at[idx, metric_name] = metric_value
-        else:
+        elif not preserve_row_metrics:
             # Fallback to log summary metrics
             split_metrics = get_split_mcc_metrics(log_path)
             if split_metrics:
@@ -786,13 +963,18 @@ def _order_model_columns(df: pd.DataFrame) -> pd.DataFrame:
         c for c in df.columns
         if " F1 " in c or " Recall " in c or " Precision " in c or " Support " in c
     ]
+    if "Task" in df.columns:
+        df = df.copy()
+        labels = df["Task"].apply(lambda task: ", ".join(labels_for_task(task)))
+        df["N Classes"] = df["Task"].apply(lambda task: len(labels_for_task(task)))
+        df["Labels"] = labels
 
     ordered_cols = []
     if "#" in df.columns:
         ordered_cols.append("#")
 
     preferred_non_metric = [
-        "Model ID", "Registry ID", "exp ID", "Task", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
+        "Model ID", "Registry ID", "exp ID", "Task", "N Classes", "Labels", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
         "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration", "Normalize",
         "N_Neighbors", "Proto_Strat", "Proto_Comp",
         "train_datasets", "valid_dataset", "test_dataset",
@@ -834,7 +1016,8 @@ def _filter_models_df_by_sidebar_split(models_df: pd.DataFrame, *, include_split
         pass
     else:
         # Only include database and manifest (done jobs only)
-        df = df[df["Source"].astype(str) != "logs/best_models"]
+        if "Source" in df.columns:
+            df = df[df["Source"].astype(str) != "logs/best_models"]
     
     # Filter by split combo if selected in sidebar. Quick Model Selection can
     # disable this while rebuilding the list of available split choices.
@@ -860,6 +1043,17 @@ def load_best_models_table(
 
     df = attach_task_column(df)
     df = filter_models_df_by_task(df, task)
+    if df.empty:
+        return df
+    if "Task" in df.columns:
+        keep_mask = df.apply(
+            lambda row: _model_artifact_matches_task(
+                _first_value(row.get("Artifact Log Path"), row.get("Log Path"), row.get("Best Model Dir"), default=""),
+                row.get("Task"),
+            ),
+            axis=1,
+        )
+        df = df[keep_mask].copy()
     if df.empty:
         return df
 
@@ -1274,7 +1468,7 @@ def _render_top_models_table(models_df: pd.DataFrame, args) -> None:
 def _prediction_csv_candidates(row_dict: Dict[str, Any], split: str) -> List[str]:
     candidates: List[str] = []
     for key in ["Artifact Log Path", "Best Model Dir", "Log Path", "Source Run Path"]:
-        path = str(row_dict.get(key) or "").strip()
+        path = _clean_str(row_dict.get(key))
         if not path:
             continue
         if os.path.isfile(path):
@@ -1554,9 +1748,9 @@ def _build_validation_threshold_frame(model_rows: pd.DataFrame, selected_idx: in
     ensemble_votes = []
     for _, row in merged.iterrows():
         votes = [
-            str(row.get(col) or "").strip()
+            _clean_str(row.get(col))
             for col in prediction_cols
-            if str(row.get(col) or "").strip() and str(row.get(col) or "").strip().lower() != "error"
+            if _clean_str(row.get(col)) and _clean_str(row.get(col)).lower() != "error"
         ]
         if not votes:
             ensemble_predictions.append("Unknown")
@@ -2120,7 +2314,7 @@ def _make_model_selection_options(models_df: pd.DataFrame):
 def _render_selected_model_calibration(row_dict: Dict[str, Any], split: str = "valid") -> None:
     log_path = row_dict.get("Log Path")
 
-    if not log_path:
+    if not _has_value(log_path):
         return
 
     st.subheader(f"📈 Calibration Curve (Model #{row_dict.get('#', '?')}, {split})")
@@ -2185,7 +2379,7 @@ def _render_selected_model_calibration(row_dict: Dict[str, Any], split: str = "v
 
 def _set_selected_model(row_dict: Dict[str, Any], selected_key: str) -> None:
     row_dict = dict(row_dict)
-    row_dict.update(extract_params_from_log_path(row_dict.get("Best Model Dir") or row_dict.get("Log Path")))
+    row_dict.update(extract_params_from_log_path(_first_value(row_dict.get("Best Model Dir"), row_dict.get("Log Path"), default="")))
 
     row_dict["model_id"] = row_dict.get("Registry ID")
 
@@ -2592,6 +2786,7 @@ def render(
                         _render_model_selector(display_models_df, page_key, calibration_split=calibration_split)
 
                     if include_model_table:
+                        _render_top_models_table(models_df, args)
                         _render_best_models_auc_curves(display_models_df, page_key, split=calibration_split)
                         render_validation_threshold_heatmap(display_models_df, page_key)
 

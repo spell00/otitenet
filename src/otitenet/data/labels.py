@@ -58,6 +58,8 @@ TASK_LABEL_SCHEMES = {
     "notNormal": "binary",
     "otite_four_class": "four_class",
     "otitis_four_class": "four_class",
+    "otitis_four_class_071426": "four_class",
+    "four_classes_220726": "four_class",
 }
 DEFAULT_LABEL_TASK = "notNormal"
 
@@ -102,10 +104,19 @@ def task_display_name(task: object) -> str:
     text = str(task or DEFAULT_LABEL_TASK)
     if text == "notNormal":
         return "Binary: Normal / NotNormal"
-    if text in {"otite_four_class", "otitis_four_class"}:
+    if (
+        text.startswith("otite_four_class")
+        or text.startswith("otitis_four_class")
+        or text.startswith("four_classes")
+    ):
         return "Four class: Normal / NotNormal / Wax / Tube"
     return text
 
 
 def labels_for_task(task: object) -> tuple[str, ...]:
     return label_scheme_labels(label_scheme_for_task(task))
+
+
+def label_summary_for_task(task: object) -> str:
+    labels = labels_for_task(task)
+    return f"{len(labels)} classes: {', '.join(labels)}"

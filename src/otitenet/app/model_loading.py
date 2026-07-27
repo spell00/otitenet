@@ -181,9 +181,20 @@ def _load_model_and_prototypes_cached(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(1)
 
+    def _valid_path_text(value) -> str:
+        try:
+            if value is None or np.asarray(value).shape == () and bool(np.isnan(value)):
+                return ""
+        except Exception:
+            pass
+        text = str(value or "").strip()
+        if text.lower() in {"", "none", "nan", "null", "<na>", "—"}:
+            return ""
+        return text
+
     candidates = []
-    if log_path:
-        direct_dir = str(log_path)
+    direct_dir = _valid_path_text(log_path)
+    if direct_dir:
         candidates.append((
             os.path.join(direct_dir, "model.pth"),
             os.path.join(direct_dir, "prototypes.pkl"),

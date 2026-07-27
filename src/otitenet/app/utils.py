@@ -95,6 +95,19 @@ def sort_dataframe_by_model_metric(df, metric=None) -> pd.DataFrame:
 
 # ---- String/Filename Utilities ---- #
 
+def _non_missing_text(value) -> str:
+    try:
+        if value is None:
+            return ""
+        missing = pd.isna(value)
+        if isinstance(missing, (bool, np.bool_)) and missing:
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    return "" if text.lower() in {"", "none", "nan", "null", "<na>"} else text
+
+
 def set_random_seeds(seed=1, deterministic=False):
     """Set app-level random seeds without importing training-only dependencies."""
     try:
@@ -148,14 +161,14 @@ def _unique_preserve_order(items):
 
 def normalize_train_datasets(value) -> str:
     """Canonical comma-separated training dataset combination."""
-    if value is None:
+    if _non_missing_text(value) == "":
         return ""
     if isinstance(value, (list, tuple, set)):
-        parts = [str(x).strip() for x in value]
+        parts = [_non_missing_text(x) for x in value]
     else:
         parts = [x.strip() for x in str(value).replace(";", ",").split(",")]
     # Sort alphabetically to ensure consistent ordering regardless of input order
-    filtered = [x for x in parts if x and x.lower() not in {"none", "nan", "null"}]
+    filtered = [x for x in parts if x and x.lower() not in {"none", "nan", "null", "<na>"}]
     return ",".join(sorted(filtered))
 
 
@@ -164,7 +177,7 @@ LEGACY_VALID_DATASET = "Banque_Viscaino_Chili_2020"
 
 
 def legacy_split_config(valid_dataset="") -> dict:
-    valid = str(valid_dataset or LEGACY_VALID_DATASET).strip()
+    valid = _non_missing_text(valid_dataset) or LEGACY_VALID_DATASET
     train = normalize_train_datasets(LEGACY_TRAIN_DATASETS)
     return {
         "train_datasets": train,
@@ -178,16 +191,16 @@ def split_config_values(_args) -> dict:
     """Return train/valid/test dataset identifiers for a model run."""
     return {
         "train_datasets": normalize_train_datasets(getattr(_args, "train_datasets", "")),
-        "valid_dataset": str(getattr(_args, "valid_dataset", "") or "").strip(),
-        "test_dataset": str(getattr(_args, "test_dataset", "") or "").strip(),
+        "valid_dataset": _non_missing_text(getattr(_args, "valid_dataset", "")),
+        "test_dataset": _non_missing_text(getattr(_args, "test_dataset", "")),
     }
 
 
 def split_config_key(train_datasets="", valid_dataset="", test_dataset="") -> str:
     return "|".join([
         normalize_train_datasets(train_datasets),
-        str(valid_dataset or "").strip(),
-        str(test_dataset or "").strip(),
+        _non_missing_text(valid_dataset),
+        _non_missing_text(test_dataset),
     ])
 
 
@@ -195,18 +208,21 @@ def split_combo_key_from_row(row) -> str:
     if row is None:
         return ""
     getter = row.get if hasattr(row, "get") else lambda _key, _default=None: _default
-    key = getter("split_config_key")
-    if key and str(key).strip() not in {"", "None", "nan", "null"}:
-        return str(key).strip().replace(";", ",")
+    key = _non_missing_text(getter("split_config_key"))
+    if key:
+        return key.replace(";", ",")
+    train_datasets = _non_missing_text(getter("train_datasets")) or _non_missing_text(getter("Train Datasets"))
+    valid_dataset = _non_missing_text(getter("valid_dataset")) or _non_missing_text(getter("Valid Dataset"))
+    test_dataset = _non_missing_text(getter("test_dataset")) or _non_missing_text(getter("Test Dataset"))
     return split_config_key(
-        getter("train_datasets") or getter("Train Datasets") or "",
-        getter("valid_dataset") or getter("Valid Dataset") or "",
-        getter("test_dataset") or getter("Test Dataset") or "",
+        train_datasets,
+        valid_dataset,
+        test_dataset,
     )
 
 
 def split_combo_key_to_values(combo_key: str) -> tuple[str, str, str]:
-    return tuple((str(combo_key or "").split("|") + ["", "", ""])[:3])
+    return tuple((_non_missing_text(combo_key).split("|") + ["", "", ""])[:3])
 
 
 def split_config_segment(train_datasets="", valid_dataset="", test_dataset="") -> str:
@@ -232,17 +248,17 @@ def dataset_path_segment(path: str) -> str:
 
 def get_model_params_path(_args):
     """Construct the standardized relative path for model parameters folders."""
-    nsize = ensure_int(_args.new_size)
-    fgsm = ensure_int(_args.fgsm)
-    ncal = ensure_int(_args.n_calibration)
-    npos = ensure_int(_args.n_positives)
-    nneg = ensure_int(_args.n_negatives)
-    n_neighbors = ensure_int(_args.n_neighbors)
+    nsize = ensure_int(getattr(_args, "new_size", 224))
+    fgsm = ensure_int(getattr(_args, "fgsm", 0))
+    ncal = ensure_int(getattr(_args, "n_calibration", 0))
+    npos = ensure_int(getattr(_args, "n_positives", 1))
+    nneg = ensure_int(getattr(_args, "n_negatives", 1))
+    n_neighbors = ensure_int(getattr(_args, "n_neighbors", 1))
     
-    dataset_name = dataset_path_segment(_args.path)
+    dataset_name = dataset_path_segment(getattr(_args, "path", ""))
     
     # Strip "prototypes_" prefix if present (training may add it)
-    proto_val = str(_args.prototypes_to_use)
+    proto_val = str(getattr(_args, "prototypes_to_use", "no"))
     if proto_val.startswith("prototypes_"):
         proto_val = proto_val[len("prototypes_"):]
     
@@ -364,14 +380,60 @@ def task_from_model_row(row, default=None):
     if getter is None:
         return default
 
-    task = getter("Task") or getter("task") or getter("label_task")
-    if task:
-        return str(task)
+    def _first_scalar_text(value) -> str:
+        if isinstance(value, pd.Series):
+            for item in value.tolist():
+                text = _first_scalar_text(item)
+                if text:
+                    return text
+            return ""
+        try:
+            if value is None or pd.isna(value):
+                return ""
+        except Exception:
+            pass
+        text = str(value).strip()
+        return "" if text.lower() in {"", "none", "nan", "null", "<na>"} else text
 
-    parsed = extract_params_from_log_path(
-        getter("Log Path") or getter("log_path") or getter("path") or ""
+    for key in ("Task", "task", "label_task"):
+        task = _first_scalar_text(getter(key))
+        if task:
+            return task
+
+    path_keys = (
+        "Artifact Log Path",
+        "artifact_log_path",
+        "Best Model Dir",
+        "best_model_dir",
+        "Source Run Path",
+        "source_run_log_path",
+        "Log Path",
+        "log_path",
+        "run_log_path",
+        "path",
     )
-    return parsed.get("Task") or default
+    for key in path_keys:
+        path = _first_scalar_text(getter(key))
+        if not path:
+            continue
+        parsed = extract_params_from_log_path(path)
+        task = _first_scalar_text(parsed.get("Task"))
+        if task:
+            return task
+
+        parts = path.strip("/").split("/")
+        if "logs" not in parts:
+            continue
+        logs_idx = parts.index("logs")
+        tail = parts[logs_idx + 1 :]
+        if len(tail) < 2:
+            continue
+        if tail[0] in {"best_models", "progresses", "progresses_old"}:
+            return tail[1]
+        if tail[0] not in {"dvc_exp"}:
+            return tail[0]
+
+    return default
 
 
 def attach_task_column(models_df: pd.DataFrame, default=None) -> pd.DataFrame:
@@ -395,6 +457,29 @@ def filter_models_df_by_task(models_df: pd.DataFrame, task: str | None) -> pd.Da
     df = attach_task_column(models_df)
     task_text = str(task)
     return df[df["Task"].astype(str) == task_text].reset_index(drop=True)
+
+
+def dedupe_model_rows(df: pd.DataFrame, group_cols: list[str], sort_col: str = "MCC") -> pd.DataFrame:
+    """Drop duplicate model rows using a stable row key without tripping on empty frames."""
+    if df is None or df.empty:
+        return df
+
+    present_group_cols = [col for col in group_cols if col in df.columns]
+    if not present_group_cols:
+        return df
+
+    out = df.copy()
+    dedupe_frame = out.loc[:, present_group_cols].fillna("").astype(str)
+    key_series = dedupe_frame.apply(lambda row: "|".join(row.tolist()), axis=1)
+    if isinstance(key_series, pd.DataFrame):
+        key_series = pd.Series(["|".join(map(str, values)) for values in dedupe_frame.to_numpy()], index=out.index)
+    elif not isinstance(key_series, pd.Series):
+        key_series = pd.Series(key_series, index=out.index)
+
+    out["_dedupe_key"] = key_series.astype(str)
+    if sort_col in out.columns:
+        out = out.sort_values(sort_col, ascending=False)
+    return out.drop_duplicates(subset=["_dedupe_key"], keep="first").drop(columns=["_dedupe_key"])
 
 
 LEADERBOARD_DONE_MANIFEST_CACHE_KEY = "done_manifest_config_cache"
@@ -1108,6 +1193,135 @@ def _load_split_mcc_metrics(log_path: str):
 
     return out
 
+
+def _compute_basic_prediction_metrics(csv_path: str, split: str) -> dict:
+    if not csv_path or not os.path.exists(csv_path):
+        return {}
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception:
+        return {}
+    if "label" not in df.columns or "pred" not in df.columns:
+        return {}
+
+    y_true = df["label"].fillna("").astype(str)
+    y_pred = df["pred"].fillna("").astype(str)
+    prefix = str(split).strip().lower()
+    out = {}
+    try:
+        from sklearn.metrics import accuracy_score, matthews_corrcoef
+
+        out[f"{prefix}_mcc"] = float(matthews_corrcoef(y_true, y_pred))
+        out[f"{prefix}_accuracy"] = float(accuracy_score(y_true, y_pred))
+    except Exception:
+        pass
+    out[f"{prefix}_auc"] = _compute_auc_from_predictions_csv(csv_path)
+    out.update(_compute_per_class_metrics_from_predictions_csv(csv_path, split))
+    return out
+
+
+def _run_artifact_cache_from_predictions(_args) -> dict:
+    """Build a minimal learned-head cache from a completed training run folder.
+
+    Paper reproduction runs save the final model and prediction CSVs, but may not
+    have a separate knn_optimization_cache.pkl. In that case the trained KNN head
+    can still be represented from the run's saved params and predictions.
+    """
+    candidate_paths = []
+    for attr in ["log_path", "complete_log_path", "best_model_dir", "source_run_log_path", "model_dir"]:
+        value = getattr(_args, attr, None)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {"none", "nan", "null"} and text not in candidate_paths:
+            candidate_paths.append(text)
+
+    for log_path in candidate_paths:
+        if os.path.isfile(log_path):
+            log_path = os.path.dirname(log_path)
+        if not os.path.isdir(log_path):
+            continue
+
+        summary_path = os.path.join(log_path, "run_summary.json")
+        metadata_path = os.path.join(log_path, "run_metadata.json")
+        summary = {}
+        metadata = {}
+        try:
+            if os.path.exists(summary_path):
+                with open(summary_path, "r", encoding="utf-8") as f:
+                    summary = json.load(f) or {}
+        except Exception:
+            summary = {}
+        try:
+            if os.path.exists(metadata_path):
+                with open(metadata_path, "r", encoding="utf-8") as f:
+                    metadata = json.load(f) or {}
+        except Exception:
+            metadata = {}
+
+        params = summary.get("params") if isinstance(summary, dict) else {}
+        if not isinstance(params, dict):
+            params = {}
+        optimized_params = metadata.get("optimized_params") if isinstance(metadata, dict) else {}
+        if not isinstance(optimized_params, dict):
+            optimized_params = {}
+
+        k_val = (
+            params.get("n_neighbors")
+            or optimized_params.get("n_neighbors")
+            or getattr(_args, "n_neighbors", 1)
+            or 1
+        )
+        try:
+            k_val = int(float(k_val))
+        except Exception:
+            k_val = 1
+
+        n_aug = params.get("n_aug") or optimized_params.get("n_aug") or 0
+        try:
+            n_aug = int(float(n_aug))
+        except Exception:
+            n_aug = 0
+
+        metrics = {"k": k_val, "details": f"Recovered from saved predictions in {log_path}"}
+        for split in ["train", "valid", "test"]:
+            metrics.update(_compute_basic_prediction_metrics(_resolve_split_predictions_csv(log_path, split), split))
+
+        if pd.isna(metrics.get("valid_mcc", np.nan)):
+            best_mcc = summary.get("best_mcc") if isinstance(summary, dict) else None
+            try:
+                metrics["valid_mcc"] = float(best_mcc)
+            except Exception:
+                pass
+        if pd.isna(metrics.get("valid_accuracy", np.nan)):
+            best_acc = summary.get("best_acc") if isinstance(summary, dict) else None
+            try:
+                metrics["valid_accuracy"] = float(best_acc)
+            except Exception:
+                pass
+
+        if pd.isna(metrics.get("valid_mcc", np.nan)):
+            continue
+
+        return {
+            n_aug: {
+                "head_cache_version": "run_artifact_fallback",
+                "train_datasets": getattr(_args, "train_datasets", None),
+                "valid_dataset": getattr(_args, "valid_dataset", None),
+                "test_dataset": getattr(_args, "test_dataset", None),
+                "knn": {"mcc_per_k": [metrics]},
+                "prototypes": {},
+                "baselines": {},
+                "best_k": k_val,
+                "best_mcc": metrics.get("valid_mcc"),
+                "best_config": str(k_val),
+                "best_head_metrics": metrics,
+            }
+        }
+
+    return {}
+
+
 def get_split_mcc_metrics(log_path: str):
     """Return cached train/valid/test MCC metrics for a given model log path."""
     if not log_path:
@@ -1412,6 +1626,28 @@ def _ensure_model_number_map(cursor):
         st.session_state.pop('best_models_table_metric', None)
 
     try:
+        from otitenet.app.pages.leaderboard import load_best_models_table
+
+        active_task = st.session_state.get("production_task")
+        leaderboard_df = load_best_models_table(cursor, task=active_task)
+        leaderboard_df = apply_selection_keys_to_models_df(
+            leaderboard_df,
+            st.session_state.get("top_models_filtered_selection_keys"),
+            filters_active=bool(st.session_state.get("top_models_filters_active")),
+        )
+        if leaderboard_df is not None and not leaderboard_df.empty:
+            refreshed_map = {}
+            for _, row in leaderboard_df.iterrows():
+                rd = row.to_dict()
+                refreshed_map[_make_model_selection_key(rd)] = rd.get("#", "?")
+            st.session_state['model_number_map'] = refreshed_map
+            st.session_state['best_models_table'] = leaderboard_df.copy()
+            st.session_state['best_models_table_metric'] = active_metric
+            return refreshed_map, leaderboard_df.copy()
+    except Exception:
+        pass
+
+    try:
         try:
             cursor.execute(
                 """
@@ -1513,10 +1749,7 @@ def _ensure_model_number_map(cursor):
         "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration", "Normalize", "N_Neighbors",
         "train_datasets", "valid_dataset", "test_dataset",
     ]
-    _dedupe_frame = df[group_cols].copy().fillna("").astype(str)
-    df["_dedupe_key"] = _dedupe_frame.apply(lambda r: "|".join(r.values.tolist()), axis=1)
-    df = df.sort_values("MCC", ascending=False)
-    df = df.drop_duplicates(subset=["_dedupe_key"], keep="first").drop(columns=["_dedupe_key"])
+    df = dedupe_model_rows(df, group_cols, sort_col="MCC")
     df = df.dropna(subset=["Log Path"])
     df = df[df["Log Path"].astype(str) != ""]
     df = df.reset_index(drop=True)
@@ -2083,6 +2316,9 @@ def load_optimization_cache_dict(_args) -> dict:
                     print(f"[Cache] Loaded {len(db_heads)} heads from database as fallback")
         except Exception as e:
             print(f"[Cache] Database fallback failed: {e}")
+
+    if not merged_cache:
+        merged_cache = _run_artifact_cache_from_predictions(_args)
     
     return merged_cache
 

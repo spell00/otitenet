@@ -23,6 +23,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import LinearSVC, SVC
 from sklearn.tree import DecisionTreeClassifier
 
+from otitenet.app.display_metrics import _arrow_safe_dataframe
 from otitenet.app.model_loading import load_model_and_prototypes
 from otitenet.app.model_loading import clear_cached_model, resolve_model_paths
 from otitenet.app.utils_dataset_names import get_short_dataset_name, get_short_dataset_names
@@ -646,9 +647,17 @@ def _render_head_tables(heads_df):
 
     st.subheader("Existing classifier heads")
 
+    display_df = heads_df.copy()
+    if "Task" in display_df.columns:
+        display_df["N Classes"] = display_df["Task"].apply(lambda task: len(labels_for_task(task)))
+        display_df["Labels"] = display_df["Task"].apply(lambda task: ", ".join(labels_for_task(task)))
+
     display_cols = [
         "Model ID",
         "Model",
+        "Task",
+        "N Classes",
+        "Labels",
         "Train Datasets",
         "Valid Dataset",
         "Test Dataset",
@@ -668,9 +677,8 @@ def _render_head_tables(heads_df):
         "Config",
         "Details",
     ]
-    display_cols = [c for c in display_cols if c in heads_df.columns]
+    display_cols = [c for c in display_cols if c in display_df.columns]
 
-    display_df = heads_df.copy()
     # Add short name columns for datasets if present
     for col in ["train_datasets", "valid_dataset", "test_dataset", "Train Datasets", "Valid Dataset", "Test Dataset"]:
         if col in display_df.columns:
@@ -694,6 +702,9 @@ def _render_head_tables(heads_df):
         best_cols = [
             "Model ID",
             "Model",
+            "Task",
+            "N Classes",
+            "Labels",
             "Train Datasets",
             "Valid Dataset",
             "Test Dataset",
@@ -1593,27 +1604,6 @@ def train_heads_for_args(
     with open(cache_path, "wb") as f:
         pickle.dump(cache, f)
 
-    # Save to database for persistence across app restarts
-    try:
-        model_id = None
-        log_path = getattr(_args, "log_path", None)
-        
-        # Try to resolve model_id from database
-        if ctx and hasattr(ctx, 'cursor'):
-            from otitenet.app.database import resolve_model_id
-            model_id = resolve_model_id(ctx.cursor, _args, log_path)
-        
-        # Convert cache result to heads format and save
-        if ctx and hasattr(ctx, 'cursor') and hasattr(ctx, 'conn'):
-            from otitenet.app.utils import enumerate_classification_heads
-            from otitenet.app.database import save_learned_embedding_heads
-            
-            heads = enumerate_classification_heads(_args, include_all_n_aug=True)
-            if heads:
-                save_learned_embedding_heads(ctx.cursor, ctx.conn, model_id, log_path, heads)
-    except Exception as e:
-        print(f"[learned_embedding] Warning: could not save heads to database: {e}")
-
     return result, cache_path
 
 
@@ -2121,6 +2111,88 @@ def _cache_has_n_aug_entry(_args, n_aug: int) -> Tuple[bool, str]:
     return bool(has_complete_split_metrics), cache_path
 
 
+def _delete_n_aug_cache_entry(_args, n_aug: int) -> Tuple[bool, str]:
+    cache_path = get_optimization_cache_file_path(_args)
+    if not os.path.exists(cache_path):
+        return False, cache_path
+    try:
+        with open(cache_path, "rb") as f:
+            cache = pickle.load(f)
+    except Exception:
+        return False, cache_path
+    if not isinstance(cache, dict):
+        return False, cache_path
+
+    n_aug_int = int(n_aug)
+    removed = False
+    for key in (n_aug_int, str(n_aug_int)):
+        if key in cache:
+            cache.pop(key, None)
+            removed = True
+    if removed:
+        with open(cache_path, "wb") as f:
+            pickle.dump(cache, f)
+    return removed, cache_path
+
+
+def _int_model_identifier(value):
+    try:
+        if value is None or pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        return int(float(str(value).strip()))
+    except Exception:
+        return None
+
+
+def _delete_db_heads_for_n_aug(ctx, model_row, _args, n_aug: int) -> int:
+    cursor = getattr(ctx, "cursor", None)
+    conn = getattr(ctx, "conn", None)
+    if cursor is None or conn is None:
+        return 0
+
+    row = model_row if isinstance(model_row, dict) else {}
+    model_id = _int_model_identifier(
+        row.get("Registry ID")
+        or row.get("DB Model ID")
+        or getattr(_args, "model_id", None)
+    )
+    log_path = str(
+        row.get("Log Path")
+        or row.get("Best Model Dir")
+        or getattr(_args, "log_path", "")
+        or ""
+    ).strip()
+
+    clauses = []
+    params = []
+    if model_id is not None:
+        clauses.append("model_id = %s")
+        params.append(model_id)
+    if log_path:
+        clauses.append("log_path = %s")
+        params.append(log_path)
+    if not clauses:
+        return 0
+
+    try:
+        cursor.execute(
+            f"DELETE FROM learned_embedding_heads WHERE n_aug = %s AND ({' OR '.join(clauses)})",
+            tuple([int(n_aug)] + params),
+        )
+        deleted = int(getattr(cursor, "rowcount", 0) or 0)
+        conn.commit()
+        return deleted
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0
+
+
 def _resolved_model_path_for_args(_args) -> str:
     params = get_model_params_path(_args)
     parts = params.split("/")
@@ -2365,7 +2437,7 @@ def _display_training_results(payload: Dict[str, Any], replay: bool = False):
 
     st.success("Last classifier-head training finished." if replay else "Finished classifier-head training.")
     if summary_rows:
-        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
+        st.dataframe(_arrow_safe_dataframe(pd.DataFrame(summary_rows)), use_container_width=True)
 
     if trained_head_rows:
         st.subheader("Classifier heads now available for trained jobs")
@@ -2393,11 +2465,11 @@ def _display_training_results(payload: Dict[str, Any], replay: bool = False):
             "Details",
         ]
         trained_cols = [c for c in trained_cols if c in trained_heads_df.columns]
-        st.dataframe(trained_heads_df[trained_cols], use_container_width=True)
+        st.dataframe(_arrow_safe_dataframe(trained_heads_df[trained_cols]), use_container_width=True)
 
     if trained_head_errors:
         with st.expander("Trained-job heads that could not be reloaded"):
-            st.dataframe(pd.DataFrame(trained_head_errors), use_container_width=True)
+            st.dataframe(_arrow_safe_dataframe(pd.DataFrame(trained_head_errors)), use_container_width=True)
 
 
 def _merge_recent_training_heads(heads_df: pd.DataFrame) -> pd.DataFrame:
@@ -2443,15 +2515,21 @@ def _render_training_controls(ctx):
                 index=0,
                 key="learned_train_target",
             )
+            bulk_all_models = st.checkbox(
+                "Bulk: all available models",
+                value=True,
+                key="learned_train_all_models",
+                disabled=(train_target != "Top N models in bulk"),
+            )
 
             bulk_top_n = st.number_input(
                 "Bulk: top N models",
                 min_value=1,
                 max_value=200,
-                value=5,
+                value=20,
                 step=1,
                 key="learned_train_bulk_top_n",
-                disabled=(train_target != "Top N models in bulk"),
+                disabled=(train_target != "Top N models in bulk") or bulk_all_models,
             )
 
         with c2:
@@ -2493,10 +2571,9 @@ def _render_training_controls(ctx):
                 key="learned_train_skip_existing",
                 help=(
                     "Use this to resume after an interrupted bulk run. "
-                    "Models/n_aug values already present in knn_optimization_cache.pkl are skipped."
+                    "Uncheck to recalculate and replace existing entries."
                 ),
             )
-            overwrite = st.checkbox("Overwrite selected n_aug cache entry", value=True, key="learned_train_overwrite")
 
         prototype_strategies = st.multiselect(
             "Prototype strategies",
@@ -2527,6 +2604,11 @@ def _render_training_controls(ctx):
         return
 
     clear_cached_model()
+    skip_existing = bool(st.session_state.get("learned_train_skip_existing", skip_existing))
+    force_retrain = not skip_existing
+    overwrite = force_retrain
+    if force_retrain:
+        st.info("Force retrain enabled: existing n_aug cache entries will be deleted and recalculated.")
 
     k_values = list(range(1, int(k_max) + 1))
     proto_components = list(range(1, int(proto_max) + 1))
@@ -2563,7 +2645,9 @@ def _render_training_controls(ctx):
                     }
                 )
     else:
-        top_models = _load_top_models(ctx, int(bulk_top_n))
+        bulk_model_limit = 99999 if bulk_all_models else int(bulk_top_n)
+        top_models = _load_top_models(ctx, bulk_model_limit)
+        st.caption(f"Bulk head training selected {len(top_models)} available model row(s).")
         jobs = []
 
         for _, row in top_models.iterrows():
@@ -2666,7 +2750,7 @@ def _render_training_controls(ctx):
             _finish_job(stack_key, "skipped_class_mismatch", idx)
             continue
 
-        if skip_existing:
+        if skip_existing and not force_retrain:
             has_cache_entry, cache_path = _cache_has_n_aug_entry(model_args, int(n_aug_label))
             if has_cache_entry:
                 message = (
@@ -2681,6 +2765,19 @@ def _render_training_controls(ctx):
                 summary_rows.append(_cache_summary_row(model_row, model_args, int(n_aug_label), "skipped_existing"))
                 _finish_job(stack_key, "skipped_existing", idx)
                 continue
+
+        if force_retrain:
+            removed_cache_entry, cache_path = _delete_n_aug_cache_entry(model_args, int(n_aug_label))
+            if removed_cache_entry:
+                _log_training_update(
+                    f"Deleted existing n_aug={int(n_aug_label)} cache entry for {model_label}: {cache_path}"
+                )
+            deleted_db_heads = _delete_db_heads_for_n_aug(ctx, model_row, model_args, int(n_aug_label))
+            if deleted_db_heads:
+                _log_training_update(
+                    f"Deleted {deleted_db_heads} stored learned-head DB row(s) for n_aug={int(n_aug_label)} "
+                    f"before force retrain."
+                )
 
         message = (
             f"Encoding embeddings for {model_label} "

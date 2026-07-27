@@ -8,6 +8,7 @@ from mysql.connector import Error
 from otitenet.data.labels import (
     DEFAULT_LABEL_TASK,
     TASK_LABEL_SCHEMES,
+    label_summary_for_task,
     label_scheme_for_task,
     task_display_name,
 )
@@ -356,6 +357,7 @@ def render_labeling_task_sidebar():
 
     st.session_state["production_task"] = selected
     st.session_state["label_scheme"] = label_scheme_for_task(selected)
+    st.sidebar.caption(label_summary_for_task(selected))
     return selected
 
 

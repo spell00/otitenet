@@ -1771,7 +1771,7 @@ class TrainAE:
                     self.log_predictions(best_lists, run, comet_logger, 0)
 
                     loggers['cm_logger'].add(best_lists)
-                    best_vals = values.copy()
+                    best_vals = copy.deepcopy(values)
                     best_vals['rec_loss'] = self.best_loss
                     # best_vals['dom_loss'] = self.best_dom_loss
                     # best_vals['dom_acc'] = self.best_dom_acc
@@ -1937,7 +1937,7 @@ class TrainAE:
                         torch.save(self.model.state_dict(), f'{self.complete_log_path}/model.pth')
                         self.save_prototypes(self.complete_log_path)
                         self.save_samples_weights(self.complete_log_path)
-                        best_vals = values.copy()
+                        best_vals = copy.deepcopy(values)
                         best_vals['rec_loss'] = self.best_loss
                         # After training, perform clustering and visualize
                         # Store all samples before clustering
@@ -4028,20 +4028,49 @@ class TrainAE:
             return False
 
         requested_names = [str(name) for name in manifest['name'].dropna().tolist()]
-        if n_calibration and len(requested_names) != int(n_calibration):
+        expected = int(n_calibration or 0)
+        manifest_source_counts = {}
+        if 'source_group' in manifest.columns:
+            manifest_source_counts = {
+                str(source): int(count)
+                for source, count in manifest['source_group'].dropna().astype(str).value_counts().to_dict().items()
+            }
+        per_source_manifest = (
+            expected > 0
+            and manifest_source_counts
+            and all(count == expected for source, count in manifest_source_counts.items() if source in {'valid', 'test'})
+            and any(source in {'valid', 'test'} for source in manifest_source_counts)
+        )
+        if expected and len(requested_names) != expected and not per_source_manifest:
             print(
                 f"[CalibrationSplit] manifest count {len(requested_names)} does not match "
-                f"n_calibration={n_calibration}; drawing a new split."
+                f"n_calibration={n_calibration} or n_calibration per source; drawing a new split. "
+                f"source_counts={manifest_source_counts}"
             )
             return False
 
         source_groups = ['valid', 'test', 'train']
         name_to_source = {}
+        name_to_source_by_group = {group: {} for group in source_groups}
         for group in source_groups:
             for idx, name in enumerate(np.asarray(self.data['names'][group]).tolist()):
+                name_to_source_by_group[group].setdefault(str(name), (group, int(idx)))
                 name_to_source.setdefault(str(name), (group, int(idx)))
 
-        missing = [name for name in requested_names if name not in name_to_source]
+        requested_sources = []
+        missing = []
+        for row in manifest.to_dict(orient='records'):
+            name = str(row.get('name'))
+            preferred_group = str(row.get('source_group', '') or '')
+            source = None
+            if preferred_group in name_to_source_by_group:
+                source = name_to_source_by_group[preferred_group].get(name)
+            if source is None:
+                source = name_to_source.get(name)
+            if source is None:
+                missing.append(name)
+            else:
+                requested_sources.append(source)
         if missing:
             print(
                 f"[CalibrationSplit] manifest {manifest_path} could not be reused; "
@@ -4050,8 +4079,7 @@ class TrainAE:
             return False
 
         selected_by_group = {group: [] for group in source_groups}
-        for name in requested_names:
-            group, idx = name_to_source[name]
+        for group, idx in requested_sources:
             selected_by_group[group].append(idx)
 
         calibration_values = {key: [] for key in ['inputs', 'labels', 'old_labels', 'names', 'cats', 'batches']}
@@ -4103,6 +4131,45 @@ class TrainAE:
         )
         return True
 
+    @staticmethod
+    def _proportional_calibration_counts(labels, available, n_calibration, source_groups):
+        totals = {
+            label: sum(len(available[label][group]) for group in source_groups)
+            for label in labels
+        }
+        total = sum(totals.values())
+        if n_calibration > total:
+            raise ValueError(
+                f"n_calibration={n_calibration} exceeds the available valid/test size ({total})."
+            )
+
+        quotas = {label: (n_calibration * totals[label]) / total for label in labels}
+        requested = {label: int(np.floor(quotas[label])) for label in labels}
+        remaining = n_calibration - sum(requested.values())
+        by_remainder = sorted(
+            labels,
+            key=lambda label: (quotas[label] - requested[label], totals[label], str(label)),
+            reverse=True,
+        )
+        for label in by_remainder[:remaining]:
+            requested[label] += 1
+
+        # Keep every class represented when n_calibration is large enough.
+        for label in labels:
+            if requested[label] > 0:
+                continue
+            requested[label] = 1
+            donor = max(
+                (candidate for candidate in labels if requested[candidate] > 1),
+                key=lambda candidate: (
+                    requested[candidate] - quotas[candidate],
+                    requested[candidate],
+                    str(candidate),
+                ),
+            )
+            requested[donor] -= 1
+        return requested
+
     def _apply_calibration_split(self, data_getter):
         n_calibration = int(getattr(self.args, 'n_calibration', 0) or 0)
         if n_calibration == 0:
@@ -4132,12 +4199,12 @@ class TrainAE:
                 for idx in np.where(group_labels == label)[0]:
                     available[label][group].append(int(idx))
 
-        base = n_calibration // len(labels)
-        remainder = n_calibration % len(labels)
-        requested_by_label = {
-            label: base + (1 if i < remainder else 0)
-            for i, label in enumerate(labels)
-        }
+        requested_by_label = self._proportional_calibration_counts(
+            labels,
+            available,
+            n_calibration,
+            source_groups,
+        )
         shortages = {
             str(label): {
                 'requested': requested_by_label[label],
@@ -4267,6 +4334,7 @@ class TrainAE:
 
         if not hasattr(self, 'complete_log_path') or not self.complete_log_path:
             self.foldername = str(uuid.uuid4())
+            self.args.uuid = self.foldername
             self.complete_log_path = f'logs/{self.args.task}/{self.foldername}'
             os.makedirs(self.complete_log_path, exist_ok=True)
 
@@ -4380,7 +4448,7 @@ if __name__ == "__main__":
     parser.add_argument('--task', type=str, default='notNormal', help='Binary classification?')
     parser.add_argument('--is_stn', type=int, default=1, help='Transform train data?')
     parser.add_argument('--weighted_sampler', type=int, default=1, help='Weighted sampler?')
-    parser.add_argument('--n_calibration', type=int, default=0, help='Number of balanced calibration samples to draw from valid/test (0 disables calibration)')
+    parser.add_argument('--n_calibration', type=int, default=0, help='Total number of proportional stratified calibration samples to draw from valid/test (0 disables calibration)')
     parser.add_argument('--calibration_manifest_path', type=str, default='', help='Optional splits/calibration.csv to reuse exact calibration samples during retraining')
     parser.add_argument('--remove_noisy_samples', type=int, default=0, help='Remove noisy samples?')
     parser.add_argument('--noisy_cluster_limit', type=int, default=10, help='Noisy cluster limit?')

@@ -534,7 +534,7 @@ def args_from_inference_row(base_args, row_dict: Dict[str, Any]):
         "dloss": ("DLoss", "dloss"),
         "dist_fct": ("Dist_Fct", "dist_fct", "Dist"),
         "classif_loss": ("Classif_Loss", "classif_loss", "Loss"),
-        "n_calibration": ("N_Calibration", "n_calibration", "N_Cal"),
+        "n_calibration": ("n_cal", "N_Calibration", "n_calibration", "N_Cal"),
         "normalize": ("Normalize", "normalize"),
         "n_neighbors": ("N_Neighbors", "n_neighbors"),
         "path": ("Path", "path", "Dataset", "Artifact Dataset", "Combo Dataset"),

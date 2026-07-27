@@ -1,0 +1,63 @@
+args:
+  exp_id: paper_prevbest_four_classes_220726_PAPER_E03_PREVBEST_R01_N16_S42
+  uuid: 5db8404f-64e2-4688-a1c4-74836a0b7128
+  task: four_classes_220726
+  model_name: resnet18
+  path: data/otite_ds_64/USA_Turquie_Chili_GMFUNL_inference
+  path_original: ./data/otite_ds_-1
+  train_datasets: Banque_Comert_Turquie_2020_jpg,Banque_Calaman_USA_2020_trie_CM,GMFUNL_jan2023
+  valid_dataset: Banque_Viscaino_Chili_2020
+  test_dataset: inference
+  effective_train_datasets: Banque_Calaman_USA_2020_trie_CM,Banque_Comert_Turquie_2020_jpg,GMFUNL_jan2023
+  effective_valid_dataset: Banque_Viscaino_Chili_2020
+  effective_test_dataset: inference
+  new_size: 224
+  normalize: true
+  n_epochs: 1000
+  n_trials: 20
+  trial_index: 4
+  bs: 32
+  dloss: inverseTriplet
+  classif_loss: ce
+  prototypes_to_use: false
+  prototype_strategy: mean
+  prototype_components: 1
+  siamese_inference: linearsvc
+  n_neighbors: 2
+  fgsm: 0
+  n_calibration: 16
+  n_positives: 1
+  n_negatives: 1
+  dist_fct: cosine
+  n_aug: 1
+  seed: 42
+  groupkfold: 1
+  weighted_sampler: 1
+  device: cuda:0
+optimized_params:
+  dist_fct: cosine
+  dmargin: 0.06505159298527952
+  dropout: 0.0
+  epsilon: 0
+  gamma: 62.451395747430766
+  is_transform: 1
+  lr: 3.489018845491386e-05
+  margin: 0
+  n_aug: 5
+  n_neighbors: 9
+  normalize: false
+  optimizer_type: adam
+  smoothing: 0.009290082543999545
+  wd: 3.5849855803404713e-05
+run:
+  foldername: 5db8404f-64e2-4688-a1c4-74836a0b7128
+  complete_log_path: logs/four_classes_220726/5db8404f-64e2-4688-a1c4-74836a0b7128
+code:
+  git_commit: 8d1d8f55114dbda28a7bba9434a50bdef7fd8ada
+  git_branch: main
+  git_dirty: true
+  requirements_sha256: 72acfb144a71f6b33fbe54cd10cfb0ef1387bfed8a470727c472ad78c0c038ea
+dvc:
+  selected_paths: data/otite_ds_64/USA_Turquie_Chili_GMFUNL_inference;data;logs/best_models
+  selected_dvc_files: data.dvc;logs/best_models.dvc
+  selected_md5s: 4164aea77091cc10e2a40a6c1662bea3.dir;4164aea77091cc10e2a40a6c1662bea3.dir;96beebccebc8db68da9f1905353963c6.dir

@@ -210,7 +210,50 @@ data/mobile_deployments/current/
 
 ### 7. Build the Offline Desktop App
 
-Compact build, recommended:
+Otitenet Desktop has three supported installation paths:
+
+- Windows installer for Windows users. This is the primary target OS.
+- Ubuntu/Debian installer for Ubuntu users.
+- Windows installer under Wine for Linux development/debugging only.
+
+#### Windows installer
+
+The recommended production Windows build is the manual GitHub Actions workflow:
+`Build Windows Desktop`. Run it with `variant=compact` unless you explicitly
+need the full PyTorch runtime.
+
+The workflow builds on `windows-latest`, packages the Windows Streamlit sidecar,
+builds the Tauri NSIS installer, and uploads artifacts:
+
+```text
+otitenet-windows-sidecar-compact
+otitenet-windows-installer-compact
+```
+
+Equivalent native Windows commands:
+
+```powershell
+$env:OTITENET_DESKTOP_VARIANT = "compact"
+$env:OTITENET_PYINSTALLER_ONEFILE = "1"
+python -m pip install -r requirements-desktop.txt
+python -m pip install -r requirements-export.txt
+python -m PyInstaller packaging/pyinstaller/otitenet_streamlit.spec --clean -y
+cd desktop
+npm run tauri:build
+```
+
+Windows installer output:
+
+```text
+desktop/src-tauri/target/release/bundle/nsis/
+```
+
+For a full PyTorch Windows build, use `exact` instead of `compact` in
+`OTITENET_DESKTOP_VARIANT`.
+
+#### Ubuntu installer
+
+Compact Ubuntu build, recommended:
 
 ```bash
 PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:prepare:compact
@@ -229,11 +272,111 @@ PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:sidecar:exact
 PYTHON=/home/simon/otitenet/.conda/bin/python npm run desktop:tauri:exact
 ```
 
-Installer outputs:
+Ubuntu installer outputs:
 
 ```text
-desktop/src-tauri/target/release/bundle/deb/Otitenet_0.7.1_amd64_compact.deb
-desktop/src-tauri/target/release/bundle/deb/Otitenet_0.7.1_amd64_exact.deb
+desktop/src-tauri/target/release/bundle/deb/Otitenet_0.9.0_amd64_compact.deb
+desktop/src-tauri/target/release/bundle/deb/Otitenet_0.9.0_amd64_exact.deb
+```
+
+#### Debug the Windows app from Linux with Wine
+
+Wine is for Linux-side development/debugging only. It is not the recommended
+production build path for Windows users or release installers. If Wine hangs on
+the server before `python.exe --version`, stop and use the Windows CI workflow.
+
+Install Wine on Ubuntu:
+
+```bash
+sudo dpkg --add-architecture i386
+sudo mkdir -pm755 /etc/apt/keyrings
+sudo wget -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key
+sudo wget -NP /etc/apt/sources.list.d/ \
+  "https://dl.winehq.org/wine-builds/ubuntu/dists/$(lsb_release -sc)/winehq-$(lsb_release -sc).sources"
+sudo apt update
+sudo apt install --install-recommends winehq-stable
+sudo apt install winetricks xvfb unzip
+wine --version
+```
+
+Ubuntu's default `wine64`/`wine32` packages can be too old for Python 3.11
+Windows wheels. Wine 6.x is known to fail here with missing UCRT functions such
+as `api-ms-win-crt-runtime-l1-1-0.dll.fetestexcept`.
+If you upgrade Wine after creating a prefix, recreate the prefix instead of
+trying to repair it; old prefixes can fail to load core DLLs such as
+`win32u.dll`, `user32.dll`, or `shell32.dll`.
+
+Create a dedicated Wine prefix. On a headless server, run Wine through
+`xvfb-run` so Windows installers have a virtual display:
+
+```bash
+export WINEPREFIX="$HOME/.wine-otitenet-win64"
+export WINEARCH=win64
+mv "$WINEPREFIX" "${WINEPREFIX}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+xvfb-run -a wineboot -u
+xvfb-run -a winetricks -q vcrun2022
+```
+
+Avoid `winecfg` on headless servers if it hangs. With WineHQ stable, a fresh
+prefix is the important part; PyInstaller may still print `Platform:
+Windows-7...` from legacy metadata even when Wine's Windows compatibility layer
+is new enough.
+
+To debug a Windows sidecar from Linux, install Windows Python into that prefix.
+On a headless server, prefer the Windows Python NuGet package instead of the GUI
+installer:
+
+```bash
+curl -L -o /tmp/python.3.11.9.nupkg \
+  https://www.nuget.org/api/v2/package/python/3.11.9
+rm -rf /tmp/python-3.11.9-nuget "$WINEPREFIX/drive_c/Python311"
+unzip -q /tmp/python.3.11.9.nupkg -d /tmp/python-3.11.9-nuget
+cp -a /tmp/python-3.11.9-nuget/tools "$WINEPREFIX/drive_c/Python311"
+xvfb-run -a wine C:\\Python311\\python.exe -m ensurepip --upgrade
+```
+
+If PyInstaller aborts with an `api-ms-win-crt-runtime...fetestexcept` Wine
+error, first verify the prefix reports Windows 10, then rerun
+`xvfb-run -a winetricks -q vcrun2022` and retry the PyInstaller command. That
+error means Wine is missing the Windows C runtime behavior required by Python or
+one of the Windows wheels.
+
+Then run the Windows PyInstaller build:
+
+```bash
+export WINEPREFIX="$HOME/.wine-otitenet-win64"
+
+export OTITENET_DESKTOP_VARIANT=compact
+export OTITENET_PYINSTALLER_ONEFILE=1
+
+xvfb-run -a wine C:\\Python311\\python.exe -m pip install --upgrade pip
+xvfb-run -a wine C:\\Python311\\python.exe -m pip install -r requirements-desktop.txt
+xvfb-run -a wine C:\\Python311\\python.exe -m pip install -r requirements-export.txt
+xvfb-run -a wine C:\\Python311\\python.exe -m PyInstaller packaging/pyinstaller/otitenet_streamlit.spec --clean -y
+
+mkdir -p dist/otitenet-streamlit-windows-compact
+cp -f dist/otitenet-streamlit/otitenet-streamlit.exe \
+  dist/otitenet-streamlit-windows-compact/otitenet-streamlit.exe
+```
+
+Every Wine command must use this same `WINEPREFIX`. If you open a new shell,
+export `WINEPREFIX="$HOME/.wine-otitenet-win64"` again before running Python,
+PyInstaller, or `winetricks`; otherwise Wine falls back to `~/.wine`.
+
+If you also need to assemble a Windows NSIS installer from Linux for debugging,
+install the cross-build tools and run the existing Tauri wrapper:
+
+```bash
+sudo apt install nsis lld llvm clang
+rustup target add x86_64-pc-windows-msvc
+cargo install --locked cargo-xwin
+npm run desktop:tauri:windows:compact
+```
+
+Debug installer output:
+
+```text
+desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/
 ```
 
 Detailed desktop packaging notes are in [docs/OFFLINE_DESKTOP.md](docs/OFFLINE_DESKTOP.md).

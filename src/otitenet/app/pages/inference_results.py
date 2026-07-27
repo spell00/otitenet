@@ -19,6 +19,7 @@ from otitenet.app.display_metrics import (
     _head_config_label_global,
     _set_classifier_head_on_args_global,
 )
+from otitenet.app.artifact_registry import preferred_model_artifact_dir
 from otitenet.app.services.inference_results_service import (
     args_from_inference_row,
     compute_inference_metrics,
@@ -53,6 +54,10 @@ def _correct_state(prediction, truth):
     if str(prediction or "").strip().lower() in {"", "unknown", "na", "nan", "none"}:
         return "X"
     return "✓" if labels_match(prediction, truth) else ""
+
+
+def _has_loadable_model_artifact(row_dict):
+    return bool(preferred_model_artifact_dir(row_dict))
 
 
 def _model_id_as_int(model_id):
@@ -138,6 +143,7 @@ RESULT_IDENTITY_COLUMNS = [
     ("FGSM", "fgsm"),
     ("Normalize", "normalize"),
     ("N_Calibration", "n_calibration"),
+    ("n_cal", "n_calibration"),
     ("Classif_Loss", "classif_loss"),
     ("DLoss", "dloss"),
     ("Dist_Fct", "dist_fct"),
@@ -167,6 +173,7 @@ def _result_identity_from_args(args):
         "FGSM": _string_identity_value(getattr(args, "fgsm", "")),
         "Normalize": _string_identity_value(getattr(args, "normalize", "")),
         "N_Calibration": _string_identity_value(getattr(args, "n_calibration", "")),
+        "n_cal": _string_identity_value(getattr(args, "n_calibration", "")),
         "Classif_Loss": _string_identity_value(getattr(args, "classif_loss", "")),
         "DLoss": _string_identity_value(getattr(args, "dloss", "")),
         "Dist_Fct": _string_identity_value(getattr(args, "dist_fct", "")),
@@ -1005,7 +1012,18 @@ def render(ctx):
                 step=1,
                 key="inference_top_n_models",
             )
-            top_n_model_df = inference_model_df.head(int(top_n_models)).copy()
+            top_n_candidate_df = inference_model_df.head(int(top_n_models)).copy()
+            loadable_mask = top_n_candidate_df.apply(
+                lambda row: _has_loadable_model_artifact(row.to_dict()),
+                axis=1,
+            )
+            skipped_unloadable = int((~loadable_mask).sum())
+            top_n_model_df = top_n_candidate_df[loadable_mask].copy()
+            if skipped_unloadable:
+                st.caption(
+                    f"Skipped {skipped_unloadable} Top-N model(s) without loadable model artifacts "
+                    "(missing source-run model.pth/prototypes.pkl)."
+                )
             top_n_model_ids = [
                 model_id
                 for model_id in (
@@ -1104,6 +1122,8 @@ def render(ctx):
                 if not rows:
                     return pd.DataFrame()
                 df = pd.DataFrame(rows, columns=columns)
+                if "N_Calibration" in df.columns and "n_cal" not in df.columns:
+                    df["n_cal"] = df["N_Calibration"]
                 df["Model ID"] = pd.to_numeric(df["Model ID"], errors="coerce").astype("Int64")
                 df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
                 df["Model Key"] = df["Model ID"].astype(str)
@@ -1516,8 +1536,12 @@ def render(ctx):
                     perf_row = {
                         "#": rank_value,
                         "Model ID": perf_model_id,
+                        "Task": perf_model_row.get("Task"),
+                        "N Classes": perf_model_row.get("N Classes"),
+                        "Labels": perf_model_row.get("Labels"),
                         "Model Name": perf_model_row.get("Model Name"),
                         "N_Calibration": perf_model_row.get("N_Calibration", perf_model_row.get("n_calibration", "—")),
+                        "n_cal": perf_model_row.get("n_cal", perf_model_row.get("N_Calibration", perf_model_row.get("n_calibration", "—"))),
                         "N Aug": head_n_aug,
                         "Best Classification Head": head_label,
                         "Best Head Config": head_config,
