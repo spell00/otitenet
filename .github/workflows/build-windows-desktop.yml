@@ -53,10 +53,10 @@ jobs:
             Write-Error "Missing offline deployment payload: $manifestPath"
             throw "Offline deployment payload is incomplete. Commit the compact files under data/mobile_deployments/current before building the Windows installer."
           }
-          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json -AsHashtable
           $requiredFiles = @($manifestPath)
-          foreach ($property in $manifest.files.PSObject.Properties) {
-            $filename = [string]$property.Value
+          foreach ($filename in $manifest["files"].Values) {
+            $filename = [string]$filename
             if ($filename -and $filename -ne "manifest.json") {
               $requiredFiles += (Join-Path $deploymentDir (Split-Path $filename -Leaf))
             }
