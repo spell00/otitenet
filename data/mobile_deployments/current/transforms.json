@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "image": {
+    "resize": [
+      224,
+      224
+    ],
+    "resize_mode": "app_64_then_size",
+    "base_resize": [
+      64,
+      64
+    ],
+    "base_resize_size": 64,
+    "color_mode": "RGB",
+    "normalize": "yes",
+    "normalization": "channel_mean_std",
+    "normalize_mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "normalize_std": [
+      0.229,
+      0.224,
+      0.225
+    ]
+  }
+}
