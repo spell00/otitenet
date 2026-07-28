@@ -16,6 +16,7 @@ from scripts.create_mobile_deployment import (
     align_prototype_deployment_metadata,
     resolve_deployment_distance,
     resolve_head_config,
+    write_knn_reference_arrays,
 )
 
 
@@ -244,6 +245,21 @@ def test_mobile_deployment_resolves_best_head_config_key():
 
     assert resolve_head_config(production_model) == "protot_kmeans_2"
     assert resolve_head_config(production_model, explicit_head_config="3") == "3"
+
+
+def test_knn_reference_arrays_are_written_from_train_encodings(tmp_path, monkeypatch):
+    monkeypatch.setattr(create_mobile_deployment, "CURRENT_DIR", tmp_path / "current")
+    source = tmp_path / "train_encodings.npz"
+    embeddings = np.asarray([[0.0, 0.1], [1.0, 1.1]], dtype=np.float32)
+    cats = np.asarray([0, 2])
+    np.savez(source, embeddings=embeddings, cats=cats, labels=np.asarray(["Normal", "Wax"]))
+
+    embeddings_name, labels_name = write_knn_reference_arrays(source)
+
+    assert embeddings_name == "reference_embeddings.npy"
+    assert labels_name == "reference_labels.npy"
+    assert np.array_equal(np.load(tmp_path / "current" / embeddings_name), embeddings)
+    assert np.array_equal(np.load(tmp_path / "current" / labels_name), cats)
 
 
 def test_prototype_deployment_metadata_aligns_to_four_class_artifacts(tmp_path, monkeypatch):

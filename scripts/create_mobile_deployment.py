@@ -800,6 +800,21 @@ def write_sklearn_baseline_head(source_encodings: str | Path, head_config: str |
     return target.name
 
 
+def write_knn_reference_arrays(source_encodings: str | Path) -> tuple[str, str]:
+    import numpy as np
+
+    payload = np.load(source_encodings, allow_pickle=True)
+    embeddings = np.asarray(payload["embeddings"], dtype=np.float32)
+    labels = np.asarray(payload["cats"])
+
+    CURRENT_DIR.mkdir(parents=True, exist_ok=True)
+    embeddings_target = CURRENT_DIR / "reference_embeddings.npy"
+    labels_target = CURRENT_DIR / "reference_labels.npy"
+    np.save(embeddings_target, embeddings)
+    np.save(labels_target, labels)
+    return embeddings_target.name, labels_target.name
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Create the current mobile deployment manifest for OtiteNet."
@@ -969,19 +984,17 @@ def main():
         else:
             source_embedding = Path(args.embedding_model_file)
 
-        if args.reference_embeddings_file is None:
-            raise ValueError(
-                "--reference-embeddings-file is required for knn_embedding deployment."
-            )
-
-        if args.reference_labels_file is None:
-            raise ValueError(
-                "--reference-labels-file is required for knn_embedding deployment."
-            )
-
         copied_embedding_model_name = copy_to_current(source_embedding)
-        copied_reference_embeddings_name = copy_to_current(args.reference_embeddings_file)
-        copied_reference_labels_name = copy_to_current(args.reference_labels_file)
+        if args.reference_embeddings_file and args.reference_labels_file:
+            copied_reference_embeddings_name = copy_to_current(args.reference_embeddings_file)
+            copied_reference_labels_name = copy_to_current(args.reference_labels_file)
+        elif args.reference_embeddings_file or args.reference_labels_file:
+            raise ValueError(
+                "--reference-embeddings-file and --reference-labels-file must be passed together."
+            )
+        else:
+            source_encodings = resolve_train_encodings_from_production_model(production_model)
+            copied_reference_embeddings_name, copied_reference_labels_name = write_knn_reference_arrays(source_encodings)
 
         manifest = create_knn_embedding_manifest(
             model_id=str(model_id),

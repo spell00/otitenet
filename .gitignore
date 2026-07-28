@@ -161,4 +161,6 @@ data/mobile_deployments/current/*
 !data/mobile_deployments/current/manifest.json
 !data/mobile_deployments/current/embedding_model.onnx
 !data/mobile_deployments/current/classifier_head.joblib
+!data/mobile_deployments/current/reference_embeddings.npy
+!data/mobile_deployments/current/reference_labels.npy
 !data/mobile_deployments/current/transforms.json

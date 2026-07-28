@@ -220,7 +220,7 @@ def create_knn_embedding_manifest(
         "deployment_id": "current",
         "model_id": _manifest_model_id(model_id),
         "model_name": model_name,
-        "model_type": "torch_embedding",
+        "model_type": "torch_embedding_knn",
         "head_type": "knn",
         **_head_metadata(production_params),
         "requires_reference_arrays": True,
@@ -234,6 +234,7 @@ def create_knn_embedding_manifest(
         "production_params": production_params or {},
         "labels": labels,
         "files": {
+            "model": embedding_path.name,
             "embedding_model": embedding_path.name,
             "reference_embeddings": ref_emb_path.name,
             "reference_labels": ref_lab_path.name,

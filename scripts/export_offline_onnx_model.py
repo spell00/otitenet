@@ -165,6 +165,10 @@ def update_manifest(
         updated["model_type"] = "onnx_embedding_baseline"
         updated["runtime"] = "onnxruntime"
         updated["head_type"] = "baseline"
+    elif embedding_output and head_type == "knn":
+        updated["model_type"] = "onnx_embedding_knn"
+        updated["runtime"] = "onnxruntime"
+        updated["head_type"] = "knn"
     else:
         updated["model_type"] = "onnx_classifier"
         updated["runtime"] = "onnxruntime"

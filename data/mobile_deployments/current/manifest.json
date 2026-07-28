@@ -1,15 +1,16 @@
 {
   "deployment_id": "current",
-  "model_id": "1837",
+  "model_id": "1850",
   "model_name": "resnet18",
-  "model_type": "onnx_embedding_baseline",
-  "runtime": "onnxruntime",
-  "head_type": "baseline",
-  "head_name": "baseline_rbf_svc",
-  "head_config": "baseline_rbf_svc",
-  "head_family": "baseline",
-  "head_n_aug": null,
+  "model_type": "onnx_embedding_knn",
+  "head_type": "knn",
+  "head_name": "19",
+  "head_config": "19",
+  "head_family": "knn",
+  "head_n_aug": 2,
   "requires_reference_arrays": true,
+  "k": 19,
+  "distance": "cosine",
   "input": {
     "image_size": [
       224,
@@ -43,23 +44,23 @@
     ]
   },
   "production_params": {
-    "model_id": 1837,
+    "model_id": 1850,
     "model_name": "resnet18",
-    "log_path": "logs/four_classes_220726/dffd8c2f-7594-43eb-87c1-1a93bd6f7717",
+    "log_path": "logs/four_classes_220726/cee65e4d-b6d0-43d2-aaf0-78fc3b390e91",
     "new_size": 224,
     "normalize": "yes",
     "prototypes_to_use": "no",
     "dist_fct": "cosine",
     "classif_loss": "ce",
     "dloss": "inverseTriplet",
-    "n_neighbors": 7,
+    "n_neighbors": 19,
     "n_positives": 1,
     "n_negatives": 1,
-    "n_calibration": "8",
-    "head": "baseline_rbf_svc",
-    "head_config": "baseline_rbf_svc",
-    "head_family": "baseline",
-    "head_n_aug": 0,
+    "n_calibration": "0",
+    "head": "19",
+    "head_config": "19",
+    "head_family": "knn",
+    "head_n_aug": 2,
     "prototype_strategy": "mean",
     "prototype_components": 1.0,
     "Dataset": "data/otite_ds_64/USA_Turquie_Chili_GMFUNL_inference",
@@ -69,7 +70,7 @@
     "valid_dataset": "Banque_Viscaino_Chili_2020",
     "test_dataset": "inference",
     "split_config_key": "Banque_Calaman_USA_2020_trie_CM,Banque_Comert_Turquie_2020_jpg,GMFUNL_jan2023|Banque_Viscaino_Chili_2020|inference",
-    "label_task": "four_classes_220726",
+    "label_task": "otite_four_class",
     "label_scheme": "four_class",
     "Dist_Fct": "cosine",
     "dist_metric": "cosine",
@@ -82,17 +83,20 @@
     "Tube"
   ],
   "files": {
+    "model": "embedding_model.onnx",
     "embedding_model": "embedding_model.onnx",
-    "classifier_head": "classifier_head.joblib",
+    "reference_embeddings": "reference_embeddings.npy",
+    "reference_labels": "reference_labels.npy",
     "transforms": "transforms.json",
-    "manifest": "manifest.json",
-    "model": "embedding_model.onnx"
+    "manifest": "manifest.json"
   },
   "sha256": {
-    "embedding_model": "97c6a36c2b77633d8bc95e041824c0be8ccc2db4388876b6439da329946f6a65",
-    "classifier_head": "eae29a412431d2947e72545bee234b0d22468e1691bc9034d90f82274ffd0ae9",
+    "embedding_model": "a795b955848159f52376fa6e594b1dce9fb1cd50c3fd063aeab87a89d1a312f1",
+    "reference_embeddings": "bb93bd3e3b17a3a06b7bf9bcf30f58827b8582fb300fcf82e1844e6ccd0fd738",
+    "reference_labels": "b83b526296a7c276a46822a44fe5626ded4ec13391e7b09731533ba6407ee9e7",
     "transforms": "6abdca071cab79c5521ce6100577f3564a4d685ffe0a4b6fe905db0dc1cdc14e",
-    "model": "97c6a36c2b77633d8bc95e041824c0be8ccc2db4388876b6439da329946f6a65"
+    "model": "a795b955848159f52376fa6e594b1dce9fb1cd50c3fd063aeab87a89d1a312f1"
   },
+  "runtime": "onnxruntime",
   "quantization": "none"
 }

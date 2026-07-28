@@ -47,12 +47,20 @@ jobs:
       - name: Verify offline deployment payload
         shell: pwsh
         run: |
-          $requiredFiles = @(
-            "data/mobile_deployments/current/manifest.json",
-            "data/mobile_deployments/current/embedding_model.onnx",
-            "data/mobile_deployments/current/classifier_head.joblib",
-            "data/mobile_deployments/current/transforms.json"
-          )
+          $deploymentDir = "data/mobile_deployments/current"
+          $manifestPath = Join-Path $deploymentDir "manifest.json"
+          if (!(Test-Path $manifestPath)) {
+            Write-Error "Missing offline deployment payload: $manifestPath"
+            throw "Offline deployment payload is incomplete. Commit the compact files under data/mobile_deployments/current before building the Windows installer."
+          }
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          $requiredFiles = @($manifestPath)
+          foreach ($property in $manifest.files.PSObject.Properties) {
+            $filename = [string]$property.Value
+            if ($filename -and $filename -ne "manifest.json") {
+              $requiredFiles += (Join-Path $deploymentDir (Split-Path $filename -Leaf))
+            }
+          }
           $missingFiles = $requiredFiles | Where-Object { !(Test-Path $_) }
           if ($missingFiles.Count -gt 0) {
             $missingFiles | ForEach-Object { Write-Error "Missing offline deployment payload: $_" }

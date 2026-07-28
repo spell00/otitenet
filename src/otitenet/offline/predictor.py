@@ -63,11 +63,46 @@ class SklearnHeadModel:
         return self.embedding_model.predict_embedding(array)
 
 
+class KnnHeadModel:
+    def __init__(self, embedding_model: Any, reference_embeddings: np.ndarray, reference_labels: np.ndarray):
+        self.embedding_model = embedding_model
+        self.reference_embeddings = np.asarray(reference_embeddings, dtype=np.float32)
+        self.reference_labels = np.asarray(reference_labels)
+
+    def predict_embedding(self, array: np.ndarray) -> np.ndarray:
+        return self.embedding_model.predict_embedding(array)
+
+
 def load_model(deployment: OfflineDeployment, device: str = "cpu"):
     path = deployment.model_file
+    if deployment.model_type in {"onnx_embedding_knn", "onnx_knn"}:
+        reference_embeddings, reference_labels = _load_knn_references(deployment)
+        return KnnHeadModel(OnnxEmbeddingModel(path), reference_embeddings, reference_labels)
+
     if deployment.model_type in {"onnx_embedding_baseline", "onnx_baseline"}:
         classifier, head_labels = _load_classifier_head(deployment)
         return SklearnHeadModel(OnnxEmbeddingModel(path), classifier, head_labels)
+
+    if deployment.model_type in {"torch_embedding_knn", "torch_knn", "torch_embedding"} and str(
+        deployment.manifest.get("head_type", "")
+    ).lower() == "knn":
+        try:
+            import torch
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "This KNN deployment requires PyTorch unless it is exported "
+                "to an ONNX embedding deployment."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                "PyTorch could not be imported from this exact desktop runtime. "
+                "Rebuild and reinstall the exact Tauri package."
+            ) from exc
+
+        torch_runtime = importlib.import_module("otitenet.offline.torch_runtime")
+        torch_model = torch_runtime.load_state_dict_model(path, deployment, device)
+        reference_embeddings, reference_labels = _load_knn_references(deployment)
+        return KnnHeadModel(TorchEmbeddingModel(torch_model, device), reference_embeddings, reference_labels)
 
     if deployment.model_type in {"torch_embedding_baseline", "torch_baseline"}:
         try:
@@ -208,6 +243,26 @@ def _load_classifier_head(deployment: OfflineDeployment) -> tuple[Any, list[str]
     if labels is None or len(labels) == 0:
         labels = deployment.labels
     return classifier, [str(label) for label in labels]
+
+
+def _load_knn_references(deployment: OfflineDeployment) -> tuple[np.ndarray, np.ndarray]:
+    files = deployment.manifest.get("files", {})
+    embeddings_name = files.get("reference_embeddings")
+    labels_name = files.get("reference_labels")
+    if not embeddings_name or not labels_name:
+        raise ValueError("KNN deployment manifest does not define reference arrays.")
+
+    embeddings_path = deployment.root / Path(embeddings_name).name
+    labels_path = deployment.root / Path(labels_name).name
+    if not embeddings_path.exists():
+        raise FileNotFoundError(f"KNN reference embeddings not found: {embeddings_path}")
+    if not labels_path.exists():
+        raise FileNotFoundError(f"KNN reference labels not found: {labels_path}")
+
+    return (
+        np.asarray(np.load(embeddings_path, allow_pickle=True), dtype=np.float32),
+        np.asarray(np.load(labels_path, allow_pickle=True)),
+    )
 
 
 def preprocess_image_array(image: Image.Image, deployment: OfflineDeployment) -> np.ndarray:
@@ -362,6 +417,52 @@ def _align_classifier_probabilities(
     return np.asarray([by_label.get(str(label), 0.0) for label in manifest_labels], dtype=np.float64)
 
 
+def _knn_probabilities(
+    embedding: np.ndarray,
+    reference_embeddings: np.ndarray,
+    reference_labels: np.ndarray,
+    manifest_labels: list[str],
+    k: int,
+    distance: str,
+) -> np.ndarray:
+    if reference_embeddings.ndim != 2 or len(reference_embeddings) == 0:
+        raise ValueError("KNN reference embeddings must be a non-empty 2D array.")
+
+    query = np.asarray(embedding, dtype=np.float32).reshape(1, -1)
+    if query.shape[1] != reference_embeddings.shape[1]:
+        raise ValueError(
+            f"KNN embedding dimension mismatch: query has {query.shape[1]}, "
+            f"references have {reference_embeddings.shape[1]}."
+        )
+
+    metric = str(distance or "minkowski").lower()
+    if metric == "cosine":
+        query_norm = query / (np.linalg.norm(query, axis=1, keepdims=True) + 1e-8)
+        ref_norm = reference_embeddings / (np.linalg.norm(reference_embeddings, axis=1, keepdims=True) + 1e-8)
+        distances = 1.0 - np.matmul(ref_norm, query_norm[0])
+    else:
+        distances = np.linalg.norm(reference_embeddings - query[0], axis=1)
+
+    neighbor_count = max(1, min(int(k), len(reference_embeddings)))
+    neighbor_indices = np.argpartition(distances, neighbor_count - 1)[:neighbor_count]
+    votes: dict[str, float] = {}
+    for raw_label in reference_labels[neighbor_indices]:
+        label_key = str(raw_label.item() if hasattr(raw_label, "item") else raw_label)
+        label = label_key
+        try:
+            idx = int(float(label_key))
+            if 0 <= idx < len(manifest_labels):
+                label = manifest_labels[idx]
+        except (TypeError, ValueError):
+            pass
+        votes[str(label)] = votes.get(str(label), 0.0) + 1.0
+
+    return np.asarray(
+        [votes.get(str(label), 0.0) / float(neighbor_count) for label in manifest_labels],
+        dtype=np.float64,
+    )
+
+
 def predict(image: Image.Image, model: Any, deployment: OfflineDeployment, device: str = "cpu") -> dict[str, Any]:
     labels = deployment.labels
 
@@ -374,6 +475,16 @@ def predict(image: Image.Image, model: Any, deployment: OfflineDeployment, devic
         embedding = model.predict_embedding(preprocess_image_array(image, deployment))
         head_probs, classes = _classifier_probabilities(model.classifier, embedding)
         probs = _align_classifier_probabilities(head_probs, classes, model.head_labels, labels)
+    elif isinstance(model, KnnHeadModel):
+        embedding = model.predict_embedding(preprocess_image_array(image, deployment))[0]
+        probs = _knn_probabilities(
+            embedding,
+            model.reference_embeddings,
+            model.reference_labels,
+            labels,
+            int(deployment.manifest.get("k") or 5),
+            str(deployment.manifest.get("distance") or "minkowski"),
+        )
     elif isinstance(model, OnnxClassifier):
         logits = model.predict_logits(preprocess_image_array(image, deployment))
         probs = _softmax(logits)[0]
