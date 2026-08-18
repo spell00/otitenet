@@ -439,6 +439,40 @@ def ensure_results_model_id(conn, cursor):
             raise
 
 
+def ensure_results_log_path_capacity(conn, cursor):
+    """Allow inference result rows to store full model/query artifact paths."""
+    try:
+        cursor.execute(
+            """
+            SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'results'
+              AND COLUMN_NAME = 'log_path'
+            """
+        )
+        row = cursor.fetchone()
+        if not row:
+            cursor.execute("ALTER TABLE results ADD COLUMN log_path TEXT NULL")
+            conn.commit()
+            return
+
+        data_type = str(row[0] or "").lower()
+        max_length = row[1]
+        has_capacity = data_type in {"text", "mediumtext", "longtext"}
+        if not has_capacity:
+            try:
+                has_capacity = max_length is not None and int(max_length) >= 4096
+            except Exception:
+                has_capacity = False
+        if not has_capacity:
+            cursor.execute("ALTER TABLE results MODIFY COLUMN log_path TEXT NULL")
+            conn.commit()
+    except Exception:
+        _safe_rollback(conn)
+        raise
+
+
 def ensure_results_class_scores(conn, cursor):
     """Ensure `results.class_scores` exists for per-class inference probabilities."""
     try:

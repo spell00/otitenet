@@ -12,7 +12,7 @@ COMPLETED_RUNS_METRICS_HEADER = [
     'kind', 'variant',
     'loss', 'classif_loss',
     'prototype', 'prototypes',
-    'dloss', 'BER',
+    'dloss', 'domain_loss_implementation', 'BER',
     'fgsm', 'normalize', 'n_calibration', 'dist_fct', 'knn', 'n_negatives',
     'train_datasets', 'valid_dataset', 'test_dataset', 'split_config_key',
     'retry_count', 'launcher_retry_count', 'launcher_failed_final',

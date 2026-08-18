@@ -640,8 +640,38 @@ def _build_classification_loss(loss_name, label_smoothing):
     return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
 
-def _use_domain_loss(dloss_name):
-    return str(dloss_name).lower() in ["dann", "inversetriplet"]
+def _domain_loss_kind(dloss_name):
+    name = str(dloss_name).strip().lower()
+    if name in {"", "no", "none"}:
+        return "no"
+    if name == "dann":
+        return "dann"
+    if name == "inversetriplet":
+        return "inverse_triplet"
+    raise ValueError(f"Unsupported domain loss: {dloss_name!r}")
+
+
+def _build_inverse_triplet_loss(distance_name, margin):
+    distance_name = str(distance_name).strip().lower()
+    if distance_name == "cosine":
+        distance_function = lambda x, y: 1.0 - nn.functional.cosine_similarity(x, y)
+    elif distance_name == "euclidean":
+        distance_function = nn.PairwiseDistance(p=2)
+    else:
+        raise ValueError(f"Unsupported inverse-triplet distance: {distance_name!r}")
+    return nn.TripletMarginWithDistanceLoss(
+        distance_function=distance_function,
+        margin=float(margin),
+        swap=False,
+    )
+
+
+def _domain_loss_implementation(dloss_name):
+    return {
+        "no": "none",
+        "dann": "gradient_reversal_domain_cross_entropy",
+        "inverse_triplet": "reversed_domain_triplet_margin",
+    }[_domain_loss_kind(dloss_name)]
 
 
 def _resolve_strategy_label(classif_loss, knn):
@@ -726,11 +756,18 @@ class CNNSupervisedCompare:
             'prototype': '',
             'prototypes': '',
             'dloss': getattr(self.args, 'dloss', ''),
+            'domain_loss_implementation': _domain_loss_implementation(
+                getattr(self.args, 'dloss', 'no')
+            ),
             'BER': '',
             'fgsm': getattr(self.args, 'fgsm', ''),
             'normalize': getattr(self.args, 'normalize', ''),
             'n_calibration': getattr(self.args, 'n_calibration', ''),
-            'dist_fct': '',
+            'dist_fct': (
+                getattr(self.args, 'dist_fct', '')
+                if _domain_loss_kind(getattr(self.args, 'dloss', 'no')) == 'inverse_triplet'
+                else ''
+            ),
             'knn': knn_value,
             'n_negatives': '',
             'train_datasets': split_config['train_datasets'],
@@ -840,7 +877,9 @@ class CNNSupervisedCompare:
             samples_weights=self.samples_weights,
             epoch=0,
             unique_labels=self.unique_labels,
-            triplet_dloss="no",
+            # Dataset1 returns a same-domain sample and a different-domain sample
+            # only for inverseTriplet. DANN never consumes triplet samples.
+            triplet_dloss=("inverseTriplet" if _domain_loss_kind(self.args.dloss) == "inverse_triplet" else "no"),
             prototypes_to_use="no",
             n_positives=1,
             n_negatives=1,
@@ -852,7 +891,48 @@ class CNNSupervisedCompare:
             num_workers=getattr(self.args, "num_workers", 0),
         )
 
-    def _train_epoch(self, model, domain_head, loader, classif_criterion, domain_criterion, optimizer, epoch_idx, total_epochs):
+    def _compute_domain_loss(
+        self,
+        model,
+        domain_head,
+        feats,
+        domains,
+        batch,
+        dann_criterion,
+        inverse_triplet_criterion,
+        reverse_dann,
+    ):
+        kind = _domain_loss_kind(self.args.dloss)
+        if kind == "no":
+            return feats.new_zeros(())
+        if kind == "dann":
+            if domain_head is None or dann_criterion is None:
+                raise RuntimeError("DANN requires a domain-classification head and CE criterion")
+            domain_feats = ReverseLayerF.apply(feats, 1.0) if reverse_dann else feats
+            return dann_criterion(domain_head(domain_feats), domains)
+        if inverse_triplet_criterion is None:
+            raise RuntimeError("inverseTriplet requires a TripletMarginWithDistanceLoss criterion")
+        same_domain = batch[8].to(self.device).float()
+        different_domain = batch[9].to(self.device).float()
+        _, same_domain_feats = model(same_domain)
+        _, different_domain_feats = model(different_domain)
+        # Inverse triplet deliberately treats the different-domain embedding as
+        # the positive and the same-domain embedding as the negative. Minimizing
+        # it removes domain structure without a DANN head or gradient reversal.
+        return inverse_triplet_criterion(feats, different_domain_feats, same_domain_feats)
+
+    def _train_epoch(
+        self,
+        model,
+        domain_head,
+        loader,
+        classif_criterion,
+        dann_criterion,
+        inverse_triplet_criterion,
+        optimizer,
+        epoch_idx,
+        total_epochs,
+    ):
         model.train()
         if domain_head is not None:
             domain_head.train()
@@ -868,10 +948,10 @@ class CNNSupervisedCompare:
                 logits, feats = model(x)
                 classif_loss = classif_criterion(logits, y)
                 domain_loss = torch.tensor(0.0, device=self.device)
-                if _use_domain_loss(self.args.dloss) and domain_head is not None:
-                    rev_feats = ReverseLayerF.apply(feats, 1.0)
-                    domain_logits = domain_head(rev_feats)
-                    domain_loss = domain_criterion(domain_logits, d)
+                domain_loss = self._compute_domain_loss(
+                    model, domain_head, feats, d, batch, dann_criterion,
+                    inverse_triplet_criterion, reverse_dann=True,
+                )
                 total_loss = classif_loss + float(self.args.gamma) * domain_loss
             if self.use_grad_scaler:
                 self.grad_scaler.scale(total_loss).backward(retain_graph=int(self.args.fgsm) == 1)
@@ -884,9 +964,11 @@ class CNNSupervisedCompare:
                     adv_logits, adv_feats = model(adv_x)
                     adv_classif = classif_criterion(adv_logits, y)
                     adv_total = adv_classif
-                    if _use_domain_loss(self.args.dloss) and domain_head is not None:
-                        adv_domain = domain_head(ReverseLayerF.apply(adv_feats, 1.0))
-                        adv_total = adv_total + float(self.args.gamma) * domain_criterion(adv_domain, d)
+                    adv_domain_loss = self._compute_domain_loss(
+                        model, domain_head, adv_feats, d, batch, dann_criterion,
+                        inverse_triplet_criterion, reverse_dann=True,
+                    )
+                    adv_total = adv_total + float(self.args.gamma) * adv_domain_loss
                 if self.use_grad_scaler:
                     self.grad_scaler.scale(0.1 * adv_total).backward()
                 else:
@@ -907,7 +989,18 @@ class CNNSupervisedCompare:
         acc, mcc = _acc_mcc_from_confmat_gpu(confmat)
         return EpochStats(loss=float(np.mean(losses) if losses else 0.0), acc=acc, mcc=mcc)
 
-    def _eval_epoch(self, model, domain_head, loader, classif_criterion, domain_criterion, epoch_idx, total_epochs, phase):
+    def _eval_epoch(
+        self,
+        model,
+        domain_head,
+        loader,
+        classif_criterion,
+        dann_criterion,
+        inverse_triplet_criterion,
+        epoch_idx,
+        total_epochs,
+        phase,
+    ):
         model.eval()
         if domain_head is not None:
             domain_head.eval()
@@ -922,9 +1015,10 @@ class CNNSupervisedCompare:
                     logits, feats = model(x)
                     classif_loss = classif_criterion(logits, y)
                     domain_loss = torch.tensor(0.0, device=self.device)
-                    if _use_domain_loss(self.args.dloss) and domain_head is not None:
-                        domain_logits = domain_head(feats)
-                        domain_loss = domain_criterion(domain_logits, d)
+                    domain_loss = self._compute_domain_loss(
+                        model, domain_head, feats, d, batch, dann_criterion,
+                        inverse_triplet_criterion, reverse_dann=False,
+                    )
                     loss = classif_loss + float(self.args.gamma) * domain_loss
                 pred = logits.argmax(1)
 
@@ -977,8 +1071,12 @@ class CNNSupervisedCompare:
         print("")
         model, feat_dim = self._build_model(variant)
         model = model.to(self.device)
+        print(
+            f"[{variant}] domain objective: "
+            f"{_domain_loss_implementation(self.args.dloss)}"
+        )
         domain_head = None
-        if _use_domain_loss(self.args.dloss):
+        if _domain_loss_kind(self.args.dloss) == "dann":
             domain_head = nn.Linear(int(feat_dim), self.n_domains).to(self.device)
         if torch.cuda.is_available() and str(self.device).startswith("cuda"):
             reset_gpu_peak(self.device)
@@ -994,7 +1092,12 @@ class CNNSupervisedCompare:
             )
 
         classif_criterion = _build_classification_loss(self.args.classif_loss, self.args.label_smoothing)
-        domain_criterion = nn.CrossEntropyLoss()
+        dann_criterion = nn.CrossEntropyLoss() if _domain_loss_kind(self.args.dloss) == "dann" else None
+        inverse_triplet_criterion = (
+            _build_inverse_triplet_loss(self.args.dist_fct, self.args.dmargin)
+            if _domain_loss_kind(self.args.dloss) == "inverse_triplet"
+            else None
+        )
 
         params = list(model.parameters())
         if domain_head is not None:
@@ -1014,16 +1117,20 @@ class CNNSupervisedCompare:
         for epoch in range(total_epochs):
             # Mirror Siamese logging by showing an "all" split pass each epoch.
             self._eval_epoch(
-                model, domain_head, loaders["all"], classif_criterion, domain_criterion, epoch, total_epochs, "all"
+                model, domain_head, loaders["all"], classif_criterion, dann_criterion,
+                inverse_triplet_criterion, epoch, total_epochs, "all"
             )
             tr = self._train_epoch(
-                model, domain_head, loaders["train"], classif_criterion, domain_criterion, optimizer, epoch, total_epochs
+                model, domain_head, loaders["train"], classif_criterion, dann_criterion,
+                inverse_triplet_criterion, optimizer, epoch, total_epochs
             )
             va, va_df = self._eval_epoch(
-                model, domain_head, loaders["valid"], classif_criterion, domain_criterion, epoch, total_epochs, "valid"
+                model, domain_head, loaders["valid"], classif_criterion, dann_criterion,
+                inverse_triplet_criterion, epoch, total_epochs, "valid"
             )
             te, te_df = self._eval_epoch(
-                model, domain_head, loaders["test"], classif_criterion, domain_criterion, epoch, total_epochs, "test"
+                model, domain_head, loaders["test"], classif_criterion, dann_criterion,
+                inverse_triplet_criterion, epoch, total_epochs, "test"
             )
             scheduler.step(va.mcc)
 
@@ -1089,6 +1196,9 @@ class CNNSupervisedCompare:
             "variant": variant,
             "model_name": self.args.model_name,
             "dloss": self.args.dloss,
+            "domain_loss_implementation": _domain_loss_implementation(self.args.dloss),
+            "dist_fct": self.args.dist_fct if _domain_loss_kind(self.args.dloss) == "inverse_triplet" else "",
+            "dmargin": float(self.args.dmargin) if _domain_loss_kind(self.args.dloss) == "inverse_triplet" else None,
             "classif_loss": self.args.classif_loss,
             "fgsm": int(self.args.fgsm),
             "n_calibration": int(self.args.n_calibration),
@@ -1177,7 +1287,11 @@ class CNNSupervisedCompare:
                     'prototypes': 'no',
                     'npos': 1,
                     'nneg': 1,
-                    'dist_fct': 'none',
+                    'dist_fct': (
+                        getattr(self.args, 'dist_fct', 'euclidean')
+                        if _domain_loss_kind(getattr(self.args, 'dloss', 'no')) == 'inverse_triplet'
+                        else 'none'
+                    ),
                     'n_neighbors': 0,
                     'prototype_strategy': 'mean',
                     'prototype_components': 1,
@@ -1305,7 +1419,7 @@ def parse_args():
     parser.add_argument("--bs", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers (-1 uses all CPU cores)")
     parser.add_argument("--n_epochs", type=int, default=80)
-    parser.add_argument("--n_trials", type=int, default=20, help="Number of Optuna trials for hyperparameter optimization")
+    parser.add_argument("--n_trials", type=int, default=40, help="Number of Optuna trials for hyperparameter optimization")
     parser.add_argument("--optuna_pruner", type=str, default="median", choices=["median", "none"],
                         help="Optuna pruner strategy: median (default) or none (disable pruning)")
     parser.add_argument("--early_stop", type=int, default=20)
@@ -1320,8 +1434,16 @@ def parse_args():
     parser.add_argument("--optimizer_type", type=str, default="adam")
     parser.add_argument("--label_smoothing", type=float, default=0.0)
     parser.add_argument("--classif_loss", type=str, default="ce", choices=["ce", "hinge"])
-    parser.add_argument("--dloss", type=str, default="no", choices=["no", "DANN", "inverseTriplet"])
+    parser.add_argument(
+        "--dloss", type=str, default="no", choices=["no", "DANN", "inverseTriplet"],
+        help=(
+            "Domain objective: no; DANN=gradient-reversal domain CE; "
+            "inverseTriplet=reversed domain triplet margin (never routed through DANN)"
+        ),
+    )
     parser.add_argument("--gamma", type=float, default=1.0)
+    parser.add_argument("--dist_fct", type=str, default="euclidean", choices=["euclidean", "cosine"])
+    parser.add_argument("--dmargin", type=float, default=1.0)
     parser.add_argument("--fgsm", type=int, default=0)
     parser.add_argument("--epsilon", type=float, default=0.01)
     parser.add_argument("--verbose", type=int, default=1)
@@ -1404,8 +1526,22 @@ if __name__ == "__main__":
             trial_args.label_smoothing = trial.suggest_float("label_smoothing", 0.0, 0.2)
             trial_args.n_aug = trial.suggest_int("n_aug", 1, 5)
             trial_args.optimizer_type = trial.suggest_categorical("optimizer_type", ["adam", "adamw"])
+            # Favor lighter backbones while still keeping densenet121 in play
+            # because it has shown an early edge in manual trials.
+            trial_args.model_name = trial.suggest_categorical(
+                "model_name", ["resnet18", "densenet121", "efficientnet_b0"]
+            )
+            trial_args.classif_loss = trial.suggest_categorical("classif_loss", ["ce", "hinge"])
+            trial_args.dloss = trial.suggest_categorical("dloss", ["no", "DANN", "inverseTriplet"])
+            trial_args.fgsm = trial.suggest_categorical("fgsm", [0, 1])
+            trial_args.normalize = trial.suggest_categorical(
+                "normalize", ["yes", "no", "per_image", "imagenet"]
+            )
             if str(getattr(trial_args, 'dloss', 'no')).lower() in ["dann", "inversetriplet"]:
                 trial_args.gamma = trial.suggest_float("gamma", 1e-2, 1e2, log=True)
+            if str(getattr(trial_args, 'dloss', 'no')).lower() == "inversetriplet":
+                trial_args.dist_fct = trial.suggest_categorical("dist_fct", ["cosine", "euclidean"])
+                trial_args.dmargin = trial.suggest_float("dmargin", 1e-3, 1.0, log=True)
             if int(getattr(trial_args, 'fgsm', 0)) == 1:
                 trial_args.epsilon = trial.suggest_float("epsilon", 1e-4, 5e-1, log=True)
 

@@ -580,7 +580,7 @@ def args_from_inference_row(base_args, row_dict: Dict[str, Any]):
                 value = float(value)
             except Exception:
                 pass
-        elif attr == "path" and isinstance(value, str) and value and not value.startswith("data/"):
+        elif attr == "path" and isinstance(value, str) and value and not os.path.isabs(value) and not value.startswith("data/"):
             value = os.path.join("data", value)
 
         setattr(args, attr, value)
@@ -601,7 +601,7 @@ def args_from_inference_row(base_args, row_dict: Dict[str, Any]):
             parsed = extract_params_from_log_path(getattr(args, "log_path", None) or row.get("Log Path") or "")
             dataset = parsed.get("Dataset")
             if dataset:
-                args.path = dataset if str(dataset).startswith("data/") else os.path.join("data", str(dataset))
+                args.path = dataset if os.path.isabs(str(dataset)) or str(dataset).startswith("data/") else os.path.join("data", str(dataset))
         except Exception:
             pass
 
@@ -625,6 +625,84 @@ def args_from_inference_row(base_args, row_dict: Dict[str, Any]):
         args.siamese_inference = "knn"
 
     return args
+
+
+# -------------------------------------------------
+# Leakage-safe inference sample selection
+# -------------------------------------------------
+
+def unseen_evaluation_splits_for_args(args) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
+    """Return filename -> split for samples not used in gradient training.
+
+    Validation and test samples are both eligible for inference evaluation.
+    The page reports them separately and together, while excluding ``train``.
+    Missing split provenance fails closed.
+    """
+    raw_path = str(getattr(args, "path", "") or "").strip()
+    if not raw_path:
+        return {}, None, "model dataset path is missing"
+
+    normalized = os.path.normpath(raw_path)
+    candidates = []
+    if os.path.basename(normalized).lower() == "infos.csv":
+        candidates.append(normalized)
+    else:
+        candidates.append(os.path.join(normalized, "infos.csv"))
+        if not os.path.isabs(normalized) and not normalized.startswith("data" + os.sep):
+            candidates.append(os.path.join("data", normalized, "infos.csv"))
+
+    infos_path = next((path for path in candidates if os.path.isfile(path)), None)
+    if infos_path is None:
+        return {}, None, f"no infos.csv found for model dataset: {raw_path}"
+
+    try:
+        infos = pd.read_csv(infos_path)
+    except Exception as exc:
+        return {}, infos_path, f"could not read split manifest: {exc}"
+
+    required = {"name", "group"}
+    missing = sorted(required - set(infos.columns))
+    if missing:
+        return {}, infos_path, f"split manifest is missing columns: {', '.join(missing)}"
+
+    groups = infos["group"].astype(str).str.strip().str.lower()
+    eligible = infos.loc[groups.isin({"valid", "test"}), ["name", "group"]]
+    split_by_name = {
+        os.path.basename(str(row["name"]).strip()).casefold(): str(row["group"]).strip().lower()
+        for _, row in eligible.dropna(subset=["name"]).iterrows()
+        if str(row["name"]).strip()
+    }
+    if not split_by_name:
+        return {}, infos_path, "split manifest contains no group=valid or group=test samples"
+    return split_by_name, infos_path, None
+
+
+def filter_paths_to_unseen_evaluation(
+    image_paths: Iterable[str], args
+) -> Tuple[List[str], Dict[str, str], Optional[str], Optional[str]]:
+    """Keep valid+test image paths and return their split membership."""
+    split_by_name, infos_path, error = unseen_evaluation_splits_for_args(args)
+    if error:
+        return [], {}, infos_path, error
+    filtered = [
+        path for path in image_paths
+        if os.path.basename(str(path)).casefold() in split_by_name
+    ]
+    return filtered, split_by_name, infos_path, None
+
+
+# Backward-compatible wrappers for callers outside the Inference page.
+def untouched_test_filenames_for_args(args) -> Tuple[set[str], Optional[str], Optional[str]]:
+    split_by_name, infos_path, error = unseen_evaluation_splits_for_args(args)
+    return {name for name, split in split_by_name.items() if split == "test"}, infos_path, error
+
+
+def filter_paths_to_untouched_test(image_paths: Iterable[str], args) -> Tuple[List[str], Optional[str], Optional[str]]:
+    split_by_name, infos_path, error = unseen_evaluation_splits_for_args(args)
+    if error:
+        return [], infos_path, error
+    test_names = {name for name, split in split_by_name.items() if split == "test"}
+    return [path for path in image_paths if os.path.basename(str(path)).casefold() in test_names], infos_path, None
 
 
 # -------------------------------------------------

@@ -190,10 +190,16 @@ def args_from_model_row(base_args, row_dict: dict):
     if log_path:
         local_args.log_path = log_path
 
-    dataset = row.get("Dataset") or row.get("dataset")
+    dataset = row.get("Dataset") or row.get("dataset") or getattr(local_args, "path", None)
     if dataset:
-        dataset = str(dataset)
-        local_args.path = dataset if dataset.startswith("data/") else os.path.join("data", dataset)
+        dataset = str(dataset).strip().replace("\\", "/")
+        # Normalize legacy absolute paths that lost their leading slash, including
+        # the malformed data/home/... form that triggered the UI error.
+        if dataset.startswith("data/home/"):
+            dataset = "/" + dataset[len("data/"):]
+        elif dataset.startswith("home/"):
+            dataset = "/" + dataset
+        local_args.path = dataset if os.path.isabs(dataset) or dataset.startswith(("data/", "./data/")) else os.path.join("data", dataset)
 
     return local_args
 

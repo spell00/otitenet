@@ -14,6 +14,7 @@ from .classifiers import (
     fit_knn_classifier,
     fit_linearsvc_classifier,
     fit_logreg_classifier,
+    fit_prototype_classifier,
     fit_baseline_classifiers,
     fit_kde_classifier,
     predict_with_prototypes,
@@ -37,6 +38,7 @@ __all__ = [
     'fit_knn_classifier',
     'fit_linearsvc_classifier',
     'fit_logreg_classifier',
+    'fit_prototype_classifier',
     'fit_baseline_classifiers',
     'fit_kde_classifier',
     'predict_with_prototypes',
@@ -50,4 +52,3 @@ __all__ = [
     'optimize_prototype_components',
     'find_best_classifier',
 ]
-

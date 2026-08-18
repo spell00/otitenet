@@ -26,6 +26,7 @@ from otitenet.offline.history import (
     record_result,
 )
 from otitenet.offline.predictor import load_model, predict
+from otitenet.offline.ui import find_gradcam_image_paths, result_guidance, result_palette
 from otitenet.app.image_processing import preprocessing_trace
 
 
@@ -321,35 +322,14 @@ def _display_label(label: str) -> str:
 
 
 def _result_palette(label: str) -> dict[str, str]:
-    key = _display_label(label).lower()
-    if key == "normal":
-        return {"color": "#15803d", "background": "#f0fdf4", "border": "#86efac"}
-    if key == "not normal":
-        return {"color": "#b91c1c", "background": "#fef2f2", "border": "#fca5a5"}
-    if key == "wax":
-        return {"color": "#ca8a04", "background": "#fefce8", "border": "#fde047"}
-    if key == "tube":
-        return {"color": "#111827", "background": "#f9fafb", "border": "#111827"}
-    return {"color": "#374151", "background": "#f9fafb", "border": "#d1d5db"}
+    return result_palette(label)
 
 
 def _result_guidance(label: str, confidence: float | None) -> str:
-    if confidence is not None and confidence < 0.50:
-        return "Low confidence. Try another photo or consult a doctor."
-
-    key = _display_label(label).lower()
-    if key == "tube":
-        return "A tube is present. The model is limited when a tube is visible."
-    if key == "wax":
-        return "Wax is visible. Clean the ear if appropriate and try again the next day, because cleaning can affect the result."
-    if key == "not normal":
-        return "The model found an abnormal result. Consider consulting a doctor."
-    if key == "normal":
-        return "The image looks normal according to the model."
-    return "Review the result and consult a doctor if symptoms continue."
+    return result_guidance(label, confidence)
 
 
-def _render_result_card(row: dict) -> None:
+def _render_result_card(row: dict, image=None, image_path: str | None = None, gradcam_paths: list[str] | None = None) -> None:
     label = row.get("Prediction", row.get("prediction", "Unknown"))
     confidence_value = row.get("Confidence", row.get("confidence"))
     try:
@@ -386,6 +366,21 @@ def _render_result_card(row: dict) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+    if image is not None:
+        st.image(image, caption=filename or "Uploaded image", use_container_width=True)
+    elif image_path:
+        preview_image, preview_error = _load_history_preview_image(image_path)
+        if preview_image is not None:
+            st.image(preview_image, caption=filename or "Saved image", use_container_width=True)
+        else:
+            st.caption(preview_error)
+
+    if _gradcam_available() and gradcam_paths:
+        st.caption("Grad-CAM highlights")
+        for gc_path in gradcam_paths:
+            if os.path.exists(gc_path):
+                st.image(gc_path, caption=os.path.basename(gc_path), use_container_width=True)
 
 
 def _probability_rows(probabilities: list[dict]) -> list[dict]:
@@ -574,6 +569,12 @@ def render_new_analysis():
                     prediction=result,
                     deployment_manifest=deployment.manifest,
                 )
+                gradcam_dir = os.path.join("data", "offline_gradcam", selected_user["id"])
+                gradcam_paths = (
+                    find_gradcam_image_paths(gradcam_dir, upload["name"], max_count=4)
+                    if _gradcam_available()
+                    else []
+                )
                 rows.append(
                     {
                         "Filename": upload["name"],
@@ -581,6 +582,8 @@ def render_new_analysis():
                         "Confidence": float(result["confidence"]),
                         "Probabilities": result.get("probabilities", []),
                         "Saved At": row.get("timestamp") or row.get("created_at") or "",
+                        "_image_obj": upload["image"],
+                        "_gradcam_paths": gradcam_paths,
                     }
                 )
             except Exception as exc:
@@ -590,6 +593,8 @@ def render_new_analysis():
                         "Prediction": "ERROR",
                         "Confidence": None,
                         "Error": str(exc),
+                        "_image_obj": upload["image"],
+                        "_gradcam_paths": [],
                     }
                 )
 
@@ -602,7 +607,11 @@ def render_new_analysis():
     if rows:
         st.subheader("Result")
         for row in rows:
-            _render_result_card(row)
+            _render_result_card(
+                row,
+                image=row.get("_image_obj"),
+                gradcam_paths=row.get("_gradcam_paths") or [],
+            )
 
         display_rows = []
         for row in rows:
@@ -784,7 +793,13 @@ def render_historics():
     with c2:
         if showing_everyone:
             st.markdown(f"**Person:** {row.get('person_name', 'Offline user')}")
-        _render_result_card(row)
+        gradcam_dir = os.path.join("data", "offline_gradcam", str(row_person_id))
+        gradcam_paths = (
+            find_gradcam_image_paths(gradcam_dir, row.get("filename"), max_count=4)
+            if _gradcam_available()
+            else []
+        )
+        _render_result_card(row, image_path=row.get("image_path"), gradcam_paths=gradcam_paths)
 
         with st.expander("Advanced details", expanded=False):
             st.markdown(f"**Model:** {row.get('model_name')} #{row.get('model_id')}")

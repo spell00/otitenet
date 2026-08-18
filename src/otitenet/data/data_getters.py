@@ -213,6 +213,12 @@ def get_images_loaders(data, random_recs, weighted_sampler,
         resolved_workers = requested_workers
     resolved_workers = max(0, min(int(resolved_workers), int(cpu_count)))
     use_worker_processes = resolved_workers > 0
+    # These loaders are rebuilt after every training epoch so their datasets can
+    # receive the new epoch/prototype state. Persistent workers would keep every
+    # superseded loader's processes, queues, pin-memory thread, and file
+    # descriptors alive until garbage collection, eventually exhausting the
+    # process's fd limit during long Optuna studies.
+    persistent_workers = False
     prefetch_factor = 2 if use_worker_processes else None
 
     # Ensure n_aug is at least 1
@@ -306,7 +312,7 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                             num_workers=resolved_workers,
                             pin_memory=True,
                             drop_last=True,
-                            persistent_workers=use_worker_processes,
+                            persistent_workers=persistent_workers,
                             prefetch_factor=prefetch_factor,
                             worker_init_fn=worker_init_fn
                             )
@@ -317,7 +323,7 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                             num_workers=resolved_workers,
                             pin_memory=True,
                             drop_last=True,
-                            persistent_workers=use_worker_processes,
+                            persistent_workers=persistent_workers,
                             prefetch_factor=prefetch_factor,
                             worker_init_fn=worker_init_fn
                             )
@@ -330,7 +336,7 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                             num_workers=resolved_workers,
                            pin_memory=True,
                            drop_last=False,
-                           persistent_workers=use_worker_processes,
+                           persistent_workers=persistent_workers,
                            prefetch_factor=prefetch_factor,
                            worker_init_fn=worker_init_fn
                            ),
@@ -341,7 +347,7 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                             num_workers=resolved_workers,
                             pin_memory=True,
                             drop_last=False,
-                            persistent_workers=use_worker_processes,
+                            persistent_workers=persistent_workers,
                             prefetch_factor=prefetch_factor,
                             worker_init_fn=worker_init_fn
 
@@ -389,7 +395,7 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                                     num_workers=resolved_workers,
                                     pin_memory=True,
                                     drop_last=False,
-                                    persistent_workers=use_worker_processes,
+                                    persistent_workers=persistent_workers,
                                     prefetch_factor=prefetch_factor,
                                     worker_init_fn=worker_init_fn
                                     )
@@ -406,7 +412,7 @@ def get_images_loaders(data, random_recs, weighted_sampler,
                                 num_workers=resolved_workers,
                                 pin_memory=True,
                                 drop_last=True,
-                                persistent_workers=use_worker_processes,
+                                persistent_workers=persistent_workers,
                                 prefetch_factor=prefetch_factor,
                                 worker_init_fn=worker_init_fn
                                 )        

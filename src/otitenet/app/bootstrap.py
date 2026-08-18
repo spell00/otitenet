@@ -21,6 +21,7 @@ from .database import (
     create_db,
     get_db_connection,
     ensure_results_model_id,
+    ensure_results_log_path_capacity,
     ensure_results_class_scores,
     ensure_results_head_config,
     ensure_best_models_registry_nsize,
@@ -37,6 +38,7 @@ def initialize_database():
         create_db,
         get_db_connection,
         ensure_results_model_id,
+        ensure_results_log_path_capacity,
         ensure_results_class_scores,
         ensure_results_head_config,
         ensure_best_models_registry_nsize,
@@ -73,6 +75,7 @@ def initialize_database():
     conn, cursor = create_db()
 
     conn, cursor = _run_db_step("ensure_results_model_id", ensure_results_model_id, conn, cursor)
+    conn, cursor = _run_db_step("ensure_results_log_path_capacity", ensure_results_log_path_capacity, conn, cursor)
     conn, cursor = _run_db_step("ensure_results_class_scores", ensure_results_class_scores, conn, cursor)
     conn, cursor = _run_db_step("ensure_results_head_config", ensure_results_head_config, conn, cursor)
     conn, cursor = _run_db_step("ensure_best_models_registry_nsize", ensure_best_models_registry_nsize, conn, cursor)

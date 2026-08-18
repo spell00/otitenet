@@ -128,12 +128,12 @@ def _best_head_entry_for_args_global(args):
         pass
     return {}
 
-def _classification_head_options_for_args_global(args):
+def _classification_head_options_for_args_global(args, include_all_n_aug: bool = False):
     """Return cached classification-head options for the args."""
     try:
         from otitenet.app.utils import enumerate_classification_heads
 
-        return list(enumerate_classification_heads(args) or [])
+        return list(enumerate_classification_heads(args, include_all_n_aug=include_all_n_aug) or [])
     except Exception:
         return []
 

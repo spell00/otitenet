@@ -6,7 +6,7 @@ from otitenet.app import utils
 from otitenet.app.services.embedding_optimization_service import args_from_model_row
 
 
-def test_best_display_classifier_heads_keeps_families_but_collapses_knn_neighbors():
+def test_best_display_classifier_heads_keeps_every_trained_head():
     rows = [
         {"Model ID": 1, "N Aug": 0, "Family": "knn", "Classifier": "KNN", "Config": "1", "Valid MCC": 0.50},
         {"Model ID": 1, "N Aug": 0, "Family": "knn", "Classifier": "KNN", "Config": "5", "Valid MCC": 0.70},
@@ -17,12 +17,33 @@ def test_best_display_classifier_heads_keeps_families_but_collapses_knn_neighbor
 
     out = utils.best_display_classifier_heads(rows)
 
-    assert len(out) == 4
-    by_key = {(row["N Aug"], row["Family"]): row for row in out}
-    assert by_key[(0, "knn")]["Config"] == "5"
-    assert by_key[(0, "gmm")]["Config"] == "protot_gmm_2"
-    assert by_key[(0, "logreg")]["Config"] == "baseline_logreg"
-    assert by_key[(1, "knn")]["Config"] == "3"
+    assert len(out) == 5
+    assert {(row["N Aug"], row["Family"], row["Config"]) for row in out} == {
+        (0, "knn", "1"),
+        (0, "knn", "5"),
+        (0, "gmm", "protot_gmm_2"),
+        (0, "logreg", "baseline_logreg"),
+        (1, "knn", "3"),
+    }
+
+
+def test_model_selection_key_distinguishes_optuna_trial_artifacts():
+    common = {
+        "Model Name": "resnet18",
+        "NSize": 224,
+        "Classif_Loss": "ce",
+        "DLoss": "no",
+        "train_datasets": "from_infos_csv",
+        "valid_dataset": "from_infos_csv",
+        "test_dataset": "from_infos_csv",
+    }
+
+    key_1 = utils._make_model_selection_key({**common, "Artifact ID": "trial-uuid-1", "Trial": 1})
+    key_2 = utils._make_model_selection_key({**common, "Artifact ID": "trial-uuid-2", "Trial": 2})
+
+    assert key_1 != key_2
+    assert "artifact:trial-uuid-1" in key_1
+    assert "artifact:trial-uuid-2" in key_2
 
 
 def test_enumerate_classification_heads_exposes_knn_prototype_and_baseline(monkeypatch):

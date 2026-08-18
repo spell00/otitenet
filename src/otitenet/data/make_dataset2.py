@@ -35,6 +35,7 @@ def make_dataset_folder(
     split_mode='by_dataset',
     label_scheme=DEFAULT_LABEL_SCHEME,
     strict_label_map=True,
+    remove_excluded=False,
 ):
     new_path = f"{new_path}_{size}"
     if output_subdir is None:
@@ -69,7 +70,6 @@ def make_dataset_folder(
                     raw_labels = np.concatenate((raw_labels.reshape(1, -1), np.array([label]).reshape(1, -1)), 1)
                     names = np.concatenate((names.reshape(1, -1), np.array([im]).reshape(1, -1)), 1)
                     datasets = np.concatenate((datasets.reshape(1, -1), np.array([dataset]).reshape(1, -1)), 1)
-
             if split_mode == 'by_dataset':
                 new_groups = np.array(['train'] * new_labels.shape[1])
             else:
@@ -197,8 +197,10 @@ def make_dataset_folder(
 
         if dataset == "inference":
             # Load classes.csv for label mapping
+            inclusions = np.array([])
             csv_path = os.path.join(path, dataset, "classes.csv")
             class_map = {}
+            inclusion_map = {}
             if os.path.exists(csv_path):
                 df_classes = pd.read_csv(csv_path)
                 for _, row in df_classes.iterrows():
@@ -206,11 +208,12 @@ def make_dataset_folder(
                         continue
                     fname = os.path.basename(str(row["path"]))
                     class_map[fname] = str(row["class"])
+                    inclusion_map[fname] = str(row["inclusion"])
             else:
                 print(f"[Preprocess] Warning: classes.csv not found at {csv_path}")
 
             for im in os.listdir(f"{path}/{dataset}"):
-                if '.jpg' not in im and '.jpeg' not in im and '.png' not in im:
+                if not im.lower().endswith((".jpg", ".jpeg", ".png")):
                     continue
                 png = Image.open(f"{path}/{dataset}/{im}")
                 if size != -1:
@@ -218,6 +221,10 @@ def make_dataset_folder(
                 png.save(f"{new_path}/{im}")
                 # Use class from csv if available
                 true_class = class_map.get(im, 'unknown')
+                inclusion = inclusion_map.get(im, 'unknown')
+                inclusion = 1 if inclusion == 'inclus' else 0
+                if inclusion == 0 and remove_excluded:
+                    continue  # Skip excluded images
                 try:
                     mapped_label = normalize_label(true_class, scheme=label_scheme, strict=strict_label_map) if true_class != 'unknown' else -1
                 except Exception as e:
@@ -227,6 +234,7 @@ def make_dataset_folder(
                 datasets = np.concatenate((datasets.reshape(1, -1), np.array([dataset]).reshape(1, -1)), 1)
                 raw_labels = np.concatenate((raw_labels.reshape(1, -1), np.array([true_class]).reshape(1, -1)), 1)
                 labels = np.concatenate((labels.reshape(1, -1), np.array([mapped_label]).reshape(1, -1)), 1)
+                inclusions = np.concatenate((inclusions.reshape(1, -1), np.array([inclusion]).reshape(1, -1)), 1)
                 groups = np.concatenate((groups.reshape(1, -1), np.array(['test']).reshape(1, -1)), 1)
 
     df = pd.DataFrame(
@@ -238,6 +246,7 @@ def make_dataset_folder(
             groups.reshape(-1, 1)
             ), 1), columns=['dataset', 'name', 'raw_label', 'label', 'group']
         )
+    # KEEP ONLY rows where INCLUSION is not -1 (i.e., valid labels)
     df.to_csv(f"{new_path}/infos.csv", index=False)
     print(f"[Preprocess] Wrote processed dataset: {new_path}")
 
@@ -256,6 +265,7 @@ def build_from_config(config_path):
         output_subdir = dataset_output_subdir(include, exclude)
     label_scheme = DEFAULT_LABEL_SCHEME
     strict_label_map = bool(cfg.get('strict_label_map', True))
+    remove_excluded = bool(cfg.get('remove_excluded', False))
 
     split_mode = cfg.get('split_mode', 'by_dataset')
     print(
@@ -273,6 +283,7 @@ def build_from_config(config_path):
         split_mode=split_mode,
         label_scheme=label_scheme,
         strict_label_map=strict_label_map,
+        remove_excluded=remove_excluded
     )
 
 if __name__ == '__main__':

@@ -20,6 +20,7 @@ from otitenet.app.utils import (
     _unique_preserve_order,
     assign_stable_model_ids,
     attach_task_column,
+    canonical_dataset_path,
     dedupe_model_rows,
     filter_models_df_by_task,
     get_split_mcc_metrics,
@@ -63,19 +64,16 @@ def _preserve_active_page_for_sidebar_rerun() -> None:
 def _available_dataset_paths(data_dir: str) -> list[str]:
     """Return dataset folders under data_dir, including nested folders with infos.csv."""
     registry_paths = available_dataset_paths_from_registry(data_dir)
-    if registry_paths:
-        return registry_paths
-
-    out = []
+    out = list(registry_paths or [])
     if not os.path.isdir(data_dir):
-        return out
+        return sorted(dict.fromkeys(out))
     for root, _dirs, files in os.walk(data_dir):
         if "infos.csv" not in files:
             continue
         rel = os.path.relpath(root, data_dir).replace("\\", "/")
         if rel != ".":
             out.append(rel)
-    return sorted(out)
+    return sorted(dict.fromkeys(out))
 
 
 def _infer_new_size_from_dataset_path(dataset_path: str, default: int = 224) -> int:
@@ -93,12 +91,25 @@ def _infer_new_size_from_dataset_path(dataset_path: str, default: int = 224) -> 
 
 
 def _canonical_dataset_path(dataset_path: str) -> str:
-    try:
-        text = "" if dataset_path is None or pd.isna(dataset_path) else str(dataset_path)
-    except Exception:
-        text = str(dataset_path or "")
-    text = text.strip().replace("\\", "/")
-    return text
+    return canonical_dataset_path(dataset_path)
+
+
+def _filter_models_df_by_dataset(df: pd.DataFrame, dataset_path: str) -> pd.DataFrame:
+    """Keep only rows proven to belong to the selected dataset."""
+    if df is None or df.empty or not dataset_path:
+        return df
+    if "Dataset" not in df.columns:
+        return df.iloc[0:0].copy()
+    selected_key = _canonical_dataset_path(dataset_path)
+    row_keys = df["Dataset"].map(_canonical_dataset_path)
+    return df[row_keys == selected_key].copy()
+
+
+def _dataset_with_split_fallback(explicit_dataset, inferred_dataset: str) -> str:
+    """Preserve artifact provenance; use the split-derived dataset only if absent."""
+    if _has_value(explicit_dataset):
+        return _canonical_dataset_path(explicit_dataset)
+    return _canonical_dataset_path(inferred_dataset)
 
 
 def _progress_manifest_dataset_paths(task: str = "", model_name: str = "") -> list[str]:
@@ -247,7 +258,12 @@ def _split_combos_for_task_model(cursor, task: str, model_name: str) -> list[str
 
 
 def _progress_manifest_model_rows(task: str = "", model_name: str = "") -> pd.DataFrame:
-    """Return done launcher manifest jobs in the Quick Model Selection row shape."""
+    """Return completed progress rows in the Quick Model Selection row shape.
+
+    The shared leaderboard loader recursively reads both done launcher
+    manifests and ``*_completed_runs_metrics.csv`` files.  Reuse it here so the
+    default "Database + Manifest" inventory includes completed fresh runs too.
+    """
     task_text = str(task or "").strip()
     if not task_text:
         return pd.DataFrame()
@@ -255,6 +271,19 @@ def _progress_manifest_model_rows(task: str = "", model_name: str = "") -> pd.Da
     root = os.path.join("logs", "progresses", task_text)
     if not os.path.isdir(root):
         return pd.DataFrame()
+
+    try:
+        from otitenet.app.pages.leaderboard import _progress_manifest_models_dataframe
+
+        progress_df = _progress_manifest_models_dataframe(task=task_text)
+        if model_name and not progress_df.empty and "Model Name" in progress_df.columns:
+            progress_df = progress_df[
+                progress_df["Model Name"].astype(str) == str(model_name)
+            ]
+        return progress_df.reset_index(drop=True)
+    except Exception:
+        # Retain the legacy manifest-only scanner as a safe fallback.
+        pass
 
     rows = []
     manifest_name = f"PROD_{task_text}_job_manifest.csv"
@@ -434,7 +463,7 @@ def _args_namespace_from_model_row(model_row: dict) -> argparse.Namespace:
     row.update(extract_params_from_log_path(parse_path))
     row = _validate_and_resolve_dataset(row)
     dataset = _first_value(row.get("Dataset"), row.get("path"), default="otite_ds_64")
-    if isinstance(dataset, str) and not dataset.startswith("data/"):
+    if isinstance(dataset, str) and not os.path.isabs(dataset) and not dataset.startswith("data/"):
         dataset = f"data/{dataset}"
     proto_comp = _first_value(row.get("Proto_Comp"), row.get("prototype_components"), default=1)
     try:
@@ -1100,6 +1129,11 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                     from otitenet.app.pages.leaderboard import load_best_models_table
                     _df = load_best_models_table(cursor, task=task, include_sidebar_split=False)
                     _df_from_leaderboard = True
+                    _df = _filter_models_df_by_dataset(_df, dataset_segment)
+                    if _df.empty:
+                        st.info(
+                            "No models found for the selected dataset path in the log tree."
+                        )
                 except Exception as e:
                     st.warning(f"Could not load from leaderboard ({e}), falling back to database+manifest")
                     _df = _append_manifest_model_rows(_df, _manifest_model_df)
@@ -1135,19 +1169,18 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
                     combo_key = _split_combo_key_from_row(_df.loc[idx])
                     inferred_dataset = _dataset_path_for_split_combo(combo_key, physical_datasets)
                     _df.at[idx, "Combo Dataset"] = inferred_dataset
-                    if inferred_dataset:
-                        _df.at[idx, "Dataset"] = inferred_dataset
+                    _df.at[idx, "Dataset"] = _dataset_with_split_fallback(
+                        row.get("Dataset"), inferred_dataset
+                    )
                 _df = attach_task_column(_df)
                 _df = _prefer_source_artifact_paths(_df)
                 _df = filter_models_df_by_task(_df, task)
-                if dataset_segment and "Dataset" in _df.columns:
-                    selected_dataset_key = _canonical_dataset_path(dataset_segment)
-                    _df = _df[_df["Dataset"].astype(str).map(_canonical_dataset_path) == selected_dataset_key]
-                    if _df.empty:
-                        st.info(
-                            "No best models found for the selected dataset path. "
-                            "Choose a dataset path that matches the trained best-model artifacts."
-                        )
+                _df = _filter_models_df_by_dataset(_df, dataset_segment)
+                if _df.empty:
+                    st.info(
+                        "No best models found for the selected dataset path. "
+                        "Choose a dataset path that matches the trained best-model artifacts."
+                    )
                 _task_filtered_df = _df.copy()
                 _manifest_filtered_df = _df[_df.apply(is_done_manifest_model_row, axis=1)].copy()
                 if not _manifest_filtered_df.empty and len(_manifest_filtered_df) < len(_task_filtered_df):
@@ -1899,7 +1932,7 @@ def build_args_from_sidebar(cursor, conn, is_admin, data_dir='./data'):
     )
     args.use_pretrained_encodings = bool(st.session_state.get('use_saved_encodings_tab1', True))
     args.use_trained_encoder = args.use_pretrained_encodings
-    args.siamese_inference = str(_first_value(selected_params.get("siamese_inference"), default="linearsvc"))
+    args.siamese_inference = str(_first_value(selected_params.get("siamese_inference"), default="knn"))
 
     args.prototype_strategy = str(_first_value(
         selected_params.get('Proto_Strat'),

@@ -13,11 +13,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
+from matplotlib import pyplot as plt
 
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression, RidgeClassifier
-from sklearn.metrics import accuracy_score, matthews_corrcoef, precision_recall_fscore_support, roc_auc_score
+from sklearn.metrics import accuracy_score, confusion_matrix, matthews_corrcoef, precision_recall_fscore_support, roc_auc_score
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import LinearSVC, SVC
@@ -29,6 +30,7 @@ from otitenet.app.model_loading import clear_cached_model, resolve_model_paths
 from otitenet.app.utils_dataset_names import get_short_dataset_name, get_short_dataset_names
 from otitenet.app.utils import (
     attach_task_column,
+    inference_train_sample_count_from_row,
     enumerate_classification_heads,
     filter_models_df_by_task,
     format_classifier_config,
@@ -161,13 +163,20 @@ def _normalize_head_entry(entry, model_row, model_args=None):
     model_train_mcc = model_row.get("Train MCC") or model_row.get("train_mcc")
     model_valid_mcc = model_row.get("Valid MCC") or model_row.get("valid_mcc") or model_row.get("MCC") or model_row.get("mcc")
     model_test_mcc = model_row.get("Test MCC") or model_row.get("test_mcc")
+    inference_train_samples = inference_train_sample_count_from_row(model_row)
     log_path = model_row.get("Log Path") or model_row.get("log_path") or getattr(model_args, "log_path", None)
+    fraction_experiment = "inference_fraction" in " ".join(
+        str(model_row.get(key, "") or "").lower()
+        for key in ("Dataset", "Log Path", "Source Run Path", "exp ID", "exp_id", "run_tag")
+    )
     n_calibration = _first_nonblank(
         model_row.get("n_calibration"),
         model_row.get("N_Calibration"),
         model_row.get("N Calibration"),
         getattr(model_args, "n_calibration", None),
     )
+    if fraction_experiment and not _is_blank_value(inference_train_samples):
+        n_calibration = int(inference_train_samples)
     train_datasets = _first_nonblank(
         model_row.get("train_datasets"),
         model_row.get("Train Datasets"),
@@ -193,6 +202,7 @@ def _normalize_head_entry(entry, model_row, model_args=None):
             "Model ID": model_id,
             "Task": task,
             "Model": model_name,
+            "Inference Train Samples": inference_train_samples,
             "Log Path": log_path,
             "train_datasets": train_datasets,
             "valid_dataset": valid_dataset,
@@ -256,6 +266,7 @@ def _normalize_head_entry(entry, model_row, model_args=None):
         "Model ID": model_id,
         "Task": task,
         "Model": model_name,
+        "Inference Train Samples": inference_train_samples,
         "Log Path": log_path,
         "train_datasets": train_datasets,
         "valid_dataset": valid_dataset,
@@ -275,6 +286,11 @@ def _normalize_head_entry(entry, model_row, model_args=None):
         "Test MCC": entry.get("test_mcc", entry.get("Test MCC")),
         "All MCC": entry.get("all_mcc", entry.get("All MCC")),
         "Valid Accuracy": entry.get("valid_accuracy", entry.get("Valid Accuracy", entry.get("accuracy", entry.get("acc", entry.get("Accuracy"))))),
+        "Test Accuracy": entry.get("test_accuracy", entry.get("Test Accuracy")),
+        "Valid Confusion Matrix": entry.get("valid_confusion_matrix", entry.get("Valid Confusion Matrix")),
+        "Valid Confusion Labels": entry.get("valid_confusion_labels", entry.get("Valid Confusion Labels")),
+        "Test Confusion Matrix": entry.get("test_confusion_matrix", entry.get("Test Confusion Matrix")),
+        "Test Confusion Labels": entry.get("test_confusion_labels", entry.get("Test Confusion Labels")),
         "Train AUC": entry.get("train_auc", entry.get("Train AUC")),
         "Valid AUC": valid_auc,
         "Test AUC": entry.get("test_auc", entry.get("Test AUC")),
@@ -288,6 +304,8 @@ def _normalize_head_entry(entry, model_row, model_args=None):
     for key, value in entry.items():
         if (
             key in {"ece", "brier", "valid_ece", "valid_brier", "train_accuracy", "valid_accuracy", "test_accuracy", "all_mcc", "all_auc"}
+            or str(key).endswith("_confusion_matrix")
+            or str(key).endswith("_confusion_labels")
             or " F1 " in str(key)
             or " Recall " in str(key)
             or " Precision " in str(key)
@@ -302,7 +320,7 @@ def _normalize_head_entry(entry, model_row, model_args=None):
 
 
 def _best_display_heads(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Keep one best display row per optimized model/n_aug/family."""
+    """Return every available trained head, preferring current cache rows first."""
     if not rows:
         return []
 
@@ -319,11 +337,7 @@ def _best_display_heads(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         sort_cols = ["Valid MCC"]
         ascending = [False]
 
-    group_cols = [col for col in ["Model ID", "Log Path", "N Aug", "Family"] if col in df.columns]
     df = df.sort_values(sort_cols, ascending=ascending, na_position="last")
-    if group_cols:
-        df = df.groupby(group_cols, as_index=False, dropna=False).first()
-
     df = df.drop(columns=["_current_head_cache"], errors="ignore")
     return df.to_dict("records")
 
@@ -494,6 +508,7 @@ def _load_existing_heads(ctx, top_n):
         "Train MCC", "Valid MCC", "Test MCC",
         "All MCC",
         "Valid Accuracy",
+        "Test Accuracy",
         "Train AUC", "Valid AUC", "Test AUC", "All AUC",
         "Model Train MCC", "Model Valid MCC", "Model Test MCC",
     ]
@@ -647,6 +662,120 @@ def _dedupe_display_columns(df):
     return display_df
 
 
+
+def _matrix_available(value) -> bool:
+    try:
+        arr = np.asarray(value)
+        return arr.ndim == 2 and arr.size > 0
+    except Exception:
+        return False
+
+
+def _metric_display(value) -> str:
+    try:
+        if value is None or pd.isna(value):
+            return "—"
+        return f"{float(value):.4f}"
+    except Exception:
+        return "—"
+
+
+def _render_confusion_matrix_table(matrix, labels, title: str, accuracy=None, mcc=None) -> None:
+    if not _matrix_available(matrix):
+        st.info(f"{title} confusion matrix is not available yet. Retrain/recalculate the classifier head to populate it.")
+        return
+
+    arr = np.asarray(matrix, dtype=int)
+    labels = list(labels or [])
+    if len(labels) != arr.shape[0]:
+        labels = [str(i) for i in range(arr.shape[0])]
+
+    st.markdown(f"**{title}**  ")
+    c1, c2 = st.columns(2)
+    c1.metric(f"{title} ACC", _metric_display(accuracy))
+    c2.metric(f"{title} MCC", _metric_display(mcc))
+
+    cm_df = pd.DataFrame(
+        arr,
+        index=pd.Index(labels, name="True"),
+        columns=pd.Index(labels, name="Predicted"),
+    )
+    st.dataframe(cm_df, use_container_width=True)
+
+    fig, ax = plt.subplots(figsize=(4.8, 4.0))
+    row_sums = arr.sum(axis=1, keepdims=True)
+    normalized = np.divide(arr, row_sums, out=np.zeros_like(arr, dtype=float), where=row_sums != 0)
+    im = ax.imshow(normalized, interpolation="nearest", cmap=plt.cm.Blues, vmin=0.0, vmax=1.0)
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_yticklabels(labels)
+    ax.set_xlabel("Predicted label")
+    ax.set_ylabel("True label")
+    ax.set_title(f"{title} confusion matrix")
+    for i in range(arr.shape[0]):
+        for j in range(arr.shape[1]):
+            color = "white" if normalized[i, j] > 0.5 else "black"
+            ax.text(j, i, str(arr[i, j]), ha="center", va="center", color=color)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Row-normalized")
+    fig.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+
+def _render_head_confusion_matrices(heads_df: pd.DataFrame) -> None:
+    if heads_df is None or heads_df.empty:
+        return
+    has_matrix = False
+    for col in ["Valid Confusion Matrix", "Test Confusion Matrix"]:
+        if col in heads_df.columns and heads_df[col].apply(_matrix_available).any():
+            has_matrix = True
+            break
+    if not has_matrix:
+        return
+
+    st.subheader("Valid/Test confusion matrices")
+    st.caption("Matrices are stored from classifier-head scoring; older cache rows may need retraining/recalculation before matrices appear.")
+
+    view_df = heads_df.copy().reset_index(drop=True)
+    def _label(row):
+        bits = [
+            f"Model {row.get('Model ID', '—')}",
+            str(row.get("Model", "")),
+            f"n_aug={row.get('N Aug', '—')}",
+            str(row.get("Head", row.get("Config", ""))),
+            f"valid MCC={_metric_display(row.get('Valid MCC'))}",
+            f"test MCC={_metric_display(row.get('Test MCC'))}",
+        ]
+        return " | ".join([b for b in bits if str(b).strip()])
+
+    labels = [_label(row) for _, row in view_df.iterrows()]
+    selected_label = st.selectbox(
+        "Head to inspect",
+        labels,
+        index=0,
+        key="learned_embedding_confusion_head_select",
+    )
+    row = view_df.iloc[labels.index(selected_label)]
+
+    valid_col, test_col = st.columns(2)
+    with valid_col:
+        _render_confusion_matrix_table(
+            row.get("Valid Confusion Matrix"),
+            row.get("Valid Confusion Labels"),
+            "Valid",
+            accuracy=row.get("Valid Accuracy"),
+            mcc=row.get("Valid MCC"),
+        )
+    with test_col:
+        _render_confusion_matrix_table(
+            row.get("Test Confusion Matrix"),
+            row.get("Test Confusion Labels"),
+            "Test",
+            accuracy=row.get("Test Accuracy"),
+            mcc=row.get("Test MCC"),
+        )
+
 def _render_head_tables(heads_df):
     if heads_df is None or len(heads_df) == 0:
         st.warning(
@@ -665,6 +794,7 @@ def _render_head_tables(heads_df):
     display_cols = [
         "Model ID",
         "Model",
+        "Inference Train Samples",
         "Task",
         "N Classes",
         "Labels",
@@ -713,6 +843,7 @@ def _render_head_tables(heads_df):
         best_cols = [
             "Model ID",
             "Model",
+            "Inference Train Samples",
             "Task",
             "N Classes",
             "Labels",
@@ -729,6 +860,7 @@ def _render_head_tables(heads_df):
             "Test MCC",
             "All MCC",
             "Valid Accuracy",
+            "Test Accuracy",
             "Train AUC",
             "Valid AUC",
             "Test AUC",
@@ -738,6 +870,8 @@ def _render_head_tables(heads_df):
         best_cols = [c for c in best_cols if c in best.columns]
 
         st.dataframe(best[best_cols], use_container_width=True)
+
+    _render_head_confusion_matrices(best if len(best) > 0 else display_df)
 
 
 def _render_training_dataset_filter(df: pd.DataFrame) -> pd.DataFrame:
@@ -956,6 +1090,35 @@ def _per_class_metrics(y_true, y_pred, class_names=None, prefix: str | None = No
         return {}
 
 
+def _label_name_for_value(label, class_names=None) -> str:
+    try:
+        idx = int(label)
+        if class_names is not None and 0 <= idx < len(class_names):
+            return str(class_names[idx])
+    except Exception:
+        pass
+    return str(label)
+
+
+def _confusion_matrix_metrics(y_true, y_pred, class_names=None, prefix: str | None = None) -> Dict[str, Any]:
+    if not prefix:
+        return {}
+    try:
+        y_arr = np.asarray(y_true)
+        pred_arr = np.asarray(y_pred)
+        labels = np.asarray(sorted(np.unique(np.concatenate([y_arr, pred_arr])).tolist()))
+        if labels.size == 0:
+            return {}
+        cm = confusion_matrix(y_arr, pred_arr, labels=labels)
+        prefix_key = str(prefix).strip().lower()
+        return {
+            f"{prefix_key}_confusion_matrix": cm.astype(int).tolist(),
+            f"{prefix_key}_confusion_labels": [_label_name_for_value(label, class_names) for label in labels],
+        }
+    except Exception:
+        return {}
+
+
 def _prediction_metrics(y_true, y_pred, scores=None, classes=None, class_names=None, prefix: str | None = None) -> Dict[str, float]:
     try:
         mcc = _evaluate_mcc(y_true, y_pred)
@@ -975,6 +1138,7 @@ def _prediction_metrics(y_true, y_pred, scores=None, classes=None, class_names=N
         "brier": cal.get("brier", np.nan),
     }
     out.update(_per_class_metrics(y_true, y_pred, class_names=class_names, prefix=prefix))
+    out.update(_confusion_matrix_metrics(y_true, y_pred, class_names=class_names, prefix=prefix))
     return out
 
 
@@ -1263,6 +1427,12 @@ def _split_metric_fields(train_metrics, valid_metrics, test_metrics=None, all_me
         "brier": valid_metrics.get("brier"),
         "valid_ece": valid_metrics.get("ece"),
         "valid_brier": valid_metrics.get("brier"),
+        "train_confusion_matrix": train_metrics.get("train_confusion_matrix"),
+        "train_confusion_labels": train_metrics.get("train_confusion_labels"),
+        "valid_confusion_matrix": valid_metrics.get("valid_confusion_matrix"),
+        "valid_confusion_labels": valid_metrics.get("valid_confusion_labels"),
+        "test_confusion_matrix": test_metrics.get("test_confusion_matrix"),
+        "test_confusion_labels": test_metrics.get("test_confusion_labels"),
     }
     for source in (valid_metrics, test_metrics):
         for key, value in source.items():
@@ -2484,6 +2654,7 @@ def _display_training_results(payload: Dict[str, Any], replay: bool = False):
         trained_cols = [
             "Model ID",
             "Model",
+            "Inference Train Samples",
             "n_calibration",
             "N Aug",
             "Classifier",
@@ -2491,6 +2662,8 @@ def _display_training_results(payload: Dict[str, Any], replay: bool = False):
             "Train MCC",
             "Valid MCC",
             "Test MCC",
+            "Valid Accuracy",
+            "Test Accuracy",
             "Train AUC",
             "Valid AUC",
             "Test AUC",
@@ -2535,102 +2708,103 @@ def _render_training_controls(ctx):
 
     st.caption(
         "This does not retrain the neural network. It freezes the selected embedding model, "
-        "encodes train/valid samples, then fits KNN, prototype, and baseline classifier heads."
+        "encodes train/valid samples, then fits KNN, prototype, and baseline classifier heads. "
+        "Settings are batched: changing them does not rerun the page until you submit the form."
     )
 
-    with st.expander("Training settings", expanded=True):
-        c1, c2, c3 = st.columns(3)
+    with st.form("learned_embedding_training_settings_form", clear_on_submit=False):
+        with st.expander("Training settings", expanded=True):
+            c1, c2, c3 = st.columns(3)
 
-        with c1:
-            train_target = st.radio(
-                "What to train",
-                ["Current sidebar model", "Top N models in bulk"],
-                index=0,
-                key="learned_train_target",
+            with c1:
+                train_target = st.radio(
+                    "What to train",
+                    ["Current sidebar model", "Top N models in bulk"],
+                    index=0,
+                    key="learned_train_target",
+                )
+                bulk_all_models = st.checkbox(
+                    "Bulk: all available models",
+                    value=True,
+                    key="learned_train_all_models",
+                    disabled=(train_target != "Top N models in bulk"),
+                )
+
+                bulk_top_n = st.number_input(
+                    "Bulk: top N models",
+                    min_value=1,
+                    max_value=200,
+                    value=20,
+                    step=1,
+                    key="learned_train_bulk_top_n",
+                    disabled=(train_target != "Top N models in bulk") or bulk_all_models,
+                )
+
+            with c2:
+                k_max = st.number_input(
+                    "Max K for KNN",
+                    min_value=1,
+                    max_value=100,
+                    value=20,
+                    step=1,
+                    key="learned_train_k_max",
+                )
+
+                proto_max = st.number_input(
+                    "Max prototype components",
+                    min_value=1,
+                    max_value=20,
+                    value=5,
+                    step=1,
+                    key="learned_train_proto_max",
+                )
+
+            with c3:
+                current_n_aug = int(getattr(ctx.args, "n_aug", 0) or 0)
+                n_aug_text = st.text_input(
+                    "n_aug value(s)",
+                    value=str(current_n_aug),
+                    key="learned_train_n_aug_values",
+                    help=(
+                        "One or more n_aug values, comma-separated. "
+                        "Example: 0,1,2. Each value is saved as a separate key in knn_optimization_cache.pkl."
+                    ),
+                )
+                include_knn = st.checkbox("KNN", value=True, key="learned_train_include_knn")
+                include_prototypes = st.checkbox("Prototypes", value=True, key="learned_train_include_prototypes")
+                include_baselines = st.checkbox("Baselines", value=True, key="learned_train_include_baselines")
+                skip_existing = st.checkbox(
+                    "Skip existing n_aug cache entries",
+                    value=True,
+                    key="learned_train_skip_existing",
+                    help=(
+                        "Use this to resume after an interrupted bulk run. "
+                        "Uncheck to recalculate and replace existing entries."
+                    ),
+                )
+
+            prototype_strategies = st.multiselect(
+                "Prototype strategies",
+                ["mean", "kmeans", "gmm"],
+                default=["mean", "kmeans", "gmm"],
+                key="learned_train_proto_strategies",
+                disabled=not include_prototypes,
             )
-            bulk_all_models = st.checkbox(
-                "Bulk: all available models",
-                value=True,
-                key="learned_train_all_models",
-                disabled=(train_target != "Top N models in bulk"),
+            baseline_options = list(BASELINE_DISPLAY_NAMES.keys())
+            baseline_labels = {name: BASELINE_DISPLAY_NAMES.get(name, name) for name in baseline_options}
+            selected_baselines = st.multiselect(
+                "Baseline classifiers",
+                baseline_options,
+                default=baseline_options,
+                format_func=lambda name: baseline_labels.get(name, name),
+                key="learned_train_baseline_classifiers",
+                disabled=not include_baselines,
             )
 
-            bulk_top_n = st.number_input(
-                "Bulk: top N models",
-                min_value=1,
-                max_value=200,
-                value=20,
-                step=1,
-                key="learned_train_bulk_top_n",
-                disabled=(train_target != "Top N models in bulk") or bulk_all_models,
-            )
-
-        with c2:
-            k_max = st.number_input(
-                "Max K for KNN",
-                min_value=1,
-                max_value=100,
-                value=20,
-                step=1,
-                key="learned_train_k_max",
-            )
-
-            proto_max = st.number_input(
-                "Max prototype components",
-                min_value=1,
-                max_value=20,
-                value=5,
-                step=1,
-                key="learned_train_proto_max",
-            )
-
-        with c3:
-            current_n_aug = int(getattr(ctx.args, "n_aug", 0) or 0)
-            n_aug_text = st.text_input(
-                "n_aug value(s)",
-                value=str(current_n_aug),
-                key="learned_train_n_aug_values",
-                help=(
-                    "One or more n_aug values, comma-separated. "
-                    "Example: 0,1,2. Each value is saved as a separate key in knn_optimization_cache.pkl."
-                ),
-            )
-            include_knn = st.checkbox("KNN", value=True, key="learned_train_include_knn")
-            include_prototypes = st.checkbox("Prototypes", value=True, key="learned_train_include_prototypes")
-            include_baselines = st.checkbox("Baselines", value=True, key="learned_train_include_baselines")
-            skip_existing = st.checkbox(
-                "Skip existing n_aug cache entries",
-                value=True,
-                key="learned_train_skip_existing",
-                help=(
-                    "Use this to resume after an interrupted bulk run. "
-                    "Uncheck to recalculate and replace existing entries."
-                ),
-            )
-
-        prototype_strategies = st.multiselect(
-            "Prototype strategies",
-            ["mean", "kmeans", "gmm"],
-            default=["mean", "kmeans", "gmm"],
-            key="learned_train_proto_strategies",
-            disabled=not include_prototypes,
+        run = st.form_submit_button(
+            "🚀 Train / recalculate heads",
+            type="primary",
         )
-        baseline_options = list(BASELINE_DISPLAY_NAMES.keys())
-        baseline_labels = {name: BASELINE_DISPLAY_NAMES.get(name, name) for name in baseline_options}
-        selected_baselines = st.multiselect(
-            "Baseline classifiers",
-            baseline_options,
-            default=baseline_options,
-            format_func=lambda name: baseline_labels.get(name, name),
-            key="learned_train_baseline_classifiers",
-            disabled=not include_baselines,
-        )
-
-    run = st.button(
-        "🚀 Train / recalculate heads",
-        type="primary",
-        key="learned_train_run",
-    )
 
     if not run:
         _display_training_results(st.session_state.get("learned_last_training_payload"), replay=True)

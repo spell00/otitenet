@@ -44,6 +44,7 @@ from otitenet.ml import (
     evaluate_knn_with_k_search,
     fit_knn_classifier,
     fit_linearsvc_classifier,
+    fit_prototype_classifier,
     fit_logreg_classifier,
     evaluate_all_classifiers,
     fit_baseline_classifiers,
@@ -821,6 +822,11 @@ class TrainAE:
             'prototype': run_id['prototypes'],
             'prototypes': run_id['prototypes'],
             'dloss': run_id['dloss'],
+            'domain_loss_implementation': {
+                'no': 'none',
+                'dann': 'gradient_reversal_domain_cross_entropy',
+                'inversetriplet': 'reversed_domain_triplet_margin_alternating',
+            }.get(str(run_id['dloss']).lower(), str(run_id['dloss'])),
             'BER': run_id['BER'],
             'fgsm': run_id['fgsm'],
             'normalize': run_id['normalize'],
@@ -1846,7 +1852,7 @@ class TrainAE:
                 prev_epoch_end = time.perf_counter()
 
             early_stop_counter = 0
-            if self.args.n_calibration > 0:
+            if self.args.n_calibration > 0 and not bool(getattr(self.args, 'calibration_preassigned_train', 0)):
                 print("\n========== ENTERING CALIBRATION PHASE ==========")
                 print(f"Calibration epochs: {self.args.n_epochs} | n_calibration={self.args.n_calibration}")
                 for epoch in range(0, self.args.n_epochs):
@@ -2749,7 +2755,8 @@ class TrainAE:
                 if group in ['train']:
                     if i == 0 and int(getattr(self.args, 'save_debug_images', 0)):
                         save_tensor(data[0], f'{self.complete_log_path}/{group}_data.png')
-                    # total_loss = classif_loss + gamma * dloss
+                    # Supervised/classification update. Domain objectives are
+                    # optimized in the separate `all` update immediately below.
                     if self.use_grad_scaler:
                         self.grad_scaler.scale(classif_loss).backward()
                     else:
@@ -2757,6 +2764,9 @@ class TrainAE:
                     # nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
                 elif group in ['all']:
                     if gamma > 0:
+                        # This is a real, separate domain-objective update:
+                        # DANN uses domain CE; inverseTriplet uses the reversed
+                        # domain triplet constructed in get_losses().
                         dloss = gamma * dloss
                         if self.use_grad_scaler:
                             self.grad_scaler.scale(dloss).backward()
@@ -3297,6 +3307,13 @@ class TrainAE:
                     classifier_fit_s += time.perf_counter() - fit_start
                     embedding_classifier_kind = 'logisticregression'
                     print(f"Using LogisticRegression classifier on embeddings (train_n={train_encs.shape[0]}, fit_s={classifier_fit_s:.3f})")
+                elif embedding_classifier is None and siamese_inference == 'prototype':
+                    fit_start = time.perf_counter()
+                    prototype_result = fit_prototype_classifier(train_encs, train_cats, strategy='mean', metric='euclidean')
+                    embedding_classifier = prototype_result['classifier']
+                    classifier_fit_s += time.perf_counter() - fit_start
+                    embedding_classifier_kind = 'prototype'
+                    print(f"Using Prototype classifier on embeddings (train_n={train_encs.shape[0]}, strategy=mean, fit_s={classifier_fit_s:.3f})")
                 if embedding_classifier is not None and cached is None:
                     cache[cache_key] = (embedding_classifier, embedding_classifier_kind)
                     self._embedding_classifier_cache = cache
@@ -4174,6 +4191,12 @@ class TrainAE:
         n_calibration = int(getattr(self.args, 'n_calibration', 0) or 0)
         if n_calibration == 0:
             return
+        if bool(getattr(self.args, 'calibration_preassigned_train', 0)):
+            print(
+                f"[CalibrationSplit] n_calibration={n_calibration} is already preassigned "
+                "to group=train in infos.csv; valid/test are left unchanged."
+            )
+            return
 
         if self._apply_calibration_manifest(self._calibration_manifest_path(data_getter), data_getter, n_calibration):
             return
@@ -4446,9 +4469,11 @@ if __name__ == "__main__":
     parser.add_argument('--dloss', type=str, default=None, help='domain loss - if None, will optimize')
     parser.add_argument('--classif_loss', type=str, default=None, help='triplet or cosine - if None, will optimize')
     parser.add_argument('--task', type=str, default='notNormal', help='Binary classification?')
+    parser.add_argument('--kind', type=str, default='', choices=['', 'siamese', 'cnn_mlp'],                        help='Explicit run family for metadata; defaults to the legacy loss-based heuristic')
     parser.add_argument('--is_stn', type=int, default=1, help='Transform train data?')
     parser.add_argument('--weighted_sampler', type=int, default=1, help='Weighted sampler?')
-    parser.add_argument('--n_calibration', type=int, default=0, help='Total number of proportional stratified calibration samples to draw from valid/test (0 disables calibration)')
+    parser.add_argument('--n_calibration', type=int, default=0, help='Number of calibration/inference-support samples represented by the run')
+    parser.add_argument('--calibration_preassigned_train', type=int, default=0, choices=[0, 1], help='1 when n_calibration samples are already assigned to group=train in infos.csv; do not redraw from valid/test or run a second calibration phase')
     parser.add_argument('--calibration_manifest_path', type=str, default='', help='Optional splits/calibration.csv to reuse exact calibration samples during retraining')
     parser.add_argument('--remove_noisy_samples', type=int, default=0, help='Remove noisy samples?')
     parser.add_argument('--noisy_cluster_limit', type=int, default=10, help='Noisy cluster limit?')
@@ -4456,7 +4481,7 @@ if __name__ == "__main__":
     parser.add_argument('--prototype_strategy', type=str, default='mean', choices=['mean', 'kmeans', 'gmm'], help='TRAINING: How to aggregate/learn prototypes during training (mean/kmeans/gmm). Determines shape of prototype set.')
     parser.add_argument('--prototype_components', type=int, default=1, help='Components/centroids per class for prototype aggregation (used with kmeans/gmm during training)')
     parser.add_argument('--prototype_kind', type=str, default='distance', choices=['distance', 'kde', 'distance_weighted'], help='VALIDATION: How to classify using learned prototypes at test time (distance/kde/distance_weighted)')
-    parser.add_argument('--siamese_inference', type=str, default='linearsvc', choices=['knn', 'mlp_head', 'linearsvc', 'logisticregression'], help='Siamese inference classifier over embeddings: knn, mlp_head, linearsvc, or logisticregression')
+    parser.add_argument('--siamese_inference', type=str, default='linearsvc', choices=['knn', 'mlp_head', 'linearsvc', 'logisticregression', 'prototype'], help='Siamese inference classifier over embeddings: knn, mlp_head, linearsvc, or logisticregression')
     parser.add_argument('--kde_kernel', type=str, default='gaussian', choices=['gaussian', 'exponential', 'linear', 'tophat'], help='KDE kernel type')
     parser.add_argument('--kde_bandwidth', type=str, default='scott', help='KDE bandwidth: scott, silverman, or float value')
     parser.add_argument('--n_positives', type=int, default=None, help='Number of positive samples per anchor - if None, will optimize (only for triplet-based losses)')

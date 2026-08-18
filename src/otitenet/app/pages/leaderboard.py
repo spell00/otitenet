@@ -1,8 +1,10 @@
 import argparse
+import glob
 import io
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -31,8 +33,10 @@ from otitenet.app.utils import (
     _unique_preserve_order,
     apply_selection_keys_to_models_df,
     assign_stable_model_ids,
+    attach_inference_train_sample_count,
     attach_task_column,
     best_cached_head_metrics_for_model_row,
+    canonical_dataset_path,
     ensure_int,
     ensure_calibration_alias_columns,
     extract_params_from_log_path,
@@ -63,6 +67,15 @@ from otitenet.utils.utils import get_empty_traces
 # -------------------------------------------------
 # Shared helpers
 # -------------------------------------------------
+
+_FRESH_FRACTIONS = ["0p02", "0p05", "0p1", "0p25", "0p5"]
+_FRESH_FRACTION_CALIBRATION = {
+    "0p5": 131,
+    "0p25": 66,
+    "0p1": 26,
+    "0p05": 13,
+    "0p02": 5,
+}
 
 def _k(page_key: str, key: str) -> str:
     """Namespace Streamlit keys so this page can be rendered in multiple tabs."""
@@ -214,7 +227,7 @@ def _apply_model_row_to_args(args, row_dict: Dict[str, Any]):
     dataset = _first_value(row.get("Dataset"), parsed.get("Dataset"))
     if _has_value(dataset):
         dataset = str(dataset)
-        local_args.path = dataset if dataset.startswith("data/") else os.path.join("data", dataset)
+        local_args.path = dataset if os.path.isabs(dataset) or dataset.startswith("data/") else os.path.join("data", dataset)
 
     return local_args
 
@@ -317,6 +330,176 @@ def _load_model_row_metadata(row: dict) -> dict:
             continue
 
     return {}
+
+
+def _leaderboard_project_root() -> Path:
+    """Return the repository root for locating comparison CSV artifacts."""
+    return Path(__file__).resolve().parents[4]
+
+
+def _find_project_artifact(filename: str) -> Optional[Path]:
+    """Return the first matching artifact path under the project root."""
+    project_root = _leaderboard_project_root()
+    direct = project_root / filename
+    if direct.exists():
+        return direct
+
+    pattern = str(project_root / "**" / filename)
+    matches = sorted(Path(match) for match in glob.glob(pattern, recursive=True))
+    return matches[0] if matches else None
+
+
+def _best_row_by_metric(df: pd.DataFrame, metric_col: str) -> Optional[pd.Series]:
+    if df is None or df.empty or metric_col not in df.columns:
+        return None
+    metric = pd.to_numeric(df[metric_col], errors="coerce")
+    if metric.notna().any():
+        return df.loc[metric.idxmax()]
+    return None
+
+
+def _normalized_model_value(row: pd.Series, *columns: str) -> str:
+    """Return the first populated model-table value as normalized lowercase text."""
+    for column in columns:
+        value = row.get(column)
+        if _has_value(value):
+            return str(value).strip().lower()
+    return ""
+
+
+def _inference_fraction_model_rows(models_df: pd.DataFrame, fraction: str) -> pd.DataFrame:
+    """Select app model rows for one hist-v2 fraction and the inference split."""
+    if models_df is None or models_df.empty:
+        return pd.DataFrame()
+
+    df = models_df.copy()
+    valid = df.apply(
+        lambda row: _normalized_model_value(row, "valid_dataset", "Valid Dataset") == "inference",
+        axis=1,
+    )
+    test = df.apply(
+        lambda row: _normalized_model_value(row, "test_dataset", "Test Dataset") == "inference",
+        axis=1,
+    )
+    n_calibration = pd.to_numeric(
+        df.get("N_Calibration", df.get("n_calibration")), errors="coerce"
+    )
+    expected_n = _FRESH_FRACTION_CALIBRATION[fraction]
+    dataset_token = f"inference_fraction_hist_v2_train{fraction}_seed42"
+    model_paths = df.apply(
+        lambda row: " ".join(
+            str(_first_value(row.get(column), default=""))
+            for column in (
+                "Dataset",
+                "Log Path",
+                "Artifact Log Path",
+                "Best Model Dir",
+                "Source Run Path",
+            )
+        ).lower(),
+        axis=1,
+    )
+    return df[
+        valid
+        & test
+        & n_calibration.eq(expected_n)
+        & model_paths.str.contains(dataset_token, regex=False)
+    ].copy()
+
+
+def _is_cnn_model_row(row: pd.Series) -> bool:
+    """Apply the app convention: CE with no distance loss is a non-Siamese CNN."""
+    classif_loss = _normalized_model_value(row, "Classif_Loss", "classif_loss", "loss")
+    dist_fct = _normalized_model_value(row, "Dist_Fct", "dist_fct")
+    return classif_loss == "ce" and dist_fct == "none"
+
+
+def _is_mlp_head_row(row: pd.Series) -> bool:
+    """Return whether the displayed app head is an MLP head."""
+    head = _normalized_model_value(
+        row,
+        "Head Config",
+        "Head",
+        "best_head_config",
+        "best_head_name",
+    )
+    return "mlp" in head
+
+
+def _fresh_score_comparison_table(models_df: pd.DataFrame) -> pd.DataFrame:
+    """Compare app-selected retrained heads with original fresh CNN/MLP runs."""
+    base_path = _find_project_artifact("inference_fraction_best_by_architecture.csv")
+    if base_path is None and (models_df is None or models_df.empty):
+        return pd.DataFrame()
+
+    base_df = pd.read_csv(base_path) if base_path is not None else pd.DataFrame()
+    if not base_df.empty and "fraction" in base_df.columns:
+        base_df["fraction"] = base_df["fraction"].astype(str)
+
+    rows: List[Dict[str, Any]] = []
+    for fraction in _FRESH_FRACTIONS:
+        row: Dict[str, Any] = {
+            "fraction": fraction,
+            "n_calibration": _FRESH_FRACTION_CALIBRATION[fraction],
+        }
+
+        if not base_df.empty and "fraction" in base_df.columns:
+            base_match = base_df[base_df["fraction"] == fraction]
+            if not base_match.empty:
+                row["CNN/MLP"] = pd.to_numeric(
+                    pd.Series([base_match.iloc[0].get("cnn_mlp_best_mcc")]),
+                    errors="coerce",
+                ).iloc[0]
+
+        fraction_models = _inference_fraction_model_rows(models_df, fraction)
+        if not fraction_models.empty and "Valid MCC" in fraction_models.columns:
+            cnn_mask = fraction_models.apply(_is_cnn_model_row, axis=1)
+            siamese_best = _best_row_by_metric(fraction_models[~cnn_mask], "Valid MCC")
+            if siamese_best is not None:
+                row["Siamese"] = pd.to_numeric(
+                    pd.Series([siamese_best.get("Valid MCC")]), errors="coerce"
+                ).iloc[0]
+                row["Siamese head"] = _first_value(
+                    siamese_best.get("Head"), siamese_best.get("Head Config")
+                )
+                row["Siamese n_aug"] = _first_value(
+                    siamese_best.get("Head N Aug"), siamese_best.get("N Aug")
+                )
+
+            custom_cnn = fraction_models[
+                cnn_mask & ~fraction_models.apply(_is_mlp_head_row, axis=1)
+            ]
+            cnn_best = _best_row_by_metric(custom_cnn, "Valid MCC")
+            if cnn_best is not None:
+                row["CNN/head"] = pd.to_numeric(
+                    pd.Series([cnn_best.get("Valid MCC")]), errors="coerce"
+                ).iloc[0]
+                row["CNN/head classifier"] = _first_value(
+                    cnn_best.get("Head"), cnn_best.get("Head Config")
+                )
+                row["CNN/head n_aug"] = _first_value(
+                    cnn_best.get("Head N Aug"), cnn_best.get("N Aug")
+                )
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    ordered_cols = [
+        "fraction",
+        "n_calibration",
+        "Siamese",
+        "Siamese head",
+        "Siamese n_aug",
+        "CNN/MLP",
+        "CNN/head",
+        "CNN/head classifier",
+        "CNN/head n_aug",
+    ]
+    df = df[[column for column in ordered_cols if column in df.columns]]
+    df["fraction"] = pd.Categorical(df["fraction"], categories=_FRESH_FRACTIONS, ordered=True)
+    df = df.sort_values("fraction").reset_index(drop=True)
+    df["fraction"] = df["fraction"].astype(str)
+    return df
 
 
 # -------------------------------------------------
@@ -556,6 +739,7 @@ def _dataset_path_from_run_metadata(run_path: str) -> str:
     return dataset
 
 
+@st.cache_data(ttl=300, show_spinner=False)  # Cache CSV reads for 5 min
 def _progress_manifest_models_dataframe(task: Optional[str] = None) -> pd.DataFrame:
     task_text = str(task or "").strip()
     roots = []
@@ -721,7 +905,7 @@ def _progress_manifest_models_dataframe(task: Optional[str] = None) -> pd.DataFr
     return pd.DataFrame(rows)
 
 
-def _merge_db_and_log_tree_models(db_df: pd.DataFrame) -> pd.DataFrame:
+def _merge_db_and_log_tree_models(db_df: pd.DataFrame, task: Optional[str] = None) -> pd.DataFrame:
     tree_df = _models_dataframe_from_log_tree()
     if tree_df.empty:
         out = db_df
@@ -747,7 +931,7 @@ def _merge_db_and_log_tree_models(db_df: pd.DataFrame) -> pd.DataFrame:
         ]
         out = db_df if tree_df.empty else pd.concat([db_df, tree_df], ignore_index=True, sort=False)
 
-    manifest_df = _progress_manifest_models_dataframe()
+    manifest_df = _progress_manifest_models_dataframe(task=task)
     if manifest_df.empty:
         return out
     if out is None or out.empty:
@@ -978,7 +1162,7 @@ def _order_model_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = ensure_calibration_alias_columns(df)
 
     preferred_non_metric = [
-        "Model ID", "Registry ID", "exp ID", "Task", "N Classes", "Labels", "Model Name", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
+        "Model ID", "Registry ID", "Artifact ID", "exp ID", "Trial", "Task", "N Classes", "Labels", "Model Name", "Inference Train Samples", "NSize", "FGSM", "Prototypes", "NPos", "NNeg",
         "DLoss", "Dist_Fct", "Classif_Loss", "N_Calibration", "Normalize",
         "N_Neighbors", "Proto_Strat", "Proto_Comp",
         "train_datasets", "valid_dataset", "test_dataset",
@@ -998,7 +1182,7 @@ def _split_combo_key_from_row(row) -> str:
 
 
 def _canonical_dataset_path(dataset_path: str) -> str:
-    return str(dataset_path or "").strip().replace("\\", "/")
+    return canonical_dataset_path(dataset_path)
 
 
 def _filter_models_df_by_sidebar_split(models_df: pd.DataFrame, *, include_split: bool = True) -> pd.DataFrame:
@@ -1041,7 +1225,7 @@ def load_best_models_table(
 ) -> pd.DataFrame:
     rows, use_db_rank = _query_best_models(cursor)
     df = _models_dataframe_from_rows(rows, use_db_rank)
-    df = _merge_db_and_log_tree_models(df)
+    df = _merge_db_and_log_tree_models(df, task=task)
     if df.empty:
         return df
 
@@ -1066,6 +1250,7 @@ def load_best_models_table(
         return df
 
     df = _attach_metrics(df, calibration_split=calibration_split)
+    df = attach_inference_train_sample_count(df)
     df = _order_model_columns(df)
     return df
 
@@ -1438,6 +1623,23 @@ def compute_pca_for_args(_args, proto_strategies=None, proto_components=1):
 # -------------------------------------------------
 # Rendering sections
 # -------------------------------------------------
+
+def _render_fresh_score_comparison_table(models_df: pd.DataFrame) -> None:
+    """Render fresh original MLP scores beside the app's best saved heads."""
+    comparison_df = _fresh_score_comparison_table(models_df)
+    if comparison_df.empty:
+        st.info("Fresh-model comparison data were not found yet.")
+        return
+
+    st.subheader("Fresh models and retrained heads")
+    st.caption(
+        "Validation MCC only; validation and test datasets must both be `inference`. "
+        "`Siamese` and `CNN/head` come from the app's Top Models / saved-head metrics. "
+        "`CNN/MLP` comes from the fresh-run CSV where MLP was the original head. "
+        "A model is CNN when `Classif_Loss=ce` and `Dist_Fct=none`; all other rows are Siamese."
+    )
+    st.dataframe(_arrow_safe_dataframe(comparison_df), use_container_width=True, hide_index=True)
+
 
 def _render_top_models_table(models_df: pd.DataFrame, args) -> None:
     st.write("**Top Models (all registry rows):**")
@@ -2306,10 +2508,18 @@ def _make_model_selection_options(models_df: pd.DataFrame):
         valid_mcc = _safe_metric(row_dict.get("Valid MCC"), digits=3)
         dist_fct = row_dict.get("Dist_Fct")
         normalize = row_dict.get("Normalize")
+        trial = row_dict.get("Trial", row_dict.get("trial_index"))
+        artifact_id = str(row_dict.get("Artifact ID", row_dict.get("uuid", "")) or "").strip()
+        identity_bits = []
+        if trial is not None and str(trial).strip().lower() not in {"", "nan", "none"}:
+            identity_bits.append(f"trial={trial}")
+        if artifact_id and artifact_id.lower() not in {"nan", "none"}:
+            identity_bits.append(f"run={artifact_id[:8]}")
+        identity_txt = f", {', '.join(identity_bits)}" if identity_bits else ""
 
         key_to_label[selection_key] = (
             f"#{model_num} - {model_name} "
-            f"(MCC={mcc}, valid={valid_mcc}, dist_fct={dist_fct}, normalize={normalize})"
+            f"(MCC={mcc}, valid={valid_mcc}, dist_fct={dist_fct}, normalize={normalize}{identity_txt})"
         )
 
     options = _unique_preserve_order(list(key_to_row.keys()))
@@ -2752,6 +2962,16 @@ def render(
     if active_task:
         st.caption(f"Task: {active_task}")
 
+    # Clear filter selections when task changes (avoid stale filters with new task data)
+    last_task_key = _k(page_key, "last_active_task")
+    last_task = st.session_state.get(last_task_key)
+    if active_task != last_task:
+        st.session_state[_k(page_key, "top_models_filter_columns")] = []
+        st.session_state[_k(page_key, "top_models_filters_active")] = False
+        st.session_state[_k(page_key, "top_models_filtered_selection_keys")] = None
+        st.session_state[last_task_key] = active_task
+
+
     if include_model_table or include_calibration or include_model_selector:
         try:
             calibration_split_key = _k(page_key, "calibration_split")
@@ -2791,6 +3011,8 @@ def render(
                         _render_model_selector(display_models_df, page_key, calibration_split=calibration_split)
 
                     if include_model_table:
+                        _render_fresh_score_comparison_table(models_df)
+                        st.divider()
                         _render_top_models_table(models_df, args)
                         _render_best_models_auc_curves(display_models_df, page_key, split=calibration_split)
                         render_validation_threshold_heatmap(display_models_df, page_key)

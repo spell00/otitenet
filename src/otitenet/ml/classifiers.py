@@ -580,3 +580,64 @@ def build_knn_from_model(model, train_loader, unique_labels, n_neighbors: int = 
     knn = fit_knn_classifier(train_encodings, train_labels, n_neighbors=n_neighbors, metric=metric)
     
     return knn, train_encodings, train_labels
+
+
+def fit_prototype_classifier(train_encs, train_cats, strategy='mean', components=1, metric='euclidean', proto_params=None):
+    """Fit a prototype-based classifier on training embeddings.
+    
+    Creates class prototypes (centroids) from training embeddings, then uses
+    nearest-prototype matching for prediction.
+    """
+    from otitenet.utils.prototypes import Prototypes
+    
+    unique_labels = np.unique(train_cats)
+    
+    proto_engine = Prototypes(
+        unique_labels=unique_labels,
+        unique_batches=[],
+        strategy=strategy,
+        components=components,
+        random_state=1
+    )
+    
+    prototypes_dict = {}
+    for label in unique_labels:
+        mask = train_cats == label
+        label_encs = train_encs[mask]
+        if len(label_encs) > 0:
+            prototypes_dict[label] = proto_engine._compute_prototype(label_encs)
+    
+    proto_vectors = np.array([prototypes_dict[label] for label in unique_labels])
+    proto_labels = unique_labels.copy()
+    
+    class PrototypeClassifier:
+        def __init__(self, proto_vecs, proto_lbls, metric_type='euclidean'):
+            self.proto_vecs = proto_vecs
+            self.proto_lbls = proto_lbls
+            self.metric_type = metric_type
+        
+        def predict(self, X):
+            return predict_with_prototypes(X, self.proto_vecs, self.proto_lbls, metric=self.metric_type)
+        
+        def predict_proba(self, X):
+            if self.metric_type == 'cosine':
+                X_norm = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
+                proto_norm = self.proto_vecs / (np.linalg.norm(self.proto_vecs, axis=1, keepdims=True) + 1e-8)
+                dists = 1.0 - (X_norm @ proto_norm.T)
+            else:
+                dists = np.linalg.norm(X[:, None, :] - self.proto_vecs[None, :, :], axis=2)
+            
+            inv_dists = 1.0 / (dists + 1e-8)
+            proba = inv_dists / inv_dists.sum(axis=1, keepdims=True)
+            return proba
+    
+    clf = PrototypeClassifier(proto_vectors, proto_labels, metric_type=metric)
+    return {
+        'classifier': clf,
+        'prototypes': prototypes_dict,
+        'proto_vectors': proto_vectors,
+        'proto_labels': proto_labels,
+        'strategy': strategy,
+        'components': components,
+        'metric': metric
+    }

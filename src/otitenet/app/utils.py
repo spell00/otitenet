@@ -272,12 +272,22 @@ def split_config_segment(train_datasets="", valid_dataset="", test_dataset="") -
 # ---- Model Parameter Path Construction ---- #
 
 def dataset_path_segment(path: str) -> str:
-    """Return the dataset path segment to store under best_models."""
-    text = str(path or "").strip().replace("\\", "/").strip("/")
-    for prefix in ("./data/", "data/"):
-        if text.startswith(prefix):
-            text = text[len(prefix):]
-            break
+    """Return a portable dataset segment for paths stored under best_models.
+
+    Runtime dataset paths may be absolute (for example
+    ``/home/simon/otitenet/data/otite_ds_224/...``).  Artifact paths must not
+    embed the host-specific prefix, so keep only the portion below ``data/``.
+    """
+    text = str(path or "").strip().replace("\\", "/")
+    if "/data/" in text:
+        text = text.split("/data/", 1)[1]
+    else:
+        text = text.lstrip("/")
+        for prefix in ("./data/", "data/"):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+                break
+    text = text.strip("/")
     # Preserve dataset subdirectory if present (e.g., otite_ds_64/USA_Turquie_Chili)
     return text or "otite_ds_64"
 
@@ -482,6 +492,130 @@ def attach_task_column(models_df: pd.DataFrame, default=None) -> pd.DataFrame:
 
     df["Task"] = df.apply(lambda r: task_from_model_row(r, default=default), axis=1)
     return df
+
+
+INFERENCE_TRAIN_SAMPLES_COLUMN = "Inference Train Samples"
+
+
+def _clean_dataset_path_value(value) -> str:
+    try:
+        if value is None or pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    return "" if text.lower() in {"", "none", "nan", "null", "<na>"} else text
+
+
+def canonical_dataset_path(dataset_path) -> str:
+    """Return a portable dataset identity relative to the repository data dir.
+
+    Historical artifact mirrors sometimes encode an absolute runtime path as a
+    relative directory, for example ``home/simon/otitenet/data/otite_ds_64/...``.
+    Treat everything below the final ``data/`` component as the dataset key so
+    those rows compare equal to ``otite_ds_64/...`` from the live data tree.
+    """
+    text = _clean_dataset_path_value(dataset_path).replace("\\", "/")
+    if not text:
+        return ""
+    if "/data/" in text:
+        text = text.rsplit("/data/", 1)[1]
+    else:
+        for prefix in ("./data/", "data/"):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+                break
+    return text.rstrip("/")
+
+
+@lru_cache(maxsize=2048)
+def inference_train_sample_count_from_path(dataset_path: str):
+    """Count unique inference-dataset rows assigned to the training split."""
+    raw_path = _clean_dataset_path_value(dataset_path)
+    if not raw_path:
+        return pd.NA
+
+    normalized = os.path.normpath(raw_path)
+    portable = canonical_dataset_path(raw_path)
+    candidates = []
+    if os.path.basename(normalized).lower() == "infos.csv":
+        candidates.append(normalized)
+    else:
+        candidates.append(os.path.join(normalized, "infos.csv"))
+        if not os.path.isabs(normalized):
+            candidates.append(os.path.join("data", normalized, "infos.csv"))
+        if portable and portable != normalized:
+            candidates.append(os.path.join("data", portable, "infos.csv"))
+
+    infos_path = next((path for path in candidates if os.path.isfile(path)), None)
+    if infos_path is None:
+        return pd.NA
+    try:
+        infos = pd.read_csv(infos_path, usecols=lambda col: col in {"dataset", "name", "group"})
+    except Exception:
+        return pd.NA
+    if not {"dataset", "group"}.issubset(infos.columns):
+        return pd.NA
+
+    dataset_mask = infos["dataset"].astype(str).str.strip().str.casefold().eq("inference")
+    train_mask = infos["group"].astype(str).str.strip().str.casefold().eq("train")
+    selected = infos.loc[dataset_mask & train_mask]
+    if "name" in selected.columns:
+        return int(selected["name"].dropna().astype(str).str.strip().replace("", np.nan).dropna().nunique())
+    return int(len(selected))
+
+
+def inference_train_sample_count_from_row(row) :
+    """Resolve the inference training-sample count from a model-like row."""
+    getter = row.get if hasattr(row, "get") else lambda _key, _default=None: _default
+    existing = getter(INFERENCE_TRAIN_SAMPLES_COLUMN)
+    try:
+        if existing is not None and not pd.isna(existing):
+            return int(existing)
+    except Exception:
+        pass
+
+    for key in ("Dataset", "Artifact Dataset", "Combo Dataset", "Path", "path"):
+        value = _clean_dataset_path_value(getter(key))
+        if not value:
+            continue
+        count = inference_train_sample_count_from_path(value)
+        try:
+            if not pd.isna(count):
+                return int(count)
+        except Exception:
+            pass
+    return pd.NA
+
+
+def attach_inference_train_sample_count(df: pd.DataFrame) -> pd.DataFrame:
+    """Add inference training counts and correct fraction-experiment calibration metadata.
+
+    In inference-fraction scenarios the samples are already assigned to ``train``
+    in infos.csv.  ``n_calibration`` is the experiment's support-size label, not
+    a request to draw additional samples from valid/test.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out[INFERENCE_TRAIN_SAMPLES_COLUMN] = out.apply(inference_train_sample_count_from_row, axis=1)
+
+    def _is_fraction_experiment(row) -> bool:
+        values = [
+            row.get("Dataset"), row.get("Path"), row.get("path"),
+            row.get("exp ID"), row.get("exp_id"), row.get("run_tag"),
+            row.get("Artifact Log Path"), row.get("Source Run Path"), row.get("Log Path"),
+        ]
+        return any("inference_fraction" in str(value or "").lower() for value in values)
+
+    fraction_mask = out.apply(_is_fraction_experiment, axis=1)
+    count_values = pd.to_numeric(out[INFERENCE_TRAIN_SAMPLES_COLUMN], errors="coerce")
+    override_mask = fraction_mask & count_values.notna()
+    for column in ("N_Calibration", "n_calibration", "n_cal"):
+        if column not in out.columns:
+            out[column] = pd.NA
+        out.loc[override_mask, column] = count_values.loc[override_mask].astype(int)
+    return out
 
 
 def filter_models_df_by_task(models_df: pd.DataFrame, task: str | None) -> pd.DataFrame:
@@ -1509,15 +1643,54 @@ def _normalize_value(v):
             s = ("%g" % float(v)).strip()
             return s.lower()
         s = str(v).strip()
-        if s.lower() in {"nan", "none"}:
+        if s.lower() in {"", "nan", "none", "null", "<na>"}:
             return ""
         return s.lower()
     except Exception:
         return ""
 
 
+def _model_run_identity(row_dict: dict) -> str:
+    """Return the strongest available identity for one trained run/trial."""
+    for key in ("Artifact ID", "artifact_id", "UUID", "uuid"):
+        value = _normalize_value(row_dict.get(key))
+        if value:
+            return f"artifact:{value}"
+
+    for key in (
+        "Artifact Log Path",
+        "Best Model Dir",
+        "best_model_dir",
+        "Source Run Path",
+        "source_run_log_path",
+        "Log Path",
+        "log_path",
+    ):
+        value = _normalize_value(row_dict.get(key))
+        if value:
+            normalized_path = value.replace(chr(92), "/")
+            return f"path:{normalized_path}"
+
+    for key in ("Registry ID", "DB Model ID", "model_id", "id"):
+        value = _normalize_value(row_dict.get(key))
+        if value:
+            return f"registry:{value}"
+
+    exp_id = _normalize_value(row_dict.get("exp ID", row_dict.get("exp_id", row_dict.get("run_tag"))))
+    trial = _normalize_value(row_dict.get("Trial", row_dict.get("trial_index")))
+    if exp_id or trial:
+        return f"experiment:{exp_id}|trial:{trial}"
+    return ""
+
+
 def _make_model_selection_key(row_dict: dict) -> str:
-    """Create a stable unique key for a model parameter combination."""
+    """Create a stable key for one concrete trained model/run.
+
+    Hyperparameters alone are not unique: Optuna trials can share the same
+    displayed configuration while still having different checkpoints and
+    sampled optimizer settings.  Append run identity whenever it is available
+    so every trained trial remains independently selectable.
+    """
     parts = [
         _normalize_value(row_dict.get("Model Name", "")),
         _normalize_value(row_dict.get("NSize", "")),
@@ -1535,6 +1708,9 @@ def _make_model_selection_key(row_dict: dict) -> str:
         _normalize_value(row_dict.get("valid_dataset", row_dict.get("Valid Dataset", ""))),
         _normalize_value(row_dict.get("test_dataset", row_dict.get("Test Dataset", ""))),
     ]
+    run_identity = _model_run_identity(row_dict)
+    if run_identity:
+        parts.append(run_identity)
     return "|".join(parts)
 
 
@@ -1914,7 +2090,7 @@ def format_classifier_config(best_config) -> str:
 
 
 def best_display_classifier_heads(rows: list[dict]) -> list[dict]:
-    """Keep one best display row per model/n_aug/classifier family."""
+    """Return every available trained head, ordered by validation MCC."""
     if not rows:
         return []
 
@@ -1923,16 +2099,7 @@ def best_display_classifier_heads(rows: list[dict]) -> list[dict]:
         return rows
 
     df["Valid MCC"] = pd.to_numeric(df["Valid MCC"], errors="coerce")
-    group_cols = [col for col in ["Model ID", "N Aug", "Family"] if col in df.columns]
-    if not group_cols:
-        return df.sort_values("Valid MCC", ascending=False, na_position="last").to_dict("records")
-
-    return (
-        df.sort_values("Valid MCC", ascending=False, na_position="last")
-        .groupby(group_cols, as_index=False, dropna=False)
-        .first()
-        .to_dict("records")
-    )
+    return df.sort_values("Valid MCC", ascending=False, na_position="last").to_dict("records")
 
 
 def _row_candidate_log_paths(row_dict: dict) -> list[str]:
@@ -2571,6 +2738,12 @@ def _classification_head_extra_metrics(source: dict | None) -> dict:
         "brier",
         "valid_ece",
         "valid_brier",
+        "train_confusion_matrix",
+        "train_confusion_labels",
+        "valid_confusion_matrix",
+        "valid_confusion_labels",
+        "test_confusion_matrix",
+        "test_confusion_labels",
     }
     out = {}
     for key, value in source.items():

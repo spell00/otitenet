@@ -27,6 +27,7 @@ _EXPORTS = {
     "get_db_connection": "otitenet.app.database",
     "create_db": "otitenet.app.database",
     "ensure_results_model_id": "otitenet.app.database",
+    "ensure_results_log_path_capacity": "otitenet.app.database",
     "ensure_best_models_registry_nsize": "otitenet.app.database",
     "check_ds_exists": "otitenet.app.database",
     "list_image_results": "otitenet.app.database",

@@ -518,7 +518,7 @@ def apply_production_model_to_args(args, production_model, data_dir="./data"):
 
         if dataset_path is not None:
             dataset_path = str(dataset_path)
-            if dataset_path and not dataset_path.startswith("data/") and not dataset_path.startswith("./data/"):
+            if dataset_path and not Path(dataset_path).is_absolute() and not dataset_path.startswith("data/") and not dataset_path.startswith("./data/"):
                 dataset_path = f"{data_dir.rstrip('/')}/{dataset_path}"
             setattr(args, "path", dataset_path)
 

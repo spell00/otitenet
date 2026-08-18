@@ -1,7 +1,7 @@
 {
   "source_root": "data/datasets",
   "output_base": "data/otite_ds",
-  "image_size": 224,
+  "image_size": 64,
   "split_mode": "by_dataset",
   "strict_label_map": true,
   "include_datasets": [
@@ -13,5 +13,6 @@
   ],
   "exclude_datasets": [
     "Banque_Comert_Turquie_2020"
-  ]
+  ],
+  "remove_excluded": true
 }

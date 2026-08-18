@@ -74,7 +74,14 @@ def resolve_processed_dataset_path(path, train_datasets=None, valid_dataset=None
         test_dataset: Test dataset
         for_model_lookup: If True, return the base path without dataset subdirectory for model lookup
     """
-    requested = os.path.normpath(str(path or ""))
+    requested = os.path.normpath(str(path or "").strip())
+    # Repair legacy absolute paths stored without their leading slash.  Some app
+    # routes previously prefixed these with data/, producing data/home/....
+    requested_posix = requested.replace("\\", "/")
+    if requested_posix.startswith("data/home/"):
+        requested = os.path.normpath("/" + requested_posix[len("data/"):])
+    elif requested_posix.startswith("home/"):
+        requested = os.path.normpath("/" + requested_posix)
     if os.path.isfile(os.path.join(requested, "infos.csv")):
         return requested
 

@@ -26,6 +26,7 @@ from otitenet.app.services.inference_results_service import (
     find_inference_gradcam_images,
     fmt_confidence,
     fmt_metric,
+    filter_paths_to_unseen_evaluation,
     inference_ground_truth,
     labels_match,
     normalize_analysis_result,
@@ -33,6 +34,7 @@ from otitenet.app.services.inference_results_service import (
 from otitenet.app.utils import (
     _ensure_model_number_map,
     _make_model_selection_key,
+    inference_train_sample_count_from_row,
     get_model_params_path,
     metric_value_from_mapping,
     sort_dataframe_by_model_metric,
@@ -716,14 +718,18 @@ def render(ctx):
     import glob
 
     inference_dir = 'data/datasets/inference'
-    image_extensions = ['*.jpg', '*.jpeg', '*.png']
-    inference_images = []
-    for ext in image_extensions:
-        inference_images.extend(glob.glob(os.path.join(inference_dir, ext)))
-    inference_images = sorted(inference_images)
+    supported_extensions = {'.jpg', '.jpeg', '.png'}
+    inference_images = sorted(
+        path for path in glob.glob(os.path.join(inference_dir, '*'))
+        if os.path.isfile(path) and os.path.splitext(path)[1].lower() in supported_extensions
+    )
 
     if inference_images:
-        st.success(f"Found {len(inference_images)} images in {inference_dir}")
+        st.success(f"Found {len(inference_images)} candidate images in {inference_dir}")
+        st.caption(
+            "Leakage guard is active: inference uses `group=valid` and `group=test` samples only. "
+            "Training images are excluded; Valid, Test, and Valid + Test scores are reported separately."
+        )
 
         # Use the exact same ranked/deduped table and numbering as Quick Model Selection.
         model_number_map, best_models_table = _ensure_model_number_map(cursor)
@@ -987,7 +993,15 @@ def render(ctx):
                     except Exception:
                         pass
                 score_txt = " | " + ", ".join(metric_bits) if metric_bits else ""
-                return f"#{rank} = {model_name} (ID: {model_id_val}){score_txt}"
+                trial = row.get("Trial", row.get("trial_index"))
+                artifact_id = str(row.get("Artifact ID", row.get("uuid", "")) or "").strip()
+                identity_bits = []
+                if trial is not None and str(trial).strip().lower() not in {"", "nan", "none"}:
+                    identity_bits.append(f"trial {trial}")
+                if artifact_id and artifact_id.lower() not in {"nan", "none"}:
+                    identity_bits.append(f"run {artifact_id[:8]}")
+                identity_txt = f" | {', '.join(identity_bits)}" if identity_bits else ""
+                return f"#{rank} = {model_name} (ID: {model_id_val}){identity_txt}{score_txt}"
 
             # Keep this tab synced to the model selected in Quick Model Selection when possible.
             canonical_key = st.session_state.get("selected_model_selection_key")
@@ -1024,6 +1038,57 @@ def render(ctx):
                     f"Skipped {skipped_unloadable} Top-N model(s) without loadable model artifacts "
                     "(missing source-run model.pth/prototypes.pkl)."
                 )
+
+            leakage_safe_rows = []
+            common_unseen_names = None
+            top_n_split_maps = {}
+            split_errors = []
+            split_manifests = []
+            for _, candidate_row in top_n_model_df.iterrows():
+                candidate_dict = candidate_row.to_dict()
+                candidate_args = args_from_inference_row(args, candidate_dict)
+                candidate_images, candidate_split_map, infos_path, split_error = (
+                    filter_paths_to_unseen_evaluation(inference_images, candidate_args)
+                )
+                if split_error:
+                    split_errors.append(
+                        {
+                            "Model": candidate_dict.get("Model Name"),
+                            "Model ID": candidate_dict.get("Model ID"),
+                            "Reason": split_error,
+                        }
+                    )
+                    continue
+                candidate_names = {os.path.basename(path).casefold() for path in candidate_images}
+                common_unseen_names = (
+                    candidate_names if common_unseen_names is None
+                    else common_unseen_names.intersection(candidate_names)
+                )
+                top_n_split_maps[_make_model_selection_key(candidate_dict)] = candidate_split_map
+                leakage_safe_rows.append(candidate_row)
+                if infos_path and infos_path not in split_manifests:
+                    split_manifests.append(infos_path)
+
+            top_n_model_df = pd.DataFrame(leakage_safe_rows, columns=top_n_model_df.columns)
+            top_n_inference_images = [
+                path for path in inference_images
+                if common_unseen_names is not None
+                and os.path.basename(path).casefold() in common_unseen_names
+            ]
+            if split_errors:
+                st.warning(
+                    f"Skipped {len(split_errors)} Top-N model(s) because their valid/test split "
+                    "could not be proven. Leakage protection fails closed."
+                )
+                st.dataframe(pd.DataFrame(split_errors), use_container_width=True, hide_index=True)
+            if not top_n_model_df.empty:
+                st.info(
+                    f"Top-N leakage-safe evaluation: {len(top_n_inference_images)} valid+test image(s) "
+                    f"unseen in training for all {len(top_n_model_df)} eligible model(s)."
+                )
+                if split_manifests:
+                    st.caption("Split manifest(s): " + ", ".join(split_manifests))
+
             top_n_model_ids = [
                 model_id
                 for model_id in (
@@ -1039,10 +1104,11 @@ def render(ctx):
             def _result_matches_model_row(results_df, row_dict):
                 return _result_matches_model_row_df(results_df, row_dict, base_args=args)
 
-            def _fetch_latest_inference_results_for_models(model_ids, model_rows_df=None):
-                if not inference_images:
+            def _fetch_latest_inference_results_for_models(model_ids, model_rows_df=None, image_paths=None):
+                scoped_images = list(image_paths if image_paths is not None else inference_images)
+                if not scoped_images:
                     return pd.DataFrame()
-                inference_filenames_local = [os.path.basename(img) for img in inference_images]
+                inference_filenames_local = [os.path.basename(img) for img in scoped_images]
                 file_placeholders = ",".join(["%s"] * len(inference_filenames_local))
                 model_ids = list(model_ids or [])
                 log_paths = []
@@ -1437,8 +1503,10 @@ def render(ctx):
                 )
                 return votes_df
 
-            top_n_expected_filenames = [os.path.basename(img) for img in inference_images]
-            top_n_existing_df_raw = _fetch_latest_inference_results_for_models(top_n_model_ids, top_n_model_df)
+            top_n_expected_filenames = [os.path.basename(img) for img in top_n_inference_images]
+            top_n_existing_df_raw = _fetch_latest_inference_results_for_models(
+                top_n_model_ids, top_n_model_df, image_paths=top_n_inference_images
+            )
             top_n_existing_df, complete_top_n_model_df, incomplete_top_n_rows = (
                 _complete_top_n_model_results(
                     top_n_existing_df_raw,
@@ -1524,7 +1592,22 @@ def render(ctx):
                         if not top_n_existing_df.empty
                         else pd.DataFrame()
                     )
+                    split_map = top_n_split_maps.get(
+                        _make_model_selection_key(perf_model_row.to_dict()), {}
+                    )
+                    if not model_results_df.empty:
+                        model_results_df["Split"] = model_results_df["Filename"].apply(
+                            lambda name: split_map.get(os.path.basename(str(name)).casefold(), "unknown")
+                        )
                     metrics = compute_inference_metrics(model_results_df)
+                    valid_metrics_eval = compute_inference_metrics(
+                        model_results_df[model_results_df["Split"].eq("valid")]
+                        if "Split" in model_results_df.columns else pd.DataFrame()
+                    )
+                    test_metrics_eval = compute_inference_metrics(
+                        model_results_df[model_results_df["Split"].eq("test")]
+                        if "Split" in model_results_df.columns else pd.DataFrame()
+                    )
                     score_type = _score_type_for_model(model_results_df)
                     rank_value = perf_model_row.get("#", model_number_map.get(perf_model_row.get("_selection_key"), "?"))
                     head_label = perf_model_row.get("Best Classification Head") or "—"
@@ -1540,6 +1623,7 @@ def render(ctx):
                         "N Classes": perf_model_row.get("N Classes"),
                         "Labels": perf_model_row.get("Labels"),
                         "Model Name": perf_model_row.get("Model Name"),
+                        "Inference Train Samples": inference_train_sample_count_from_row(perf_model_row),
                         "N_Calibration": perf_model_row.get("N_Calibration", perf_model_row.get("n_calibration", "—")),
                         "n_cal": perf_model_row.get("n_cal", perf_model_row.get("N_Calibration", perf_model_row.get("n_calibration", "—"))),
                         "N Aug": head_n_aug,
@@ -1549,10 +1633,18 @@ def render(ctx):
                         "Valid AUC": fmt_metric(valid_auc),
                         "Score Type": score_type,
                         "ECE": fmt_metric(ece_value),
-                        "ACC": fmt_metric(metrics["ACC"]),
-                        "MCC": fmt_metric(metrics["MCC"]),
-                        "AUC": fmt_metric(metrics["AUC"]),
-                        "N analyzed": metrics["N"],
+                        "Inference Valid ACC": fmt_metric(valid_metrics_eval["ACC"]),
+                        "Inference Valid MCC": fmt_metric(valid_metrics_eval["MCC"]),
+                        "Inference Valid AUC": fmt_metric(valid_metrics_eval["AUC"]),
+                        "Inference Valid N": valid_metrics_eval["N"],
+                        "Inference Test ACC": fmt_metric(test_metrics_eval["ACC"]),
+                        "Inference Test MCC": fmt_metric(test_metrics_eval["MCC"]),
+                        "Inference Test AUC": fmt_metric(test_metrics_eval["AUC"]),
+                        "Inference Test N": test_metrics_eval["N"],
+                        "Inference Valid + Test ACC": fmt_metric(metrics["ACC"]),
+                        "Inference Valid + Test MCC": fmt_metric(metrics["MCC"]),
+                        "Inference Valid + Test AUC": fmt_metric(metrics["AUC"]),
+                        "Inference Valid + Test N": metrics["N"],
                     }
                     for metric_name, metric_value in metrics.items():
                         if metric_name in {"ACC", "MCC", "AUC", "N"}:
@@ -1580,9 +1672,13 @@ def render(ctx):
                 value=False,
                 key="inference_force_all_top_models",
             )
-            if st.button("▶️ Compute inference for all images × selected top models", key="inference_run_all_top_models"):
+            if st.button(
+                "▶️ Compute inference for valid + test images × selected top models",
+                key="inference_run_all_top_models",
+                disabled=top_n_model_df.empty or not top_n_inference_images,
+            ):
                 from otitenet.app.analysis import clear_embedding_classifier_cache_for_args, run_analysis_on_file
-                total_jobs = int(len(inference_images) * len(top_n_model_df))
+                total_jobs = int(len(top_n_inference_images) * len(top_n_model_df))
                 progress = st.progress(0)
                 status_placeholder = st.empty()
                 done_jobs = 0
@@ -1603,7 +1699,7 @@ def render(ctx):
                                     f"Cleared cached classifier for {batch_model_args.model_name} "
                                     f"({_head_config_label_global(batch_head_config)})."
                                 )
-                        batch_filenames = [os.path.basename(img) for img in inference_images]
+                        batch_filenames = [os.path.basename(img) for img in top_n_inference_images]
                         if force_all_models_inference and batch_filenames:
                             deleted = _delete_existing_results_for_model_row(
                                 cursor,
@@ -1615,7 +1711,7 @@ def render(ctx):
                             )
                             if deleted:
                                 st.caption(f"Deleted {deleted} existing stored inference rows before recompute.")
-                        for img_path in inference_images:
+                        for img_path in top_n_inference_images:
                             img_name = os.path.basename(img_path)
                             model_label = (
                                 f"#{batch_model_dict.get('#', '?')} "
@@ -1657,11 +1753,13 @@ def render(ctx):
                                     raise
                             done_jobs += 1
                             progress.progress(min(1.0, done_jobs / max(total_jobs, 1)))
-                    refreshed_df = _fetch_latest_inference_results_for_models(top_n_model_ids, top_n_model_df)
+                    refreshed_df = _fetch_latest_inference_results_for_models(
+                        top_n_model_ids, top_n_model_df, image_paths=top_n_inference_images
+                    )
                     _complete_results, _complete_models, _incomplete_after_run = _complete_top_n_model_results(
                         refreshed_df,
                         top_n_model_df,
-                        [os.path.basename(img) for img in inference_images],
+                        [os.path.basename(img) for img in top_n_inference_images],
                         base_args=args,
                     )
                     st.session_state["inference_topn_last_incomplete"] = _incomplete_after_run
@@ -1698,41 +1796,105 @@ def render(ctx):
             log_path = selected_model_dict.get("Log Path")
             model_args = args_from_inference_row(args, selected_model_dict)
             model_args.allow_inference_reencode = False
+            selected_inference_train_samples = inference_train_sample_count_from_row(selected_model_dict)
+            if "inference_fraction" in " ".join(
+                str(selected_model_dict.get(key, "") or "").lower()
+                for key in ("Dataset", "Log Path", "Source Run Path", "exp ID", "exp_id", "run_tag")
+            ):
+                selected_model_dict["N_Calibration"] = selected_inference_train_samples
+                selected_model_dict["n_calibration"] = selected_inference_train_samples
+                model_args.n_calibration = int(selected_inference_train_samples)
+            (
+                selected_inference_images,
+                selected_split_map,
+                selected_infos_path,
+                selected_split_error,
+            ) = filter_paths_to_unseen_evaluation(inference_images, model_args)
+            if selected_split_error:
+                st.error(
+                    "Inference is disabled because valid/test split membership cannot be proven: "
+                    f"{selected_split_error}"
+                )
+            else:
+                st.info(
+                    f"Selected-model leakage-safe evaluation: {len(selected_inference_images)} valid+test "
+                    f"image(s); {len(inference_images) - len(selected_inference_images)} training or "
+                    "unrelated image(s) excluded."
+                )
+                st.caption(f"Split manifest: {selected_infos_path}")
 
-            # Classification head used for this selected model. Default to the
-            # best cached head for this model, but let the user override it here.
-            head_entries = _classification_head_options_for_args_global(model_args)
-            head_options = [str(h.get("config")) for h in head_entries if h.get("config") is not None]
+            # Classification head used for this selected model. Show every
+            # cached config at every trained n_aug value rather than collapsing
+            # each config to its single best augmentation setting.
+            head_entries = _classification_head_options_for_args_global(model_args, include_all_n_aug=True)
+
+            def _head_option_key(head_entry):
+                cfg = str(head_entry.get("config"))
+                n_aug = head_entry.get("n_aug")
+                if n_aug is None or str(n_aug).strip().lower() in {"", "nan", "none"}:
+                    return cfg
+                return f"{cfg}|n_aug={n_aug}"
+
+            head_entry_map = {
+                _head_option_key(h): h
+                for h in head_entries
+                if h.get("config") is not None
+            }
+            head_options = list(head_entry_map)
             head_label_map = {}
-            for h in head_entries:
+            for option_key, h in head_entry_map.items():
                 cfg = str(h.get("config"))
                 label = h.get("label") or _head_config_label_global(cfg)
                 score = h.get("mcc", np.nan)
                 details = h.get("details", "")
+                n_aug = h.get("n_aug")
                 score_txt = "" if pd.isna(score) else f" | score={float(score):.4f}"
+                n_aug_txt = "" if n_aug is None else f" | n_aug={n_aug}"
                 details_txt = f" | {details}" if details else ""
-                head_label_map[cfg] = f"{label} ({cfg}){score_txt}{details_txt}"
+                head_label_map[option_key] = f"{label} ({cfg}){n_aug_txt}{score_txt}{details_txt}"
 
             default_head_config = _best_head_config_for_args_global(model_args)
             if selected_model_key == st.session_state.get("selected_model_selection_key") and st.session_state.get("sidebar_classification_head_config"):
                 default_head_config = str(st.session_state.get("sidebar_classification_head_config"))
-            if str(default_head_config) not in head_options and head_options:
-                default_head_config = head_options[0]
+            preferred_n_aug = getattr(model_args, "n_aug", None)
+            default_head_option = next(
+                (
+                    key for key, entry in head_entry_map.items()
+                    if str(entry.get("config")) == str(default_head_config)
+                    and preferred_n_aug is not None
+                    and str(entry.get("n_aug")) == str(preferred_n_aug)
+                ),
+                None,
+            )
+            if default_head_option is None:
+                default_head_option = next(
+                    (key for key, entry in head_entry_map.items() if str(entry.get("config")) == str(default_head_config)),
+                    head_options[0] if head_options else str(default_head_config),
+                )
 
             head_widget_key = f"inference_head_select_{model_id}_{selected_model_key}"
             if st.session_state.get(head_widget_key) not in head_options:
-                st.session_state[head_widget_key] = str(default_head_config)
+                st.session_state[head_widget_key] = default_head_option
 
-            selected_head_config = st.selectbox(
+            selected_head_option = st.selectbox(
                 "Select classification head for inference",
                 options=head_options,
                 key=head_widget_key,
-                format_func=lambda cfg: head_label_map.get(str(cfg), _head_config_label_global(cfg)),
-                help="Defaults to the best cached head found previously for this model, but you can override it for inference.",
-            ) if head_options else str(default_head_config)
+                format_func=lambda option: head_label_map.get(str(option), str(option)),
+                help="Every cached trained head is listed, including separate n_aug variants.",
+            ) if head_options else str(default_head_option)
 
+            selected_head_entry = head_entry_map.get(selected_head_option, {})
+            selected_head_config = str(selected_head_entry.get("config", default_head_config))
+            selected_head_n_aug = selected_head_entry.get("n_aug")
             _set_classifier_head_on_args_global(model_args, selected_head_config)
-            st.caption(f"Classification head applied: {_head_config_label_global(selected_head_config)} (`{selected_head_config}`)")
+            if selected_head_n_aug is not None:
+                model_args.n_aug = int(float(str(selected_head_n_aug)))
+            n_aug_caption = "" if selected_head_n_aug is None else f", n_aug={selected_head_n_aug}"
+            st.caption(
+                f"Classification head applied: {_head_config_label_global(selected_head_config)} "
+                f"(`{selected_head_config}`{n_aug_caption})"
+            )
 
             st.divider()
             st.subheader("Decision Thresholds")
@@ -1841,12 +2003,16 @@ def render(ctx):
                 key="inference_force_reanalyze",
             )
 
-            if st.button("▶️ Run Inference on All Images", key="inference_run_all"):
-                with st.spinner(f"Running inference on {len(inference_images)} images with {model_name}..."):
+            if st.button(
+                "▶️ Run Inference on Valid + Test Images",
+                key="inference_run_all",
+                disabled=bool(selected_split_error) or not selected_inference_images,
+            ):
+                with st.spinner(f"Running inference on {len(selected_inference_images)} valid + test images with {model_name}..."):
                     try:
                         from otitenet.app.analysis import clear_embedding_classifier_cache_for_args, run_analysis_on_file
 
-                        inference_filenames = [os.path.basename(img) for img in inference_images]
+                        inference_filenames = [os.path.basename(img) for img in selected_inference_images]
                         if force_reanalyze_inference:
                             if clear_embedding_classifier_cache_for_args(model_args, head_config=selected_head_config):
                                 st.caption(
@@ -1869,11 +2035,11 @@ def render(ctx):
 
                         results = []
                         correct_count = 0
-                        total_jobs = len(inference_images)
+                        total_jobs = len(selected_inference_images)
                         progress = st.progress(0)
                         status_placeholder = st.empty()
 
-                        for img_idx, img_path in enumerate(inference_images):
+                        for img_idx, img_path in enumerate(selected_inference_images):
                             img_name = os.path.basename(img_path)
                             model_label = f"{model_name} {_head_config_label_global(selected_head_config)}"
                             _report_inference_progress(
@@ -1908,6 +2074,8 @@ def render(ctx):
 
                             result_row = {
                                 'Filename': img_name,
+                                'Inference Train Samples': selected_inference_train_samples,
+                                'Split': selected_split_map.get(img_name.casefold(), "unknown"),
                                 'Head': _head_config_label_global(selected_head_config),
                                 'Head Config': selected_head_config,
                                 'Ground Truth': ground_truth,
@@ -1920,21 +2088,34 @@ def render(ctx):
                             results.append(result_row)
                             progress.progress(min(1.0, len(results) / max(total_jobs, 1)))
 
-                        accuracy = correct_count / len(results) if results else 0
+                        results_df = pd.DataFrame(results)
+                        combined_metrics = compute_inference_metrics(results_df)
+                        valid_metrics = compute_inference_metrics(
+                            results_df[results_df["Split"].eq("valid")] if not results_df.empty else results_df
+                        )
+                        test_metrics = compute_inference_metrics(
+                            results_df[results_df["Split"].eq("test")] if not results_df.empty else results_df
+                        )
                         status_placeholder.success(f"Computed inference for {len(results)} image jobs.")
 
                         st.divider()
                         st.subheader("📊 Performance Summary")
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric("Accuracy", f"{accuracy:.4f}")
-                        with col2:
-                            st.metric("Total Images", len(results))
+                        summary_df = pd.DataFrame([
+                            {"Split": "Valid", "Inference Train Samples": selected_inference_train_samples, **valid_metrics},
+                            {"Split": "Test", "Inference Train Samples": selected_inference_train_samples, **test_metrics},
+                            {"Split": "Valid + Test", "Inference Train Samples": selected_inference_train_samples, **combined_metrics},
+                        ])
+                        for metric in ["ACC", "MCC", "AUC"]:
+                            summary_df[metric] = summary_df[metric].apply(fmt_metric)
+                        st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-                        st.success(f"Inference completed: {correct_count}/{len(results)} correct ({accuracy:.2%})")
+                        st.success(
+                            f"Inference completed on {len(results)} unseen-in-training images "
+                            f"({valid_metrics['N']} valid + {test_metrics['N']} test)."
+                        )
                         if results:
                             st.dataframe(
-                                _arrow_safe_dataframe(pd.DataFrame(results)),
+                                _arrow_safe_dataframe(results_df),
                                 use_container_width=True,
                                 hide_index=True,
                             )
@@ -1948,14 +2129,18 @@ def render(ctx):
             st.divider()
             st.subheader("📂 Existing Results for Inference Images")
 
-            inference_filenames = [os.path.basename(img) for img in inference_images]
+            inference_filenames = [os.path.basename(img) for img in selected_inference_images]
             existing_results = []
             existing_df_from_fetch = _fetch_latest_inference_results_for_models(
                 [model_id_int] if model_id_int is not None else [],
                 pd.DataFrame([selected_model_dict]),
+                image_paths=selected_inference_images,
             )
 
             if not existing_df_from_fetch.empty:
+                existing_df_from_fetch["Split"] = existing_df_from_fetch["Filename"].apply(
+                    lambda name: selected_split_map.get(os.path.basename(str(name)).casefold(), "unknown")
+                )
                 existing_results = list(
                     existing_df_from_fetch[
                         ["Filename", "Prediction", "Confidence", "Timestamp", "Log Path", "Class Scores"]
@@ -2038,6 +2223,7 @@ def render(ctx):
                         "for the same inference image/model."
                     )
 
+                existing_df['Inference Train Samples'] = selected_inference_train_samples
                 existing_df['Head'] = _head_config_label_global(selected_head_config)
                 existing_df['Head Config'] = selected_head_config
                 existing_df['Ground Truth'] = existing_df['Filename'].apply(lambda filename: inference_ground_truth(filename, inference_dir))
@@ -2144,7 +2330,7 @@ def render(ctx):
                 )
                 existing_display_df = existing_df[
                     [
-                        'Filename', 'Head', 'Head Config', 'Ground Truth',
+                        'Filename', 'Inference Train Samples', 'Head', 'Head Config', 'Ground Truth',
                         'Selected Model Prediction', 'Selected Model Correct',
                         'Ensemble Prediction', 'Ensemble Correct',
                         'Ensemble Raw Prediction', 'Ensemble Raw Vote %',
