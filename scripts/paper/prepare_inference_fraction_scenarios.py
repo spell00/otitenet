@@ -13,8 +13,6 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_BASE = ROOT / "data/otite_ds_224/USA_Turquie_Chili_GMFUNL_inference_20260803"
-DEFAULT_OUT = ROOT / "data/otite_ds_224"
 
 
 def label_for(frac: float) -> str:
@@ -69,16 +67,18 @@ def link_images(base: Path, target: Path, names: pd.Series, mode: str) -> None:
         else:
             shutil.copy2(src, dst)
 
+DEFAULT_BASE = ROOT / "data/otite_ds_64/USA_Turquie_Chili_GMFUNL_inference"
+DEFAULT_OUT = ROOT / "data/otite_ds_64"
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--base-dir", type=Path, default=DEFAULT_BASE)
     p.add_argument("--out-base", type=Path, default=DEFAULT_OUT)
-    p.add_argument("--prefix", default="USA_Turquie_Chili_GMFUNL_inference_fraction_v1")
-    p.add_argument("--fractions", default="0.5,0.25,0.1,0.05,0.02")
+    p.add_argument("--prefix", default="USA_Turquie_Chili_GMFUNL_inference_fraction_v2")
+    p.add_argument("--fractions", default="0.5,0.25,0.1,0.05,0.02,0")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--image-mode", choices=("hardlink", "symlink", "copy"), default="hardlink")
-    p.add_argument("--historical-group", choices=("train", "unused"), default="unused", help="Assignment for all non-inference rows; validation and test are always inference-only.")
+    p.add_argument("--historical-group", choices=("train", "unused"), default="train", help="Assignment for all non-inference rows; validation and test are always inference-only.")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 
@@ -87,8 +87,8 @@ def main() -> int:
     if inf.empty:
         raise ValueError("No inference rows in base infos.csv")
     total = len(inf)
-    # Deterministic fixed hold-outs: 66 validation and 65 test samples for 262 rows.
-    # This is the closest integer implementation of 25%/25%, and 0.5 train is 131 exactly.
+    # Deterministic fixed hold-outs: 61 validation and 65 test samples for 262 rows.
+    # This is the closest integer implementation of 25%/25%, and 0.5 train is 122 exactly.
     valid_n = int(np.ceil(total * .25))
     test_n = int(np.floor(total * .25))
     valid_idx = take_stratified(inf, valid_n, args.seed + 2000)

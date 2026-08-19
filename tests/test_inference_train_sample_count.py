@@ -108,7 +108,7 @@ def test_dataset_filter_prevents_fraction_cross_contamination():
     rows = pd.DataFrame([
         {
             "Dataset": "home/simon/otitenet/data/otite_ds_64/scenario_train0p25",
-            "N_Calibration": 66,
+            "N_Calibration": 61,
         },
         {
             "Dataset": "home/simon/otitenet/data/otite_ds_64/scenario_train0p02",
@@ -119,7 +119,7 @@ def test_dataset_filter_prevents_fraction_cross_contamination():
     filtered = _filter_models_df_by_dataset(
         rows, "otite_ds_64/scenario_train0p25"
     )
-    assert filtered["N_Calibration"].tolist() == [66]
+    assert filtered["N_Calibration"].tolist() == [61]
 
 
 def test_explicit_fraction_dataset_is_not_overwritten_by_generic_split_dataset():
@@ -148,7 +148,7 @@ def test_leaderboard_dataset_filter_matches_absolute_fresh_run_path(monkeypatch)
     models = pd.DataFrame([
         {
             "Dataset": f"/home/simon/otitenet/data/{selected}",
-            "N_Calibration": 66,
+            "N_Calibration": 61,
             "Source": "progress metrics",
         },
         {
@@ -170,4 +170,4 @@ def test_leaderboard_dataset_filter_matches_absolute_fresh_run_path(monkeypatch)
     )
 
     filtered = leaderboard._filter_models_df_by_sidebar_split(models)
-    assert filtered["N_Calibration"].tolist() == [66]
+    assert filtered["N_Calibration"].tolist() == [61]

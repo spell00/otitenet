@@ -19,8 +19,9 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedGroupKFold
 
+from scripts.paper.prepare_inference_fraction_scenarios import ROOT
 
-DEFAULT_FRACTIONS = "0.5,0.25,0.1,0.05,0.02,0"
+
 
 
 def label_for(fraction: float) -> str:
@@ -142,12 +143,16 @@ def validate_manifest(rows: list[dict[str, object]], n_splits: int, fractions: l
         if subset["test_fold"].nunique() != 1 or int(subset["test_fold"].iloc[0]) != expected_test:
             raise AssertionError(f"Unexpected test fold for CV run {fold}")
 
+DEFAULT_FRACTIONS = "0.5,0.25,0.1,0.05,0.02,0"
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_BASE = ROOT / "data/otite_ds_64/USA_Turquie_Chili_GMFUNL_inference"
+DEFAULT_OUT = ROOT / "data/otite_ds_64"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-dir", type=Path, required=True)
-    parser.add_argument("--out-base", type=Path, required=True)
-    parser.add_argument("--prefix", required=True)
+    parser.add_argument("--base-dir", type=Path, default=DEFAULT_BASE)
+    parser.add_argument("--out-base", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--prefix", default="USA_Turquie_Chili_GMFUNL_inference_fraction_v2")
     parser.add_argument("--fractions", default=DEFAULT_FRACTIONS)
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)

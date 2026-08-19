@@ -13,7 +13,7 @@ def test_fraction_launcher_records_preassigned_inference_count_as_n_calibration(
         "dist_fct": "cosine", "classif_loss": "ce", "normalize": "yes", "knn": 1,
     })
     scenario = pd.Series({
-        "scenario_label": "0p5", "dataset_path": "data/scenario", "inference_train": 131,
+        "scenario_label": "0p5", "dataset_path": "data/scenario", "inference_train": 122,
     })
     args = Namespace(
         experiment_label="inference_fraction_hist_v2", n_trials=20, n_epochs=1000,
@@ -22,6 +22,6 @@ def test_fraction_launcher_records_preassigned_inference_count_as_n_calibration(
 
     cmd = build_cmd(cfg, scenario, rank=1, seed=42, args=args)
 
-    assert cmd[cmd.index("--n_calibration") + 1] == "131"
+    assert cmd[cmd.index("--n_calibration") + 1] == "122"
     assert cmd[cmd.index("--calibration_preassigned_train") + 1] == "1"
     assert cmd[cmd.index("--dvclive_monitor_system") + 1] == "0"

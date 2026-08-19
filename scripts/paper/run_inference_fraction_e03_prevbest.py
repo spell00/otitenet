@@ -88,7 +88,7 @@ def _previous_best_configs(top_k: int, source_tasks: list[str]) -> pd.DataFrame:
 def _build_cmd(args, cfg: pd.Series, scenario: pd.Series, rank: int) -> list[str]:
     version = _clean(getattr(args, "version_label", ""), "")
     version_part = f"_{version}" if version else ""
-    n_calib = int(scenario.get("inference_train", 131))
+    n_calib = int(scenario.get("inference_train", 122))
     run_tag = f"INF_FRAC_E03_PREVBEST{version_part}_P{scenario.scenario_label}_R{rank:02d}"
     cmd = [
         str(PYTHON), "-m", "otitenet.train.train_triplet_new",
@@ -211,7 +211,7 @@ def main() -> int:
                     dataset_path=str(scenario.get("dataset_path")),
                     run_id=run_tag,
                     scenario_label=scenario_label,
-                    n_calibration=int(scenario.get("inference_train", 131)),
+                    n_calibration=int(scenario.get("inference_train", 122)),
                 )
                 if rc != 0:
                     print(f"Warning: run exited with code {rc}", file=sys.stderr)

@@ -8,8 +8,8 @@ import pandas as pd
 from run_inference_fraction_optuna_fresh import cnn_command, siamese_command
 
 ROOT = Path(__file__).resolve().parents[2]
-TASK = 'four_classes_220726'
-FRACTION_CONFIG = {0.50: 131, 0.25: 66, 0.10: 26, 0.05: 13, 0.02: 5, 0.0: 0}
+TASK = 'four_classes_220819'
+FRACTION_CONFIG = {0.50: 122, 0.25: 61, 0.10: 24, 0.05: 12, 0.02: 5, 0.0: 0}
 SCENARIO_LABELS = {0.50: '0p5', 0.25: '0p25', 0.10: '0p1', 0.05: '0p05', 0.02: '0p02', 0.0: '0'}
 PYTHON = ROOT / '.conda' / 'bin' / 'python'
 

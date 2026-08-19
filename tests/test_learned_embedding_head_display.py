@@ -58,7 +58,7 @@ def test_enumerate_classification_heads_exposes_knn_prototype_and_baseline(monke
             },
             "prototypes": {
                 "gmm": {
-                    "best_mcc": 0.66,
+                    "best_mcc": 0.61,
                     "best_n_components": 2,
                     "train_mcc": 0.70,
                     "test_mcc": 0.64,

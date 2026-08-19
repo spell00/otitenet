@@ -70,10 +70,10 @@ from otitenet.utils.utils import get_empty_traces
 
 _FRESH_FRACTIONS = ["0p02", "0p05", "0p1", "0p25", "0p5"]
 _FRESH_FRACTION_CALIBRATION = {
-    "0p5": 131,
-    "0p25": 66,
-    "0p1": 26,
-    "0p05": 13,
+    "0p5": 122,
+    "0p25": 61,
+    "0p1": 24,
+    "0p05": 12,
     "0p02": 5,
 }
 

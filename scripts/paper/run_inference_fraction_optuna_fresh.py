@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PYTHON = ROOT / ".conda/bin/python"
 TASK = "four_classes_220818"
 EXPECTED = ["0p5", "0p25", "0p1", "0p05", "0p02", "0"]
-EXPECTED_CALIBRATION = [131, 66, 26, 13, 5, 0]
+EXPECTED_CALIBRATION = [122, 61, 26, 13, 5, 0]
 
 
 def quoted(command: list[str]) -> str:

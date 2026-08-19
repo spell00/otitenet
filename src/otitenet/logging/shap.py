@@ -8,7 +8,7 @@ import torch.nn as nn
 import pickle
 
 CHANNEL_MEAN = [0.13854676, 0.10721603, 0.09241733]
-CHANNEL_STD = [0.07892648, 0.07227526, 0.06690206]
+CHANNEL_STD = [0.07892648, 0.07227526, 0.06190206]
 
 
 def _get_embeddings_cache_path(log_path, group, layer=None):
